@@ -489,11 +489,12 @@ export function buildRoleContext(
  * Strip inherited project instructions out of a child's system prompt.
  *
  * Pi renders every discovered `AGENTS.md`/`CLAUDE.md` as
- * `<project_instructions path="…">…</project_instructions>`. pi-subagents only
- * includes them for agents declaring `inheritProjectContext: true`, but a child
- * must never end up with two instruction sets — its own guide and the project's
- * main-session policy — so the inherited block is removed before the child guide
- * is added, regardless of what the agent declared.
+ * `<project_instructions path="…">…</project_instructions>`. pi-subagents includes
+ * them for agents declaring `inheritProjectContext: true`, which the Trellis role
+ * templates do, and a child must never end up with two instruction sets — its own
+ * guide and the project's main-session policy. Removing the inherited block here
+ * keeps that true for any agent, including ones this package does not own, and
+ * touches nothing outside a project that adopted the workflow.
  */
 export function stripProjectInstructions(systemPrompt: string): string {
   if (!systemPrompt) return systemPrompt;

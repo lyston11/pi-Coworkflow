@@ -13,12 +13,11 @@
  * which it must not do. Two mechanisms could deliver it, so this module closes
  * both:
  *
- *   1. pi-subagents inherits `AGENTS.md` only for agents declaring
- *      `inheritProjectContext: true`. The Trellis role agents declare `false`
- *      (Trellis CLI templates).
- *   2. Whatever an agent declares, `subagent-context` strips inherited project
- *      context out of a child's system prompt before adding the child guide, so
- *      a custom agent that forgot the field cannot get two sets of rules.
+ * The enforcement lives in `subagent-context`, not in agent frontmatter: it
+ * strips inherited project instructions from a child's system prompt before
+ * adding the child guide. Doing it there keeps the rule independent of which
+ * agent was dispatched (including agents this package does not own), and it
+ * only runs in a project that ran `/Coworkflow:init`.
  *
  * Placement note: the child guide lives under `.pi/Coworkflow/` rather than
  * `.trellis/`. It is this package's artifact, not Trellis's, and `trellis

@@ -258,14 +258,22 @@ lane 指针写在 `.trellis/.runtime/lanes/<任务>/<runId>.json`，只要求**�
 
 ### 为什么不可能同时注入两份
 
-子会话拿到项目 `AGENTS.md` 只有一条途径：pi-subagents 的 agent 声明了 `inheritProjectContext: true`（Pi 把它渲染成 `<project_instructions path="…">`）。两道保险都关掉它：
+子会话拿到项目 `AGENTS.md` 只有一条途径：pi-subagents 的 agent 声明了 `inheritProjectContext: true`（Pi 把它渲染成 `<project_instructions path="…">`）。
 
-1. **agent 侧**：Trellis 的三个角色 agent（`trellis-implement`/`check`/`research`）在模板里声明了 `inheritProjectContext: false`。
-2. **注入侧**：`subagent-context` 在追加子 agent 约定之前，先把系统提示里所有 `<project_instructions>` 块**剥掉**——所以即使某个自定义 agent 忘了这个字段，也不可能拿到两套规则。
+**这道隔离放在兼容层，不写进任何 agent 的 frontmatter。** `subagent-context` 在子会话里、追加自己的内容之前，先把系统提示里所有 `<project_instructions>` 块剥掉：
+
+| 场景 | 结果 |
+|---|---|
+| Trellis 角色子会话（`trellis-implement`/`check`/`research`） | 剥掉项目 AGENTS.md → 注入子 agent 约定 + 角色上下文 |
+| 任意其它 agent（`worker`、`reviewer`、自定义） | 剥掉项目 AGENTS.md → **不注入**任何本包内容（不是 Trellis 角色，就没有角色上下文） |
+| 未初始化本包的项目 | 钩子**根本不注册**，系统提示一字不动 |
+| 主会话 | 钩子只在子会话里生效（`runtime.isChild`），主会话照常继承项目 AGENTS.md |
+
+为什么不改 agent frontmatter：那要写进 `trellis-{implement,check,research}.md`，属于 Trellis 的模板（`trellis update` 会覆盖，而且改的是别人的默认配置）；而且只能覆盖我们自己拥有的三个 agent，用户自定义的 agent 仍会继承。放在注入层则**对所有 agent 生效、随本包一起升级、且只在采用本包的项目里生效**。
+
+副作用要说明：非 Trellis 角色的子 agent 也会失去项目 `AGENTS.md`。这是有意的——一个只做一件事的子 agent 不该拿到主会话的规划/派单/审计职责。它仍然有自己的 agent 系统提示、项目 `CLAUDE.md` 之外的其它上下文，以及派单提示词。
 
 注入顺序固定为：`子 agent 工作约定` → `Trellis 子任务上下文（role: …）` → `边界`。约定与角色无关，每次派单都带；角色上下文按角色给。
-
-实测：子会话系统提示含"子 agent 工作约定"、含角色上下文、**不含**"核心分工"（主会话专属那段）；模拟继承了项目 `AGENTS.md` 的提示经剥离后，`<project_instructions>` 内容消失而其余部分保留。
 
 ## 目录结构
 

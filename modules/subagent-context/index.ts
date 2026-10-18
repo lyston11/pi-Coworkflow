@@ -113,35 +113,50 @@ export const subagentContextModule: WorkflowModule = {
 
     host.on("before_agent_start", (event: any, ctx: any) => {
       if (!runtime.enabled) return undefined;
-      const sessionName = host.getSessionName?.();
-      const role = detectRole(sessionName, event?.prompt, event?.systemPrompt);
-      if (!role) return undefined;
 
       const cwd = typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : runtime.cwd;
       // Read from the main checkout: a lane worktree only holds committed state.
       const root = mainCheckout(repoRoot(cwd));
-      const taskDir =
-        detectTaskDir(root, sessionName, event?.prompt, event?.systemPrompt) ??
-        activeTaskDir(root, runtime.parentSessionId);
-      if (role !== "research" && !taskDir) return undefined;
-
-      const taskRef = taskDir ? taskRefForDisplay(root, taskDir) : "";
-      const key = `${role}::${taskRef}`;
-      if (injected.has(key)) return undefined;
-
-      const context = buildRoleContext(root, taskDir, role);
-      // The child-facing guide is independent of the role: every dispatched child
-      // gets it, and it replaces the project AGENTS.md a child must not follow.
+      const sessionName = host.getSessionName?.();
+      const role = detectRole(sessionName, event?.prompt, event?.systemPrompt);
       const guide = readSubagentGuide(root);
-      if (!context && !guide) return undefined;
-      injected.add(key);
 
-      const block = renderInjection(role, taskRef, context, guide);
-      // Drop any inherited project instructions first: a child gets exactly one
-      // instruction set (its own guide), never the main session's policy too.
+      // Separation is enforced for *every* child of an adopted project, not only
+      // for the three Trellis roles: a custom agent that inherits the project
+      // AGENTS.md would otherwise plan and audit duties it does not have. The
+      // rule lives here rather than in agent frontmatter so it keeps holding for
+      // agents this package does not own, and applies to nothing outside a
+      // project that ran `/Coworkflow:init`.
       const current = stripProjectInstructions(
         typeof event?.systemPrompt === "string" ? event.systemPrompt : "",
       );
+
+      if (!role) {
+        // Not a Trellis role: only the separation rule applies. Replacing the
+        // prompt is required because a hook cannot mutate it in place.
+        return current === (event?.systemPrompt ?? "") ? undefined : { systemPrompt: current };
+      }
+
+      const taskDir =
+        detectTaskDir(root, sessionName, event?.prompt, event?.systemPrompt) ??
+        activeTaskDir(root, runtime.parentSessionId);
+      if (role !== "research" && !taskDir) {
+        return current === (event?.systemPrompt ?? "") ? undefined : { systemPrompt: current };
+      }
+
+      const taskRef = taskDir ? taskRefForDisplay(root, taskDir) : "";
+      const key = `${role}::${taskRef}`;
+      if (injected.has(key)) {
+        return current === (event?.systemPrompt ?? "") ? undefined : { systemPrompt: current };
+      }
+
+      const context = buildRoleContext(root, taskDir, role);
+      if (!context && !guide) {
+        return current === (event?.systemPrompt ?? "") ? undefined : { systemPrompt: current };
+      }
+      injected.add(key);
+
+      const block = renderInjection(role, taskRef, context, guide);
       return { systemPrompt: [current, block].filter(Boolean).join("\n\n") };
     });
   },
