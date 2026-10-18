@@ -733,6 +733,15 @@ export class ModelPanel extends Container {
     const end = Math.min(start + MAX_VISIBLE, filtered.length);
     const sep = theme.fg("dim", " │ ");
 
+    // The chart occupies the whole usage column: it is as tall as the visible
+    // model list, so the column is filled with the bar chart rather than a single
+    // line of glyphs.
+    const chart = this.historyBlock(
+      snapshot.history.selected,
+      Math.max(4, end - start),
+      widths.usage,
+    );
+
     for (let i = start; i < end; i += 1) {
       const row = filtered[i]!;
       const selected = this.focus === "model" && i === modelCursor;
@@ -747,13 +756,9 @@ export class ModelPanel extends Container {
       const modelCell = this.paint(modelText, selected ? "accent" : null);
       const thinkingText = this.cell(isCurrent ? `● ${currentThinking}` : "", widths.thinking);
       const thinkingCell = this.paint(thinkingText, isCurrent ? "success" : null);
-      // The chart follows the selection: the row under the cursor shows its own
-      // 7-day window, so moving the cursor re-reads usage for that model. Other
-      // rows stay blank rather than repeating the same numbers.
-      const isCursorRow = i === modelCursor;
-      const usageCell = isCursorRow
-        ? this.historyCell(snapshot.history.selected, snapshot.history.selectedModel, widths.usage)
-        : this.paint(this.cell("", widths.usage), "dim");
+      // One line of the chart per model row, so the usage column is a single
+      // 7-day chart spanning the whole table height.
+      const usageCell = chart[i - start] ?? this.cell("", widths.usage);
       lines.push(`${mark}${modelCell}${sep}${thinkingCell}${sep}${usageCell}`);
     }
 
@@ -788,32 +793,59 @@ export class ModelPanel extends Container {
    * times the tokens visibly has a ten-times-longer bar.
    */
   /**
-   * Seven-day sliding-window bar chart for one model, plus the window total.
+   * The 7-day chart as a block of `height` lines: one column per day, bars growing
+   * upward, weekday labels on the bottom line.
    *
-   * Bars are vertical blocks scaled to the busiest day in the window; the label
-   * under them is the day of week, so a spike can be located without counting
-   * from the right. Values are in token totals, cache included, because that is
-   * what the provider bills against the context window.
+   * It is multi-line because the usage column is as tall as the model list — a
+   * single row of block glyphs wasted that space and could not show a spike.
    */
-  private historyCell(series: DailySeries, model: string, width: number): string {
+  private historyBlock(series: DailySeries, height: number, width: number): string[] {
     const theme = this.theme;
+    const rows = Math.max(3, height);
+    const barRows = rows - 1; // the last line is the day axis
     if (series.days.length === 0) {
-      return this.paint(this.cell("—", width), "dim");
+      const blank = Array.from({ length: rows }, () => "");
+      blank[0] = this.paint(this.cell("—", width), "dim");
+      return blank;
     }
-    // Two columns per day, 8 levels: one row of blocks is the whole chart, so the
-    // width of the usage column is what makes the shape readable.
-    const glyphs = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
-    const bars = series.days
+
+    // Day columns: as wide as the usage column allows, at least 2, at most 3.
+    const dayCount = series.days.length;
+    const colWidth = Math.max(2, Math.min(3, Math.floor(width / dayCount)));
+    const heights = series.days.map((day) => {
+      const spent = day.input + day.output + day.cacheRead + day.cacheWrite;
+      if (spent === 0 || series.peak === 0) return 0;
+      return Math.max(1, Math.round((spent / series.peak) * barRows));
+    });
+
+    const lines: string[] = [];
+    for (let row = 0; row < barRows; row += 1) {
+      // row 0 is the top of the chart; a day is filled while its bar reaches it.
+      const level = barRows - row;
+      const cells = heights.map((h) =>
+        h >= level ? theme.fg("accent", "█".repeat(colWidth)) : " ".repeat(colWidth),
+      );
+      lines.push(this.cell(` ${cells.join("")}`, width));
+    }
+
+    // Axis: weekday of each day, then the window total on the right.
+    const axis = series.days
       .map((day) => {
-        const spent = day.input + day.output + day.cacheRead + day.cacheWrite;
-        if (spent === 0) return theme.fg("dim", "··");
-        const ratio = series.peak === 0 ? 0 : spent / series.peak;
-        const level = Math.max(1, Math.min(8, Math.round(ratio * 8)));
-        return theme.fg("accent", (glyphs[level - 1] ?? "█").repeat(2));
+        const label = this.weekdayLabel(day.day);
+        return label.padEnd(colWidth, " ");
       })
       .join("");
-    const summary = `${bars} ${formatTokens(series.total)}`;
-    return this.cell(summary, width);
+    const total = `${formatTokens(series.total)}`;
+    const axisText = this.cell(` ${axis} ${total}`, width);
+    lines.push(theme.fg("dim", axisText));
+    return lines;
+  }
+
+  /** `一`..`日` for a local `YYYY-MM-DD`. */
+  private weekdayLabel(day: string): string {
+    const date = new Date(`${day}T00:00:00`);
+    if (Number.isNaN(date.getTime())) return " ";
+    return "日一二三四五六"[date.getDay()] ?? " ";
   }
 
   private updateBody(): void {

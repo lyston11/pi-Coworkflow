@@ -119,7 +119,7 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 
 ### `/Comodels`
 
-一张**表格**：每行一个模型，右侧是它自己的思考等级与 **7 天滑动窗口**的用量柱状图。
+一张**表格**：每行一个模型，右侧是它自己的思考等级；**用量列是一整块 7 天柱状图**，占满该列的整列高度（与可见模型行数同高），而不是一行迷你字符。
 
 ```
 pi-Coworkflow · 模型面板
@@ -128,19 +128,24 @@ pi-Coworkflow · 模型面板
 
   模型                                │ 思考等级         │ 用量
   ────────────────────────────────────┼──────────────────┼──────────────────────────────
-→ ✓ deepseek-v4.1-flash [buddy2api]   │ ● high           │ ··▁▁··▁▁██▁▁▁▁ 1.1M
-    glm-5.3 [buddy2api]               │                  │
-    cline-pass/deepseek-v4.1-flash […] │                  │
+→ ✓ deepseek-v4.1-flash [buddy2api]   │ ● high           │              ███
+    glm-5.3 [buddy2api]               │                  │              ███
+    glm-5.3-flash [buddy2api]         │                  │              ███
+    gpt-6-astra [buddy2api]           │                  │              ███
+    kimi-k3 [buddy2api]               │                  │              ███
+    cline-free/deepseek-v4.1-flash    │                  │              ███
+    cline-pass/deepseek-v4.1-flash    │                  │     ███   ████████████
+    gpt-6-sol [lanin]                 │                  │  一  二  三  四  五  六  日   1.1M
 
 当前生效：buddy2api/deepseek-v4.1-flash · 思考 high · 仅本会话
 ```
 
-- **柱状图就在「用量」那一格**，占满该列；柱状图只画**光标所在行**的模型，`↑↓` 移动光标即切换统计对象。
-- 7 天滑动窗口按**本地日期**，无消耗的日子画 `··`，柱高按窗口内峰值等比（8 级方块 `▁▂▃▄▅▆▇█`，每天 2 列），末尾是该窗口的 token 合计。
-- **口径**：`input + output + cacheRead + cacheWrite`；按 `provider/model` **精确匹配**，不同 provider 的同名模型不串账。
-- **只统计 Coworkflow 加载之后的消耗**（`/Coworkflow:start` 记下 `since`，之前的轮次不计）。
-- **对齐**：单元格先按列宽 pad 成纯文本再上色，分隔线 `─┼─` 与数据行 ` │ ` 同宽。
-- 表格之外没有附加的用量块——不在列表里的模型、子 agent 的按 agent 统计都不在 `/Comodels` 里展示。
+- 柱状图**竖直向上长**：7 根柱子（每天一列，2–3 列宽），高度按窗口内峰值等比；底行是星期标签与该窗口的 token 合计。
+- 图表只画**光标所在行**的模型，`↑↓` 移动光标即切换统计对象。
+- 7 天滑动窗口按**本地日期**；无消耗的日子没有柱子。
+- **口径**：`input + output + cacheRead + cacheWrite`，按 `provider/model` 精确匹配（不同 provider 的同名模型不串账），且**只统计 `/Coworkflow:start` 之后**的消耗。
+- 对齐：单元格先按列宽 pad 成纯文本再上色；分隔线 `─┼─` 与数据行 ` │ ` 同宽。
+- 表格之外没有任何附加块。
 
 | 键 | 作用 |
 |---|---|
