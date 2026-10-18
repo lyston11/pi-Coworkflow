@@ -99,7 +99,6 @@ export interface PanelSnapshot {
   /** The model whose thinking levels the subagent tab should offer. */
   subagentEffectiveModel: PanelModel | undefined;
   sessionEffectiveModel: PanelModel | undefined;
-  usage: PanelUsage;
   /**
    * 7-day sliding window for the model the cursor is on, and for the model
    * actually in effect, so the table row and the footer agree.
@@ -107,26 +106,12 @@ export interface PanelSnapshot {
   history: {
     selectedModel: string;
     selected: DailySeries;
-    effectiveModel: string;
-    effective: DailySeries;
     /** Epoch ms this session loaded Coworkflow; usage before it is excluded. */
     since?: number;
   };
 }
 
 /** Token accounting, split the way the panel shows it. */
-export interface PanelUsage {
-  /** This session's main-session models, biggest consumer first. */
-  sessionByModel: [string, UsageTotals][];
-  sessionTotal: UsageTotals;
-  /** Children dispatched by this session, biggest first. */
-  childrenByAgent: [string, UsageTotals][];
-  childRuns: number;
-  childTotal: UsageTotals;
-  /** Every child run recorded in this project's artifact directories. */
-  projectChildRuns: number;
-  projectChildTotal: UsageTotals;
-}
 
 export interface PanelPort {
   snapshot(): PanelSnapshot;
@@ -414,6 +399,16 @@ export class ModelPanel extends Container {
   private readonly searchInput = new Input();
   /** Last width handed to render(), so the table can size its columns. */
   private width: number | undefined;
+  /**
+   * Snapshot cache for one render pass.
+   *
+   * A snapshot reads every session entry and every subagent artifact, and one
+   * keystroke used to ask for it five times (sync, body, and each panel that
+   * wanted rows), which is what made the arrow keys feel sluggish. The cache is
+   * dropped when input arrives or a value is applied, so it never serves stale
+   * numbers.
+   */
+  private cached: PanelSnapshot | undefined;
   private readonly statusText = new Text("", 0, 0);
 
   constructor(
@@ -464,7 +459,7 @@ export class ModelPanel extends Container {
    * effect.
    */
   private syncCursorContext(): void {
-    const snapshot = this.port.snapshot();
+    const snapshot = this.snapshot();
     const rows = this.focus === "model" ? modelRows(snapshot, this.tab) : modelRows(snapshot, this.tab);
     const row = rows[this.focus === "model" ? this.cursor(snapshot) : this.cursorOf(snapshot, "model")];
     const model = row?.model;
@@ -473,7 +468,7 @@ export class ModelPanel extends Container {
 
   /** Rows currently rendered in the focused column, for tests. */
   currentRows(): PanelRow[] {
-    return this.activeRows(this.port.snapshot());
+    return this.activeRows(this.snapshot());
   }
 
   private key(): string {
@@ -511,7 +506,7 @@ export class ModelPanel extends Container {
   }
 
   private apply(): void {
-    const snapshot = this.port.snapshot();
+    const snapshot = this.snapshot();
     const rows = this.activeRows(snapshot);
     const row = rows[this.cursor(snapshot)];
     if (!row) return;
@@ -544,11 +539,13 @@ export class ModelPanel extends Container {
           ? "主会话思考等级不能清空"
           : this.port.applySessionThinking(level)
         : this.port.applySubagentThinking(level);
+    this.cached = undefined;
     this.refresh();
   }
 
   handleInput(data: string): void {
-    const snapshot = this.port.snapshot();
+    this.cached = undefined;
+    const snapshot = this.snapshot();
 
     if (this.matches(data, "cancel")) {
       this.port.close();
@@ -603,6 +600,12 @@ export class ModelPanel extends Container {
   private refresh(): void {
     this.updateBody();
     this.tui?.requestRender?.();
+  }
+
+  /** The current snapshot, computed at most once per render pass. */
+  private snapshot(): PanelSnapshot {
+    this.cached ??= this.port.snapshot();
+    return this.cached;
   }
 
   /**
@@ -852,7 +855,7 @@ export class ModelPanel extends Container {
     // Push the cursor's model first: the snapshot's 7-day window is computed for
     // it, so asking before syncing would chart the previously selected model.
     this.syncCursorContext();
-    const snapshot = this.port.snapshot();
+    const snapshot = this.snapshot();
     const width = this.width ?? 100;
 
     this.body.clear();
@@ -884,49 +887,6 @@ export class ModelPanel extends Container {
     return current >= 0 ? current : 0;
   }
 
-  /**
-   * Token consumption, split by who spent it: the main session's models versus
-   * the agents this session dispatched. Both halves come from records Pi and
-   * pi-subagents already wrote, so the numbers are observed, not estimated.
-   * The active tab's half comes first.
-   */
-  private usageLines(usage: PanelUsage): string[] {
-    const theme = this.theme;
-    const muted = (text: string) => theme.fg("muted", text);
-    const accent = (text: string) => theme.fg("accent", text);
-    // The column is narrow, so a model is named by its last path segment; the
-    // full `provider/id` is already visible in the model column.
-    const shortName = (id: string): string => id.split("/").pop() ?? id;
-
-    const sessionLines: string[] = [];
-    if (isZeroUsage(usage.sessionTotal)) {
-      sessionLines.push(muted("主会话  本会话暂无消耗"));
-    } else {
-      sessionLines.push(accent(`主会话  ${formatUsage(usage.sessionTotal)}`));
-      for (const [model, totals] of usage.sessionByModel) {
-        sessionLines.push(muted(`  ${shortName(model)}  ${formatUsage(totals, { turns: false })}`));
-      }
-    }
-
-    const childLines: string[] = [];
-    if (usage.childRuns === 0) {
-      childLines.push(muted("子 agent  本会话无派单"));
-    } else {
-      childLines.push(accent(`子 agent  ${usage.childRuns} 次派单  ${formatUsage(usage.childTotal)}`));
-      for (const [agent, totals] of usage.childrenByAgent) {
-        childLines.push(muted(`  ${shortName(agent)}  ${formatUsage(totals, { turns: false })}`));
-      }
-    }
-    if (usage.projectChildRuns > usage.childRuns) {
-      childLines.push(
-        muted(`本项目累计  ${usage.projectChildRuns} 次派单  ${formatUsage(usage.projectChildTotal)}`),
-      );
-    }
-
-    const head = this.tab === "session" ? sessionLines : childLines;
-    const tail = this.tab === "session" ? childLines : sessionLines;
-    return [...head, "", ...tail];
-  }
 }
 
 /** The list of models the panel offers, mirroring what `/model` shows. */
@@ -1102,41 +1062,15 @@ function createPort(
   };
 
   const history = (cwd: string) => {
+    // Only the model under the cursor is charted, so only its series is built.
+    // Building a second series for the model in effect doubled the per-keystroke
+    // cost for data the panel never rendered.
     const selected = selectedModel();
-    const effective =
-      selectedTab() === "session"
-        ? String(commandCtx?.model ? `${commandCtx.model.provider}/${commandCtx.model.id}` : "")
-        : (() => {
-            const settings = subagentSettings(ctx);
-            const id = typeof settings.defaultModel === "string" ? settings.defaultModel : "";
-            const provider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : "";
-            if (id) return provider ? `${provider}/${id}` : id;
-            return String(commandCtx?.model ? `${commandCtx.model.provider}/${commandCtx.model.id}` : "");
-          })();
+    const since = enabledSince(cwd);
     return {
       selectedModel: selected,
       selected: historyFor(cwd, selected),
-      effectiveModel: effective,
-      effective: historyFor(cwd, effective),
-      ...(enabledSince(cwd) !== undefined ? { since: enabledSince(cwd) } : {}),
-    };
-  };
-
-  const usage = (cwd: string): PanelUsage => {
-    const sessionId = commandCtx?.sessionManager?.getSessionId?.();
-    const entries = commandCtx?.sessionManager?.getEntries?.();
-    const session = Array.isArray(entries) ? collectSessionUsage(entries) : { byModel: new Map(), total: emptyUsage() };
-    const dirs = artifactDirs(cwd);
-    const mine = collectChildUsage(dirs, typeof sessionId === "string" ? sessionId : null);
-    const project = collectChildUsage(dirs);
-    return {
-      sessionByModel: topEntries(session.byModel, 3),
-      sessionTotal: session.total,
-      childrenByAgent: topEntries(mine.byAgent, 3),
-      childRuns: mine.runs,
-      childTotal: mine.total,
-      projectChildRuns: project.runs,
-      projectChildTotal: project.total,
+      ...(since !== undefined ? { since } : {}),
     };
   };
 
@@ -1166,9 +1100,6 @@ function createPort(
         (modelId ? findModel(provider, modelId) : undefined) ??
         findModel(String(commandCtx?.model?.provider ?? ""), String(commandCtx?.model?.id ?? "")) ??
         sessionModel,
-      usage: usage(
-        typeof commandCtx?.cwd === "string" && commandCtx.cwd ? commandCtx.cwd : ctx.root,
-      ),
       history: history(
         typeof commandCtx?.cwd === "string" && commandCtx.cwd ? commandCtx.cwd : ctx.root,
       ),
