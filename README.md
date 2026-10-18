@@ -117,59 +117,45 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 
 ## 会话内面板
 
-### `/Coworkflow:settings`
-
-项目设置都在这里改（Enter 执行）：
-
-```
-── 模块              trellis / worktree / agents-md / subagents / subagent-context / lane-worktree / panel 逐个 on·off
-── 会话              新会话自动加载 on·off · worktree 前缀（Enter 弹出输入框）
-── 子 agent 并发     同时活跃的 async run 上限（留空 = 不限） · 单次 parallel 并发度（留空 = 默认）
-── 维护              重新初始化（= /Coworkflow:init） · Trellis 范式对齐（= trellis update -s）
-── 状态              配置路径 · 初始化时间 · 本会话是否已加载
-```
-
-开关改动走与命令完全相同的代码路径（持久化 + 应用/收回产物），所以从面板关掉 `agents-md` 会真的把 `AGENTS.md` 受管区收回。未初始化的项目打开它会先问"初始化本项目？"，确认后直接跑完整初始化。
-
-**并发上限是项目级**，由本包自己执行——这是必要的兼容层：pi-subagents 的容量键（`maxActiveAsyncRunsPerSession`、`maxSubagentSpawnsPerSession`、`globalConcurrencyLimit`、`parallel.*`）只存在于它自己的用户级配置文件 `~/.pi/agent/extensions/subagent/config.json`，**没有项目级覆盖**；写进 `.pi/settings.json` 会被静默忽略（实测：工具仍报 `0/unlimited`）。
-
-所以本项目上限存在 `.pi/Coworkflow.json` 的 `subagentConcurrency` 里，由 `capacity` 模块在 `tool_call` 上执行：
-
-| 面板项 | 存哪 | 含义 |
-|---|---|---|
-| 本项目并发上限 | `.pi/Coworkflow.json` → `subagentConcurrency`（留空 = 不限） | 同一会话同时活跃的**顶层 async run** 数，与 pi-subagents 自己的口径一致；达到上限时新派单被拦下，理由里带上正在跑的 run 与下一步建议 |
-
-执行细节（都在 `core/capacity.ts`）：
-
-- 计数来源是 pi-subagents 自己写的运行目录（`<tmp>/pi-subagents-<scope>/async-subagent-runs/*/status.json`），按 `sessionId`（= 父会话文件）归属，终态集合与 pi-subagents 的 `TERMINAL_STATES` 一致；**进程已死但状态非终态**也释放，避免崩溃的 runner 永久占位。
-- 只拦「会新建 run」的调用：管理动作（`status`、`lane.*`、`worktree.*`、`mission.*`、`doctor`…）永远放行，否则满额时连"现在在跑什么"都问不了；前台调用（`async: false`）不占异步槽，也不拦。
-- **不改用户的 pi-subagents 配置文件**，所以没有需要还原的文件、没有两个项目的会话互相覆盖、Pi 崩溃也不会留下脏数据。没初始化 Coworkflow 的项目完全不受影响，照旧用 pi-subagents 自己的（用户级）配置。
-- 面板「状态」段同时显示 pi-subagents 自身上限与当前活跃 run 数，两个数字并排可见。
-- **同一轮并行派单也拦得住**：`tool_call` 通过后立刻在进程内占一个位（`CapacityTracker`），到该调用的 `tool_result` 释放；占位若已能被磁盘上的 run 对应上（按 `startedAt` 配对）就不再重复计数，所以既堵住了「第一个 run 还没落盘」的窗口，也不会把同一个 run 数两次。占位按 tool call id 记录并带 5 分钟 TTL，被拦下或失败的调用不会永久占位。
-
 ### `/Comodels`
 
-面板是 **tab + 三列表格**，宽度自适应（宽终端一屏看全，窄终端自动换行）：
+顶部两个 tab（`←→` 切换），下面是一张**三列表格**：每行一个模型，它自己的思考等级与用量在同一行。
 
 ```
 pi-Coworkflow · 模型面板
-[主会话]  子 agent                      ← ←→ 切换 tab
-作用范围：本会话（不写任何配置文件）
-当前：模型 clinepass/deepseek-v4.1-flash · 思考 medium
+[主会话]  子 agent   本会话
+当前：clinepass/deepseek-v4.1-flash · medium
 
-── 模型                      ── 思考等级        ── 用量
-→ deepseek-v4.1-flash [clinepass] ✓   ○ off      主会话  in 34.0k · out 2.8k · cache 29.0k · $0.0134 · 3 turns
-  glm-5.3-flash [clinepass]           ○ minimal    deepseek-v4.1-flash  in 30.0k · out 2.5k · cache 29.0k
-  gpt-5.6-sol [openai-codex]          ○ low        glm-5.3-flash  in 4.0k · out 300 · $0.0009
-                                      ● medium     子 agent  本会话无派单
-                                      ○ high
+  模型                                   │ 思考等级       │ 用量
+→ ✓ deepseek-v4.1-flash [clinepass]      │ ● medium       │ ████████████ 143.9k→12.7k (1.6M) $0.01
+    glm-5.3-flash [buddy2api]            │                │ █░░░░░░░░░░░ 4.0k→300 $0.0009
+
+当前生效：clinepass/deepseek-v4.1-flash · 思考 medium · 仅本会话
 ```
 
-- **三列分工**：左列选模型（`↑↓` + 直接打字即过滤，`✓` 是当前生效项，`→` 是光标），中列选思考等级（只列当前生效模型**真正支持**的档位），右列是 token 用量表（只读）。
-- **键位**：`↑↓` 在当前列内移动 · `Tab` 在 模型/思考 两列之间切光标 · `←→` 切换 `主会话`/`子 agent` tab · `Enter` 应用 · `Esc` 关闭 · 直接打字即搜索（只在模型列生效）。`←→` 在面板里先于搜索框处理——否则 `Input` 会把左右键当成光标移动吃掉，tab 就永远切不过去。
-- **两个 tab 的作用域**：`主会话` = 本会话（`pi.setModel` / `pi.setThinkingLevel`，不写任何配置文件）；`子 agent` = 本项目（`.pi/settings.json` 的 `subagents.defaultModel` / `defaultProvider` / `defaultThinking`，pi-subagents 的项目设置优先于用户设置，从不写全局）。子 agent 那一页第一项是 `(默认 / 继承主会话模型)`、思考第一项是 `(默认 / 继承主会话思考)`，选中即删键回到继承。
-- **用量列跟着 tab 走**：`主会话` tab 先显示本会话按模型拆分的消耗，`子 agent` tab 先显示本会话派单的按 agent 拆分消耗，另一半与「本项目累计」跟在后面。
-- **需要 `/Coworkflow:start`**：未加载的会话里 `/Comodels` 仍然注册着（这样 Pi 的斜杠命令模糊补全不会把它带到原生 `/model`），但会明确拒绝并提示先 start。
+- **用量是数字 + 柱状图**：柱长按当前视图内最大消耗等比缩放，数字用紧凑写法 `in→out (cache) $cost`。
+- **模型列有宽度上限**（约 46 列），余量给用量列——之前模型 id 占了大半屏、用量被挤成三行。
+- **子 agent tab** 的用量按 **agent** 记账，所以表格下方单独列：
+
+```
+  子 agent 用量（本会话 5 次派单）
+  trellis-implement                        │ ████████████ 705.4k→130.0k (1.9M) $0.02
+  researcher                               │ ███░░░░░░░░░ 232.9k→41.3k (375.8k) $0.0080
+```
+
+- 思考等级列平时只显示当前生效值（`● medium`）；按 `Tab` 把光标移到思考列后，表格下方展开完整档位列表供选择。
+- 列宽全部按终端宽度计算（80 列可用、160 列更宽），用 pi-tui 的 `truncateToWidth` 截断，不会换行错位。
+
+| 键 | 作用 |
+|---|---|
+| `↑↓` | 在当前列内移动 |
+| `Tab` | 在 模型 / 思考 两列之间切光标 |
+| `←→` | 切换 主会话 / 子 agent tab |
+| `Enter` | 应用当前项 |
+| `Esc` | 关闭 |
+| 直接打字 | 搜索过滤（只在模型列） |
+
+### `/Coworkflow:settings`
 
 ## 面板里的用量统计
 

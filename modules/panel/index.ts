@@ -45,7 +45,7 @@
 
 import { join } from "node:path";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
-import { Container, fuzzyFilter, HStack, Input, Key, matchesKey, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, fuzzyFilter, Input, Key, matchesKey, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type {
   ModuleContext,
   PiRuntimeHost,
@@ -60,6 +60,7 @@ import {
   collectChildUsage,
   collectSessionUsage,
   emptyUsage,
+  formatTokens,
   formatUsage,
   isZeroUsage,
   topEntries,
@@ -388,6 +389,8 @@ export class ModelPanel extends Container {
 
   private readonly body = new Container();
   private readonly searchInput = new Input();
+  /** Last width handed to render(), so the table can size its columns. */
+  private width: number | undefined;
   private readonly statusText = new Text("", 0, 0);
 
   constructor(
@@ -424,6 +427,12 @@ export class ModelPanel extends Container {
     this.searchInput.focused = true;
     this.searchInput.onSubmit = () => this.apply();
     this.updateBody();
+  }
+
+  render(width: number): string[] {
+    this.width = width;
+    this.updateBody();
+    return super.render(width);
   }
 
   /** Rows currently rendered in the focused column, for tests. */
@@ -560,10 +569,42 @@ export class ModelPanel extends Container {
     this.tui?.requestRender?.();
   }
 
-  /** Column heading, highlighted when that column owns the cursor. */
-  private heading(label: string, focused: boolean): string {
-    const text = `── ${label} `;
-    return focused ? this.theme.fg("accent", text) : this.theme.fg("muted", text);
+  /** A table cell, padded/truncated to an exact display width. */
+  private cell(text: string, width: number): string {
+    return truncateToWidth(text, width, "…", true);
+  }
+
+  /**
+   * Column widths for the table.
+   *
+   * The model name gets a fixed share rather than `grow`, because the panel was
+   * spending most of its width on model ids while the usage numbers wrapped into
+   * three lines. Everything is computed from the terminal width so the table fits
+   * on one screen at 100 columns and expands gracefully above that.
+   */
+  private columnWidths(width: number): { model: number; thinking: number; usage: number } {
+    const SEP = 3; // " │ "
+    const MARGIN = 2;
+    const total = Math.max(60, width - MARGIN - SEP * 2);
+    const thinking = Math.min(18, Math.max(12, Math.floor(total * 0.16)));
+    // The usage column carries a bar plus numbers, so it gets the largest share;
+    // the model id is truncated instead of being allowed to eat the row.
+    const usage = Math.min(64, Math.max(26, Math.floor(total * 0.5)));
+    // Cap the model column: an id longer than ~44 columns is truncated anyway, and
+    // the extra width is more useful to the numbers.
+    const model = Math.min(46, Math.max(18, total - thinking - usage));
+    const slack = Math.max(0, total - thinking - usage - model);
+    return { model, thinking, usage: usage + slack };
+  }
+
+  /** Header row: 模型 | 思考等级 | 用量 */
+  private tableHeader(widths: { model: number; thinking: number; usage: number }): string {
+    const theme = this.theme;
+    const cell = (text: string, w: number) => this.cell(text, w);
+    const sep = theme.fg("dim", " │ ");
+    const model = this.focus === "model" ? theme.fg("accent", cell("模型", widths.model)) : theme.fg("muted", cell("模型", widths.model));
+    const thinking = this.focus === "thinking" ? theme.fg("accent", cell("思考等级", widths.thinking)) : theme.fg("muted", cell("思考等级", widths.thinking));
+    return `  ${model}${sep}${thinking}${sep}${theme.fg("muted", cell("用量", widths.usage))}`;
   }
 
   private tabBar(snapshot: PanelSnapshot): Container {
@@ -575,15 +616,12 @@ export class ModelPanel extends Container {
         return this.tab === tab ? theme.fg("accent", `[${label}]`) : theme.fg("muted", ` ${label} `);
       })
       .join(" ");
-    header.addChild(new Text(tabLine, 0, 0));
     header.addChild(
       new Text(
-        theme.fg(
+        `${tabLine}  ${theme.fg(
           "muted",
-          this.tab === "session"
-            ? "作用范围：本会话（不写任何配置文件）"
-            : `作用范围：本项目（${PROJECT_SETTINGS} → subagents.*）`,
-        ),
+          this.tab === "session" ? "本会话" : `本项目 ${PROJECT_SETTINGS}`,
+        )}`,
         0,
         0,
       ),
@@ -593,8 +631,8 @@ export class ModelPanel extends Container {
         theme.fg(
           "muted",
           this.tab === "session"
-            ? `当前：模型 ${snapshot.sessionModel || "(未设置)"} · 思考 ${snapshot.sessionThinking || "(未设置)"}`
-            : `当前：模型 ${snapshot.subagentModel || INHERIT_MODEL_LABEL} · 思考 ${snapshot.subagentThinking || INHERIT_THINKING_LABEL}`,
+            ? `当前：${snapshot.sessionModel || "(未设置)"} · ${snapshot.sessionThinking || "(未设置)"}`
+            : `当前：${snapshot.subagentModel || INHERIT_MODEL_LABEL} · ${snapshot.subagentThinking || INHERIT_THINKING_LABEL}`,
         ),
         0,
         0,
@@ -603,85 +641,160 @@ export class ModelPanel extends Container {
     return header;
   }
 
-  /** The model column: search field plus the model list. */
-  private modelColumn(snapshot: PanelSnapshot, rows: PanelRow[], cursor: number): Container {
+  /**
+   * The table body: one row per model, so the thinking levels and the usage of a
+   * model sit on the same line as the model instead of in separate columns.
+   *
+   * The focused column's rows are the selectable ones; the other column still
+   * renders (with its own current value) so the row reads as a record.
+   */
+  private tableBody(snapshot: PanelSnapshot, width: number): string[] {
     const theme = this.theme;
-    const column = new Container();
-    column.addChild(new Text(this.heading("模型", this.focus === "model"), 0, 0));
-    column.addChild(this.searchInput);
-    if (rows.length === 0) {
-      column.addChild(new Text(theme.fg("muted", "  无匹配模型"), 0, 0));
-      return column;
+    const widths = this.columnWidths(width);
+    const lines: string[] = [this.tableHeader(widths)];
+
+    const modelRowsAll = modelRows(snapshot, this.tab);
+    const filtered =
+      this.focus === "model" && this.query.trim()
+        ? fuzzyFilter(modelRowsAll, this.query, (row) => `${row.label} ${row.badge ?? ""} ${row.detail ?? ""}`)
+        : modelRowsAll;
+    const modelCursor = this.focus === "model" ? this.cursor(snapshot) : this.cursorOf(snapshot, "model");
+    const thinkingRowsAll = thinkingRows(snapshot, this.tab);
+    const thinkingCursor =
+      this.focus === "thinking" ? this.cursor(snapshot) : this.cursorOf(snapshot, "thinking");
+    const currentThinking = thinkingRowsAll.find((row) => row.current)?.label ?? "—";
+    const currentModel = modelRowsAll.find((row) => row.current);
+
+    // Usage per row, drawn as a bar plus its numbers. Bars are scaled to the
+    // largest consumer in view, so the column reads as "who spent the most"
+    // rather than as raw digits that all look alike.
+    //
+    // Only the session tab maps usage onto model rows: children are accounted
+    // per *agent*, so the subagent tab shows that breakdown under the table
+    // instead of pretending it belongs to a model.
+    const usageByKey = new Map<string, UsageTotals>();
+    if (this.tab === "session") {
+      for (const [model, totals] of snapshot.usage.sessionByModel) {
+        usageByKey.set(model.split("/").pop() ?? model, totals);
+      }
     }
+    const usageMax = Math.max(
+      1,
+      ...[...usageByKey.values()].map((totals) => totals.input + totals.output + totals.cacheRead + totals.cacheWrite),
+    );
+
     const start = Math.max(
       0,
-      Math.min(cursor - Math.floor(MAX_VISIBLE / 2), Math.max(0, rows.length - MAX_VISIBLE)),
+      Math.min(modelCursor - Math.floor(MAX_VISIBLE / 2), Math.max(0, filtered.length - MAX_VISIBLE)),
     );
-    const end = Math.min(start + MAX_VISIBLE, rows.length);
+    const end = Math.min(start + MAX_VISIBLE, filtered.length);
+    const sep = theme.fg("dim", " │ ");
+
     for (let i = start; i < end; i += 1) {
-      const row = rows[i]!;
-      const selected = i === cursor;
-      const badge = row.badge ? ` ${theme.fg("muted", `[${row.badge}]`)}` : "";
-      const check = row.current ? theme.fg("success", " ✓") : "";
-      const line = selected
-        ? `${theme.fg("accent", "→ ")}${theme.fg("accent", row.label)}${badge}${check}`
-        : `  ${row.label}${badge}${check}`;
-      column.addChild(new Text(line, 0, 0));
+      const row = filtered[i]!;
+      const selected = this.focus === "model" && i === modelCursor;
+      const isCurrent = row.current;
+      const mark = selected ? theme.fg("accent", "→") : " ";
+      const check = isCurrent ? theme.fg("success", "✓ ") : "  ";
+      const name = `${row.label}${row.badge ? ` ${theme.fg("muted", `[${row.badge}]`)}` : ""}`;
+      const modelCell = selected
+        ? theme.fg("accent", this.cell(`${check}${row.label}${row.badge ? ` [${row.badge}]` : ""}`, widths.model - 2))
+        : this.cell(`${check}${name}`, widths.model - 2);
+      const thinkingCell =
+        isCurrent || (this.focus === "thinking" && false)
+          ? theme.fg(isCurrent ? "success" : "muted", this.cell(isCurrent ? `● ${currentThinking}` : "", widths.thinking))
+          : theme.fg("muted", this.cell("", widths.thinking));
+      const totals = usageByKey.get(row.label);
+      const usageCell = totals
+        ? this.usageCell(totals, usageMax, widths.usage)
+        : theme.fg("dim", this.cell("", widths.usage));
+      lines.push(`${mark} ${modelCell}${sep}${thinkingCell}${sep}${usageCell}`);
     }
-    if (start > 0 || end < rows.length) {
-      column.addChild(new Text(theme.fg("muted", `  (${cursor + 1}/${rows.length})`), 0, 0));
+
+    if (filtered.length === 0) lines.push(`  ${theme.fg("muted", "无匹配模型")}`);
+    if (start > 0 || end < filtered.length) {
+      lines.push(`  ${theme.fg("muted", `(${modelCursor + 1}/${filtered.length})`)}`);
     }
-    return column;
+
+    if (this.tab === "subagent" && snapshot.usage.childRuns > 0) {
+      const entries = [...snapshot.usage.childrenByAgent];
+      const max = Math.max(
+        1,
+        ...entries.map(([, totals]) => totals.input + totals.output + totals.cacheRead + totals.cacheWrite),
+      );
+      lines.push("");
+      lines.push(`  ${theme.fg("muted", `子 agent 用量（本会话 ${snapshot.usage.childRuns} 次派单）`)}`);
+      for (const [agent, totals] of entries) {
+        lines.push(
+          `  ${this.cell(agent, Math.max(10, widths.model - 2))}${theme.fg("dim", " │ ")}${this.usageCell(totals, max, widths.thinking + widths.usage + 3)}`,
+        );
+      }
+    }
+
+    // The thinking list renders under the table only while it owns the cursor;
+    // otherwise a single line states the current value, so the table keeps the
+    // screen instead of a seven-item row of levels.
+    if (this.focus === "thinking") {
+      const levels = thinkingRowsAll
+        .map((row, i) => {
+          const isSel = i === thinkingCursor;
+          const marker = row.current ? theme.fg("success", "●") : "○";
+          const text = `${marker} ${row.label}`;
+          return isSel ? theme.fg("accent", `[${text}]`) : text;
+        })
+        .join("  ");
+      lines.push("");
+      lines.push(`  ${theme.fg("accent", "思考等级")}  ${levels}`);
+    }
+    return lines;
   }
 
-  /** The thinking column: the levels the effective model actually supports. */
-  private thinkingColumn(rows: PanelRow[], cursor: number): Container {
+  /**
+   * One usage cell: a proportional bar, then the numbers.
+   *
+   * `in`/`out` are what the model actually billed; the bar scales on their sum
+   * (plus cache, which dominates for these providers) so a model that used ten
+   * times the tokens visibly has a ten-times-longer bar.
+   */
+  private usageCell(totals: UsageTotals, max: number, width: number): string {
     const theme = this.theme;
-    const column = new Container();
-    column.addChild(new Text(this.heading("思考等级", this.focus === "thinking"), 0, 0));
-    column.addChild(new Spacer(1));
-    for (let i = 0; i < rows.length; i += 1) {
-      const row = rows[i]!;
-      const selected = this.focus === "thinking" && i === cursor;
-      const marker = row.current ? theme.fg("success", "● ") : "○ ";
-      const label = selected ? theme.fg("accent", row.label) : row.label;
-      column.addChild(new Text(`${selected ? theme.fg("accent", "→ ") : "  "}${marker}${label}`, 0, 0));
-    }
-    return column;
-  }
+    const spent = totals.input + totals.output + totals.cacheRead + totals.cacheWrite;
+    const barWidth = Math.max(6, Math.min(12, Math.floor(width * 0.3)));
+    const filled = spent === 0 ? 0 : Math.max(1, Math.round((spent / max) * barWidth));
+    const bar = theme.fg("accent", "█".repeat(filled)) + theme.fg("dim", "░".repeat(barWidth - filled));
 
-  /** The usage column: who spent what, for the scope the active tab selects. */
-  private usageColumn(snapshot: PanelSnapshot): Container {
-    const theme = this.theme;
-    const column = new Container();
-    column.addChild(new Text(this.heading("用量", false), 0, 0));
-    column.addChild(new Spacer(1));
-    for (const line of this.usageLines(snapshot.usage)) {
-      column.addChild(new Text(line, 0, 0));
-    }
-    return column;
+    // Compact numbers: `30k→2.5k` (in→out), cache in parentheses, cost last.
+    // The full `in … · out … · cache …` form does not fit a table cell and used
+    // to wrap onto a second line.
+    const parts = [`${formatTokens(totals.input)}→${formatTokens(totals.output)}`];
+    const cache = totals.cacheRead + totals.cacheWrite;
+    if (cache > 0) parts.push(`(${formatTokens(cache)})`);
+    if (totals.cost > 0) parts.push(`$${totals.cost < 0.01 ? totals.cost.toFixed(4) : totals.cost.toFixed(2)}`);
+    return `${bar} ${theme.fg("muted", this.cell(parts.join(" "), width - barWidth - 1))}`;
   }
 
   private updateBody(): void {
     const snapshot = this.port.snapshot();
-    const rows = this.activeRows(snapshot);
-    const cursor = this.cursor(snapshot);
+    const width = this.width ?? 100;
 
     this.body.clear();
     this.body.addChild(new Text(this.theme.fg("accent", "pi-Coworkflow · 模型面板"), 0, 0));
     this.body.addChild(this.tabBar(snapshot));
     this.body.addChild(new Spacer(1));
-    this.body.addChild(
-      new HStack(
-        [
-          { component: this.modelColumn(snapshot, this.focus === "model" ? rows : modelRows(snapshot, this.tab), this.focus === "model" ? cursor : this.cursorOf(snapshot, "model")), basis: 0, grow: 3, minSize: 24 },
-          { component: this.thinkingColumn(thinkingRows(snapshot, this.tab), this.focus === "thinking" ? cursor : this.cursorOf(snapshot, "thinking")), basis: 0, grow: 1, minSize: 12 },
-          { component: this.usageColumn(snapshot), basis: 0, grow: 2, minSize: 20 },
-        ],
-        { gap: 2 },
-      ),
-    );
+    this.body.addChild(this.searchInput);
+    for (const line of this.tableBody(snapshot, width)) {
+      this.body.addChild(new Text(line, 0, 0));
+    }
+    this.body.addChild(new Spacer(1));
+    this.body.addChild(new Text(this.theme.fg("muted", this.currentModelLine(snapshot)), 0, 0));
     this.statusText.setText(this.status ? this.theme.fg("success", this.status) : "");
+  }
+
+  /** One line summarising what is in effect, right under the table. */
+  private currentModelLine(snapshot: PanelSnapshot): string {
+    return this.tab === "session"
+      ? `当前生效：${snapshot.sessionModel || "(未设置)"} · 思考 ${snapshot.sessionThinking || "(未设置)"} · 仅本会话`
+      : `当前生效：${snapshot.subagentModel || INHERIT_MODEL_LABEL} · 思考 ${snapshot.subagentThinking || INHERIT_THINKING_LABEL} · 本项目`;
   }
 
   /** Cursor of a column that does not currently own the focus. */
