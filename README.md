@@ -7,10 +7,13 @@
 用户级装一次，之后**每个项目自己决定要不要采用**：没采用的项目里这个扩展什么都不做。
 
 ```bash
-pi install npm:pi-coworkflow                    # npm 发布后
-pi install https://github.com/lyston11/pi-Coworkflow   # 直接从仓库装
-pi install /path/to/pi-Coworkflow               # 本地开发
+pi install git:github.com/lyston11/pi-Coworkflow@v0.1.0   # 推荐：按 tag 固定
+pi install https://github.com/lyston11/pi-Coworkflow      # 跟随默认分支
+pi install /path/to/pi-Coworkflow                         # 本地开发
 ```
+
+不需要 npm 账号：git 源由 Pi 直接 clone 并按 tag 固定，`pi update --extensions` 负责同步。
+（包名是 `pi-coworkflow`，将来若要发到 npm 画廊再用 `pi install npm:pi-coworkflow`。）
 
 三种源行为一致：扩展本身是**用户级**装的，装完任何项目都能用命令；每个项目要自己
 `/Coworkflow:init` 采用、`/Coworkflow:start` 加载。
