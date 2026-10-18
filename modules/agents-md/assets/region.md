@@ -28,12 +28,26 @@
 - 分支合并回 main 由人（或单一串行集成通道）执行，集成时检查 migration 序号冲突。
 - 任务收尾必含清理，不得把残留 worktree 留给用户：分支合并进 main、`task.py archive` 完成后，执行集成的 agent 必须立即 `git worktree remove ../{{worktreePrefix}}<任务目录名>` 并 `git branch -d feat/<任务目录名>`，并在交付说明中报告清理结果。删除前置条件：分支已合并进 main、worktree 无未提交代码改动（构建产物等未跟踪文件可忽略）；条件不满足时保留现场并向用户说明原因，禁止用 `--force` / `git branch -D` 掩盖未合并或未提交的工作。
 
-### 子 agent 派单（pi-subagents + Trellis 子任务注入）
+### 核心分工：主会话只做脑子，执行全部交出去
 
-主会话是决策者，也是默认执行者。派单只用于并行和隔离，不是把工作推出去；派单的机制细节按需加载 `pi-subagents` skill。
+**主会话负责规划、拆解、派单、监听、审计、决策；具体的执行工作由多个子 agent 完成，子 agent 只回结果。** 主会话不是执行者，它派完单不空等——继续做自己的判断、盯着进度、随时审计，直到总任务完成。
+
+```text
+主会话
+  ├─ 规划：理解需求 → 建/更新 Trellis 任务 → 拆成可独立验证的子任务
+  ├─ 派单：subagent({ agent, async: true, context: "fresh", task: "Active task: …" })
+  │          一次可派多个（互不冲突的才并行）
+  ├─ 监听：完成通知 + subagent({ action: "status" })；子 agent 提问走 contact_supervisor
+  ├─ 审计：读 diff / 产物，对照 prd 验收条件，跑受影响范围的最小充分检查
+  └─ 决策：合并、重派、调整拆分，或回头改需求
+```
+
+主会话自己动手的唯一场合：**需要全局判断、或改动小到不值得派单**（一行修复、改个配置、回答一个问题）。除此之外，"我来写"不是理由——派出去、审回来。
 
 - 授权：主会话可以主动派发子 agent，不必逐次询问。
 - 必须后台（`async: true`）。前台子会话是主进程内的一个会话、会占住主会话；后台派单后主会话继续做自己的事，用完成通知和 `subagent({ action: "status" })` 监控，子 agent 的提问走 `contact_supervisor` 转达。实测：后台子会话**会**加载项目 `AGENTS.md` 与 Magic Context（ambient 扩展），所以派单提示词只需给任务，不要把项目约定重抄一遍。
+- **派单边界**：能独立验证的边界工作才派（有明确的输入、产物、验收方式）；探索性、需要全局判断、或跨多个模块协调的工作留在主会话。子 agent 不负责决定"做什么"，只负责"把它做好并报告"。
+- **审计边界**：子 agent 回结果不等于结果可用。主会话要对照 prd 的验收条件检查产物、核对它引用的文件与结论、跑该模块的测试；发现偏差就重派或自己修，不能直接把子 agent 的结论当成事实汇报给用户。
 - 子会话**不继承**主会话上下文：派单时显式写 `context: "fresh"`（三个 Trellis 角色 agent 也已声明 `defaultContext: fresh`；若你全局配了 `defaultSubagentContext: "fork"`，它会被覆盖，必须显式 `fresh`）。它拿到的 Trellis 上下文由 `pi-Coworkflow` 的 `subagent-context` 模块按角色注入：`trellis-implement` / `trellis-check` / `trellis-research` 分别得到 `implement.jsonl` / `check.jsonl` / spec 目录树，加上 prd.md、design.md、implement.md；字节预算沿用 `.trellis/config.yaml` 的 `context_injection`。 **注入按角色，不按 agent 名**：任何 agent 只要标记成这三个角色之一，就拿到对应那一份；`worker` / `researcher` / `reviewer` 等其它 agent 默认不注入。
 - 因此派单提示词**首行必须是 `Active task: <任务目录>`**（Trellis 既有的派单协议）——注入靠它定位任务。角色按两级识别：① **会话名**里的 `trellis-<role>`（`subagent-<agent>-<runId>-<i>` 或 `<agent>: <task>` 都含 agent 名）；② agent 定义或派单提示词里的 `<!-- trellis-agent: <role> -->` 标记。所以想让任意 agent（例如 `worker`）拿到 implement 那份上下文，就在它的定义里加一行 `<!-- trellis-agent: implement -->`，不必把它改名成 `trellis-implement`。
 - 并行派单不要猜 API：`subagent({ workflow: "parallel", args: { tasks: [...] } })` 的每个 task **只接受 `agent` 和 `task`**（带 `output` 会被拒）；多步/带产出的 workflow 必须把 JS 脚本写成文件再用 `workflow: "<路径>"`，`workflow: true` 只在同一回复里写了 ```js 代码块时有效。先 `subagent({ action: "validate", workflow: "<路径>" })` 再 `async: true` 派发。
