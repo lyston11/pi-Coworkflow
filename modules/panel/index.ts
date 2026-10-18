@@ -57,13 +57,16 @@ import { fileContext } from "../../core/module.ts";
 import { configRoot, readConfig } from "../../core/config.ts";
 import { setSessionFlag } from "../../core/trellis.ts";
 import {
+  collectChildModelDailyUsage,
   collectChildUsage,
+  collectModelDailyUsage,
   collectSessionUsage,
   emptyUsage,
   formatTokens,
   formatUsage,
   isZeroUsage,
   topEntries,
+  type DailySeries,
   type UsageTotals,
 } from "../../core/usage.ts";
 
@@ -73,6 +76,8 @@ export type ThinkingLevelName = (typeof THINKING_LEVELS)[number];
 export const PROJECT_SETTINGS = join(".pi", "settings.json");
 const SUBAGENT_KEYS = ["defaultModel", "defaultProvider", "defaultThinking"] as const;
 const MAX_VISIBLE = 10;
+/** Sliding window for the usage bar chart, in local days. */
+const HISTORY_DAYS = 7;
 const INHERIT_MODEL_LABEL = "(默认 / 继承主会话模型)";
 const INHERIT_THINKING_LABEL = "(默认 / 继承主会话思考)";
 
@@ -95,6 +100,16 @@ export interface PanelSnapshot {
   subagentEffectiveModel: PanelModel | undefined;
   sessionEffectiveModel: PanelModel | undefined;
   usage: PanelUsage;
+  /**
+   * 7-day sliding window for the model the cursor is on, and for the model
+   * actually in effect, so the table row and the footer agree.
+   */
+  history: {
+    selectedModel: string;
+    selected: DailySeries;
+    effectiveModel: string;
+    effective: DailySeries;
+  };
 }
 
 /** Token accounting, split the way the panel shows it. */
@@ -113,6 +128,12 @@ export interface PanelUsage {
 
 export interface PanelPort {
   snapshot(): PanelSnapshot;
+  /**
+   * The model the cursor is on and the active tab, pushed by the panel before it
+   * asks for a snapshot. The panel owns the cursor; the port owns the data, and
+   * the history window has to be computed for the model under the cursor.
+   */
+  setCursorContext?(tab: Tab, model: string): void;
   applySessionModel(model: PanelModel): Promise<string>;
   applySessionThinking(level: ThinkingLevelName): string;
   applySubagentModel(model: PanelModel | null): string;
@@ -435,6 +456,19 @@ export class ModelPanel extends Container {
     return super.render(width);
   }
 
+  /**
+   * Tell the port which model the cursor is on before asking for data, so the
+   * usage chart follows the selection instead of always showing the model in
+   * effect.
+   */
+  private syncCursorContext(): void {
+    const snapshot = this.port.snapshot();
+    const rows = this.focus === "model" ? modelRows(snapshot, this.tab) : modelRows(snapshot, this.tab);
+    const row = rows[this.focus === "model" ? this.cursor(snapshot) : this.cursorOf(snapshot, "model")];
+    const model = row?.model;
+    this.port.setCursorContext?.(this.tab, model ? `${model.provider}/${model.id}` : "");
+  }
+
   /** Rows currently rendered in the focused column, for tests. */
   currentRows(): PanelRow[] {
     return this.activeRows(this.port.snapshot());
@@ -742,10 +776,13 @@ export class ModelPanel extends Container {
       const modelCell = this.paint(modelText, selected ? "accent" : null);
       const thinkingText = this.cell(isCurrent ? `● ${currentThinking}` : "", widths.thinking);
       const thinkingCell = this.paint(thinkingText, isCurrent ? "success" : null);
-      const totals = usageFor(row.model);
-      const usageCell = totals
-        ? this.usageCell(totals, usageMax, widths.usage)
-        : this.paint(this.cell("—", widths.usage), "dim");
+      // The chart follows the selection: the row under the cursor shows its own
+      // 7-day window, so moving the cursor re-reads usage for that model. Other
+      // rows stay blank rather than repeating the same numbers.
+      const isCursorRow = i === modelCursor;
+      const usageCell = isCursorRow
+        ? this.historyCell(snapshot.history.selected, snapshot.history.selectedModel, widths.usage)
+        : this.paint(this.cell("", widths.usage), "dim");
       lines.push(`${mark}${modelCell}${sep}${thinkingCell}${sep}${usageCell}`);
     }
 
@@ -822,6 +859,42 @@ export class ModelPanel extends Container {
    * (plus cache, which dominates for these providers) so a model that used ten
    * times the tokens visibly has a ten-times-longer bar.
    */
+  /**
+   * Seven-day sliding-window bar chart for one model, plus the window total.
+   *
+   * Bars are vertical blocks scaled to the busiest day in the window; the label
+   * under them is the day of week, so a spike can be located without counting
+   * from the right. Values are in token totals, cache included, because that is
+   * what the provider bills against the context window.
+   */
+  private historyCell(series: DailySeries, model: string, width: number): string {
+    const theme = this.theme;
+    if (series.days.length === 0) {
+      return this.paint(this.cell("—", width), "dim");
+    }
+    // Two columns per day: a single-row chart cannot be taller than one line, so
+    // width is what makes the shape readable. Levels are 1..8 block glyphs.
+    const glyphs = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    const bars = series.days
+      .map((day) => {
+        const spent = day.input + day.output + day.cacheRead + day.cacheWrite;
+        if (spent === 0) return theme.fg("dim", "··");
+        const ratio = series.peak === 0 ? 0 : spent / series.peak;
+        const level = Math.max(1, Math.min(8, Math.round(ratio * 8)));
+        return theme.fg("accent", (glyphs[level - 1] ?? "█").repeat(2));
+      })
+      .join("");
+    const summary = `${bars} 7d ${formatTokens(series.total)}`;
+    return this.cell(summary, width);
+  }
+
+  /** `周五` style label for a local `YYYY-MM-DD`, so the axis is readable. */
+  private weekdayLabel(day: string): string {
+    const date = new Date(`${day}T00:00:00`);
+    if (Number.isNaN(date.getTime())) return " ";
+    return "日一二三四五六"[date.getDay()] ?? " ";
+  }
+
   private usageCell(totals: UsageTotals, max: number, width: number): string {
     const theme = this.theme;
     const spent = totals.input + totals.output + totals.cacheRead + totals.cacheWrite;
@@ -842,6 +915,9 @@ export class ModelPanel extends Container {
   }
 
   private updateBody(): void {
+    // Push the cursor's model first: the snapshot's 7-day window is computed for
+    // it, so asking before syncing would chart the previously selected model.
+    this.syncCursorContext();
     const snapshot = this.port.snapshot();
     const width = this.width ?? 100;
 
@@ -851,6 +927,9 @@ export class ModelPanel extends Container {
     this.body.addChild(new Spacer(1));
     this.body.addChild(this.searchInput);
     for (const line of this.tableBody(snapshot, width)) {
+      this.body.addChild(new Text(line, 0, 0));
+    }
+    for (const line of this.historyFooter(snapshot)) {
       this.body.addChild(new Text(line, 0, 0));
     }
     this.body.addChild(new Spacer(1));
@@ -863,6 +942,27 @@ export class ModelPanel extends Container {
     return this.tab === "session"
       ? `当前生效：${snapshot.sessionModel || "(未设置)"} · 思考 ${snapshot.sessionThinking || "(未设置)"} · 仅本会话`
       : `当前生效：${snapshot.subagentModel || INHERIT_MODEL_LABEL} · 思考 ${snapshot.subagentThinking || INHERIT_THINKING_LABEL} · 本项目`;
+  }
+
+  /** Which model the 7-day chart belongs to, and its per-day breakdown. */
+  private historyFooter(snapshot: PanelSnapshot): string[] {
+    const theme = this.theme;
+    const series = snapshot.history.selected;
+    const model = snapshot.history.selectedModel;
+    if (!model || series.days.length === 0) return [];
+    const day = (value: number) => formatTokens(value);
+    const parts = series.days.map((entry) => {
+      const spent = entry.input + entry.output + entry.cacheRead + entry.cacheWrite;
+      return `${this.weekdayLabel(entry.day)} ${spent === 0 ? "—" : day(spent)}`;
+    });
+    return [
+      "",
+      theme.fg(
+        "muted",
+        `7 天窗口 · ${model} · 合计 ${day(series.total)}（含 cache；峰值 ${day(series.peak)}）`,
+      ),
+      `  ${theme.fg("dim", parts.join("  "))}`,
+    ];
   }
 
   /** Cursor of a column that does not currently own the focus. */
@@ -1016,6 +1116,13 @@ function createPort(
   tui: { requestRender?(): void },
   done: () => void,
 ): PanelPort {
+  // Pushed by the panel before each snapshot, so `history` can resolve the
+  // model under the cursor rather than only the one in effect.
+  let cursorTab: Tab = "session";
+  let cursorModel = "";
+  const selectedModel = (): string => cursorModel;
+  const selectedTab = (): Tab => cursorTab;
+
   const findModel = (provider: string, id: string): PanelModel | undefined =>
     panelModels(commandCtx).find((model) => model.provider === provider && model.id === id);
 
@@ -1030,6 +1137,68 @@ function createPort(
     if (typeof sessionDir === "string" && sessionDir) dirs.push(join(sessionDir, "subagent-artifacts"));
     dirs.push(join(cwd, ".pi", "subagents", "artifacts"));
     return dirs;
+  };
+
+  /**
+   * The 7-day window for one model: session usage by day, plus child runs that
+   * used the same model. Children are attributed by the model recorded in their
+   * run metadata, so the bar reflects what that model actually consumed.
+   */
+  const historyFor = (cwd: string, model: string): DailySeries => {
+    if (!model) {
+      return { days: [], total: 0, peak: 0 };
+    }
+    const entries = commandCtx?.sessionManager?.getEntries?.();
+    const sessionId = commandCtx?.sessionManager?.getSessionId?.();
+    const series = Array.isArray(entries)
+      ? collectModelDailyUsage(entries, model, HISTORY_DAYS)
+      : { days: [], total: 0, peak: 0 };
+    const childSeries = collectChildModelDailyUsage(
+      artifactDirs(cwd),
+      model,
+      HISTORY_DAYS,
+      typeof sessionId === "string" ? sessionId : null,
+    );
+    // Merge both sources per day so one bar covers everything that model spent.
+    const days = series.days.map((day, index) => {
+      const other = childSeries.days[index];
+      return {
+        day: day.day,
+        input: day.input + (other?.input ?? 0),
+        output: day.output + (other?.output ?? 0),
+        cacheRead: day.cacheRead + (other?.cacheRead ?? 0),
+        cacheWrite: day.cacheWrite + (other?.cacheWrite ?? 0),
+      };
+    });
+    const total = days.reduce(
+      (sum, day) => sum + day.input + day.output + day.cacheRead + day.cacheWrite,
+      0,
+    );
+    const peak = days.reduce(
+      (max, day) => Math.max(max, day.input + day.output + day.cacheRead + day.cacheWrite),
+      0,
+    );
+    return { days, total, peak };
+  };
+
+  const history = (cwd: string) => {
+    const selected = selectedModel();
+    const effective =
+      selectedTab() === "session"
+        ? String(commandCtx?.model ? `${commandCtx.model.provider}/${commandCtx.model.id}` : "")
+        : (() => {
+            const settings = subagentSettings(ctx);
+            const id = typeof settings.defaultModel === "string" ? settings.defaultModel : "";
+            const provider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : "";
+            if (id) return provider ? `${provider}/${id}` : id;
+            return String(commandCtx?.model ? `${commandCtx.model.provider}/${commandCtx.model.id}` : "");
+          })();
+    return {
+      selectedModel: selected,
+      selected: historyFor(cwd, selected),
+      effectiveModel: effective,
+      effective: historyFor(cwd, effective),
+    };
   };
 
   const usage = (cwd: string): PanelUsage => {
@@ -1079,10 +1248,17 @@ function createPort(
       usage: usage(
         typeof commandCtx?.cwd === "string" && commandCtx.cwd ? commandCtx.cwd : ctx.root,
       ),
+      history: history(
+        typeof commandCtx?.cwd === "string" && commandCtx.cwd ? commandCtx.cwd : ctx.root,
+      ),
     };
   };
 
   return {
+    setCursorContext(tab: Tab, model: string) {
+      cursorTab = tab;
+      cursorModel = model;
+    },
     snapshot,
     async applySessionModel(model: PanelModel): Promise<string> {
       const found = commandCtx?.modelRegistry?.find?.(model.provider, model.id) ?? model.raw;

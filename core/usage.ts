@@ -228,3 +228,171 @@ export function topEntries(map: Map<string, UsageTotals>, limit: number): [strin
     )
     .slice(0, limit);
 }
+
+/** A token count for one local day, keyed by `YYYY-MM-DD`. */
+export interface DailyTokens {
+  day: string;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+export interface DailySeries {
+  /** Oldest first, exactly `days` entries; days without usage are zero. */
+  days: DailyTokens[];
+  total: number;
+  /** Largest single day, for scaling bars. */
+  peak: number;
+}
+
+/** Local `YYYY-MM-DD` for a timestamp, so "today" matches the user's clock. */
+export function localDay(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+/** The last `days` local days, oldest first, ending today. */
+export function recentDays(days: number, now = new Date()): string[] {
+  const out: string[] = [];
+  for (let i = days - 1; i >= 0; i -= 1) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    out.push(localDay(d));
+  }
+  return out;
+}
+
+function emptyDay(day: string): DailyTokens {
+  return { day, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+}
+
+function accumulateDay(day: DailyTokens, usage: UsageTotals): void {
+  day.input += usage.input;
+  day.output += usage.output;
+  day.cacheRead += usage.cacheRead;
+  day.cacheWrite += usage.cacheWrite;
+}
+
+function seriesFrom(byDay: Map<string, DailyTokens>, days: number, now = new Date()): DailySeries {
+  const window = recentDays(days, now);
+  const list = window.map((day) => byDay.get(day) ?? emptyDay(day));
+  const total = list.reduce(
+    (sum, day) => sum + day.input + day.output + day.cacheRead + day.cacheWrite,
+    0,
+  );
+  const peak = list.reduce(
+    (max, day) => Math.max(max, day.input + day.output + day.cacheRead + day.cacheWrite),
+    0,
+  );
+  return { days: list, total, peak };
+}
+
+/**
+ * Token usage per local day for one model, over a sliding window.
+ *
+ * `model` is the `provider/id` key used by the usage records; matching is exact
+ * so two providers offering the same model name never share a series. Records
+ * without a usable timestamp are skipped rather than bucketed into today, since
+ * inventing a day would overstate recent usage.
+ */
+export function collectModelDailyUsage(
+  entries: unknown[],
+  model: string,
+  days: number,
+  now = new Date(),
+): DailySeries {
+  const byDay = new Map<string, DailyTokens>();
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    const type = record.type;
+    let provider: unknown;
+    let modelId: unknown;
+    let usage: UsageTotals | null = null;
+    let stamp: unknown = record.timestamp;
+
+    if (type === "message") {
+      const message = record.message;
+      if (message === null || typeof message !== "object") continue;
+      const messageRecord = message as Record<string, unknown>;
+      if (messageRecord.role !== "assistant") continue;
+      provider = messageRecord.provider;
+      modelId = messageRecord.model;
+      usage = normalizeUsage(messageRecord.usage);
+      stamp = record.timestamp ?? messageRecord.timestamp;
+    } else if (type === "usage" || type === "compaction" || type === "branch_summary") {
+      provider = record.provider;
+      modelId = record.model;
+      usage = normalizeUsage(record.usage);
+    }
+    if (usage === null) continue;
+    if (modelKey(provider, modelId) !== model) continue;
+
+    const at = typeof stamp === "string" || typeof stamp === "number" ? new Date(stamp) : null;
+    if (at === null || Number.isNaN(at.getTime())) continue;
+    const key = localDay(at);
+    const bucket = byDay.get(key) ?? emptyDay(key);
+    accumulateDay(bucket, usage);
+    byDay.set(key, bucket);
+  }
+  return seriesFrom(byDay, days, now);
+}
+
+/**
+ * Child usage per local day for one model, over a sliding window.
+ *
+ * Run metadata carries no per-run timestamp in every version, so the artifact
+ * file's mtime is used as the best available evidence of when the run finished.
+ */
+export function collectChildModelDailyUsage(
+  artifactDirs: string[],
+  model: string,
+  days: number,
+  parentSessionId?: string | null,
+  now = new Date(),
+): DailySeries {
+  const byDay = new Map<string, DailyTokens>();
+  for (const dir of artifactDirs) {
+    for (const file of listMetaFiles(dir)) {
+      const path = join(dir, file);
+      const meta = readJson(path);
+      if (meta === null) continue;
+      if (
+        parentSessionId &&
+        typeof meta.parentSessionId === "string" &&
+        meta.parentSessionId !== parentSessionId
+      ) {
+        continue;
+      }
+      const recorded = typeof meta.model === "string" ? meta.model : "";
+      // Metadata stores `provider/id` sometimes with a `:thinking` suffix.
+      const normalised = recorded.replace(/:\w+$/, "");
+      if (normalised !== model) continue;
+      const usage = normalizeUsage(meta.usage, 0);
+      if (usage === null) continue;
+
+      let at: Date | null = null;
+      if (typeof meta.timestamp === "number" || typeof meta.timestamp === "string") {
+        const parsed = new Date(meta.timestamp);
+        if (!Number.isNaN(parsed.getTime())) at = parsed;
+      }
+      if (at === null) {
+        try {
+          at = statSync(path).mtime;
+        } catch {
+          at = null;
+        }
+      }
+      if (at === null) continue;
+
+      const key = localDay(at);
+      const bucket = byDay.get(key) ?? emptyDay(key);
+      accumulateDay(bucket, usage);
+      byDay.set(key, bucket);
+    }
+  }
+  return seriesFrom(byDay, days, now);
+}
