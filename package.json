@@ -1,0 +1,28 @@
+{
+  "name": "pi-Coworkflow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Modular install of the Pi + Trellis + pi-subagents workflow layer (Trellis assets, task worktree isolation, AGENTS.md constraints, subagent defaults)",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/coworkflow.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lyston11/pi-Coworkflow.git"
+  },
+  "author": "lyston11",
+  "license": "MIT",
+  "files": [
+    "core",
+    "extensions",
+    "modules",
+    "README.md",
+    "tsconfig.json"
+  ]
+}

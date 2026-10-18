@@ -1,0 +1,5 @@
+node_modules/
+
+# Local harness links only; Pi resolves @earendil-works/* through its loader aliases.
+node_modules
+.DS_Store
