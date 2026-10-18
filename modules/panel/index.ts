@@ -569,9 +569,20 @@ export class ModelPanel extends Container {
     this.tui?.requestRender?.();
   }
 
-  /** A table cell, padded/truncated to an exact display width. */
+  /**
+   * A table cell, padded/truncated to an exact display width.
+   *
+   * Padding has to happen on the *visible* text: colouring a cell before padding
+   * makes `truncateToWidth` count escape sequences and the columns drift apart,
+   * which is what made the earlier table look ragged.
+   */
   private cell(text: string, width: number): string {
     return truncateToWidth(text, width, "…", true);
+  }
+
+  /** Colour applied after the cell has been padded to its column width. */
+  private paint(text: string, color: string | null): string {
+    return color ? this.theme.fg(color, text) : text;
   }
 
   /**
@@ -597,14 +608,29 @@ export class ModelPanel extends Container {
     return { model, thinking, usage: usage + slack };
   }
 
+  /** Horizontal rule spanning the table, so the columns read as a table. */
+  private tableRule(widths: { model: number; thinking: number; usage: number }): string {
+    const theme = this.theme;
+    // The data rows join cells with " │ " (3 columns), so the rule has to carry a
+    // dash on each side of the junction to land its ┼ under the same column.
+    const bar = (w: number) => "─".repeat(w);
+    return theme.fg(
+      "dim",
+      `  ${bar(widths.model)}─┼─${bar(widths.thinking)}─┼─${bar(widths.usage)}`,
+    );
+  }
+
   /** Header row: 模型 | 思考等级 | 用量 */
   private tableHeader(widths: { model: number; thinking: number; usage: number }): string {
     const theme = this.theme;
-    const cell = (text: string, w: number) => this.cell(text, w);
     const sep = theme.fg("dim", " │ ");
-    const model = this.focus === "model" ? theme.fg("accent", cell("模型", widths.model)) : theme.fg("muted", cell("模型", widths.model));
-    const thinking = this.focus === "thinking" ? theme.fg("accent", cell("思考等级", widths.thinking)) : theme.fg("muted", cell("思考等级", widths.thinking));
-    return `  ${model}${sep}${thinking}${sep}${theme.fg("muted", cell("用量", widths.usage))}`;
+    const model = this.paint(this.cell("模型", widths.model), this.focus === "model" ? "accent" : "muted");
+    const thinking = this.paint(
+      this.cell("思考等级", widths.thinking),
+      this.focus === "thinking" ? "accent" : "muted",
+    );
+    const usage = this.paint(this.cell("用量", widths.usage), "muted");
+    return `  ${model}${sep}${thinking}${sep}${usage}`;
   }
 
   private tabBar(snapshot: PanelSnapshot): Container {
@@ -651,7 +677,7 @@ export class ModelPanel extends Container {
   private tableBody(snapshot: PanelSnapshot, width: number): string[] {
     const theme = this.theme;
     const widths = this.columnWidths(width);
-    const lines: string[] = [this.tableHeader(widths)];
+    const lines: string[] = [this.tableHeader(widths), this.tableRule(widths)];
 
     const modelRowsAll = modelRows(snapshot, this.tab);
     const filtered =
@@ -663,7 +689,6 @@ export class ModelPanel extends Container {
     const thinkingCursor =
       this.focus === "thinking" ? this.cursor(snapshot) : this.cursorOf(snapshot, "thinking");
     const currentThinking = thinkingRowsAll.find((row) => row.current)?.label ?? "—";
-    const currentModel = modelRowsAll.find((row) => row.current);
 
     // Usage per row, drawn as a bar plus its numbers. Bars are scaled to the
     // largest consumer in view, so the column reads as "who spent the most"
@@ -672,12 +697,25 @@ export class ModelPanel extends Container {
     // Only the session tab maps usage onto model rows: children are accounted
     // per *agent*, so the subagent tab shows that breakdown under the table
     // instead of pretending it belongs to a model.
+    // Usage keys are `provider/id` (core/usage.ts `modelKey`), so match on the
+    // exact pair. Matching on the bare id was why rows for `deepseek-v4.1-flash`
+    // and `cline-pass/deepseek-v4.1-flash` could not show their own numbers.
     const usageByKey = new Map<string, UsageTotals>();
     if (this.tab === "session") {
-      for (const [model, totals] of snapshot.usage.sessionByModel) {
-        usageByKey.set(model.split("/").pop() ?? model, totals);
-      }
+      for (const [key, totals] of snapshot.usage.sessionByModel) usageByKey.set(key, totals);
     }
+    const usageFor = (model: PanelModel | null | undefined): UsageTotals | undefined => {
+      if (!model) return undefined;
+      const exact = usageByKey.get(`${model.provider}/${model.id}`);
+      if (exact) return exact;
+      // A provider may report the model id with its own prefix (cline-pass/…),
+      // so the recorded key can be `provider/prefix/id`. Only accept that when
+      // the provider matches: matching on the bare id would attribute one
+      // provider's spend to another provider's row of the same model name.
+      return [...usageByKey.entries()].find(
+        ([key]) => key.startsWith(`${model.provider}/`) && key.endsWith(`/${model.id}`),
+      )?.[1];
+    };
     const usageMax = Math.max(
       1,
       ...[...usageByKey.values()].map((totals) => totals.input + totals.output + totals.cacheRead + totals.cacheWrite),
@@ -694,26 +732,54 @@ export class ModelPanel extends Container {
       const row = filtered[i]!;
       const selected = this.focus === "model" && i === modelCursor;
       const isCurrent = row.current;
-      const mark = selected ? theme.fg("accent", "→") : " ";
-      const check = isCurrent ? theme.fg("success", "✓ ") : "  ";
-      const name = `${row.label}${row.badge ? ` ${theme.fg("muted", `[${row.badge}]`)}` : ""}`;
-      const modelCell = selected
-        ? theme.fg("accent", this.cell(`${check}${row.label}${row.badge ? ` [${row.badge}]` : ""}`, widths.model - 2))
-        : this.cell(`${check}${name}`, widths.model - 2);
-      const thinkingCell =
-        isCurrent || (this.focus === "thinking" && false)
-          ? theme.fg(isCurrent ? "success" : "muted", this.cell(isCurrent ? `● ${currentThinking}` : "", widths.thinking))
-          : theme.fg("muted", this.cell("", widths.thinking));
-      const totals = usageByKey.get(row.label);
+      const mark = selected ? theme.fg("accent", "→ ") : "  ";
+
+      // Every cell is padded as plain text, then coloured. Padding a coloured
+      // string would count escape bytes as width and misalign the columns.
+      const check = isCurrent ? "✓ " : "  ";
+      const badge = row.badge ? ` [${row.badge}]` : "";
+      const modelText = this.cell(`${check}${row.label}${badge}`, widths.model);
+      const modelCell = this.paint(modelText, selected ? "accent" : null);
+      const thinkingText = this.cell(isCurrent ? `● ${currentThinking}` : "", widths.thinking);
+      const thinkingCell = this.paint(thinkingText, isCurrent ? "success" : null);
+      const totals = usageFor(row.model);
       const usageCell = totals
         ? this.usageCell(totals, usageMax, widths.usage)
-        : theme.fg("dim", this.cell("", widths.usage));
-      lines.push(`${mark} ${modelCell}${sep}${thinkingCell}${sep}${usageCell}`);
+        : this.paint(this.cell("—", widths.usage), "dim");
+      lines.push(`${mark}${modelCell}${sep}${thinkingCell}${sep}${usageCell}`);
     }
 
     if (filtered.length === 0) lines.push(`  ${theme.fg("muted", "无匹配模型")}`);
     if (start > 0 || end < filtered.length) {
       lines.push(`  ${theme.fg("muted", `(${modelCursor + 1}/${filtered.length})`)}`);
+    }
+
+    // Usage recorded for a model that is no longer in the list (removed from
+    // config, or used earlier) would otherwise be invisible: the rows above only
+    // cover models currently offered. List just those orphans, biggest first.
+    if (this.tab === "session") {
+      const offered = modelRowsAll.filter((row) => row.model).map((row) => row.model!);
+      const orphans = [...snapshot.usage.sessionByModel]
+        .filter(([key]) => !offered.some((model) => usageFor(model) !== undefined && `${model.provider}/${model.id}` === key))
+        .sort(
+          (a, b) =>
+            b[1].input + b[1].output + b[1].cacheRead + b[1].cacheWrite -
+            (a[1].input + a[1].output + a[1].cacheRead + a[1].cacheWrite),
+        );
+      if (orphans.length > 0) {
+        const max = Math.max(
+          1,
+          ...orphans.map(([, totals]) => totals.input + totals.output + totals.cacheRead + totals.cacheWrite),
+        );
+        const nameWidth = Math.max(18, Math.min(46, widths.model));
+        lines.push("");
+        lines.push(`  ${theme.fg("muted", "已不在列表中的模型消耗")}`);
+        for (const [key, totals] of orphans) {
+          lines.push(
+            `  ${theme.fg("muted", this.cell(key, nameWidth))}${theme.fg("dim", " │ ")}${this.usageCell(totals, max, widths.thinking + widths.usage + 3)}`,
+          );
+        }
+      }
     }
 
     if (this.tab === "subagent" && snapshot.usage.childRuns > 0) {
@@ -759,18 +825,20 @@ export class ModelPanel extends Container {
   private usageCell(totals: UsageTotals, max: number, width: number): string {
     const theme = this.theme;
     const spent = totals.input + totals.output + totals.cacheRead + totals.cacheWrite;
-    const barWidth = Math.max(6, Math.min(12, Math.floor(width * 0.3)));
+    const barWidth = Math.max(6, Math.min(10, Math.floor(width * 0.26)));
     const filled = spent === 0 ? 0 : Math.max(1, Math.round((spent / max) * barWidth));
     const bar = theme.fg("accent", "█".repeat(filled)) + theme.fg("dim", "░".repeat(barWidth - filled));
 
-    // Compact numbers: `30k→2.5k` (in→out), cache in parentheses, cost last.
-    // The full `in … · out … · cache …` form does not fit a table cell and used
-    // to wrap onto a second line.
+    // Compact numbers: `in→out (cache) $cost`, padded as plain text to the
+    // remaining width so the bars line up across rows.
     const parts = [`${formatTokens(totals.input)}→${formatTokens(totals.output)}`];
     const cache = totals.cacheRead + totals.cacheWrite;
     if (cache > 0) parts.push(`(${formatTokens(cache)})`);
-    if (totals.cost > 0) parts.push(`$${totals.cost < 0.01 ? totals.cost.toFixed(4) : totals.cost.toFixed(2)}`);
-    return `${bar} ${theme.fg("muted", this.cell(parts.join(" "), width - barWidth - 1))}`;
+    if (totals.cost > 0) {
+      parts.push(`$${totals.cost < 0.01 ? totals.cost.toFixed(4) : totals.cost.toFixed(2)}`);
+    }
+    const numbers = this.cell(parts.join(" "), Math.max(6, width - barWidth - 1));
+    return `${bar} ${theme.fg("muted", numbers)}`;
   }
 
   private updateBody(): void {

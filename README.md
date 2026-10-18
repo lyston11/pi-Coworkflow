@@ -119,37 +119,32 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 
 ### `/Comodels`
 
-顶部两个 tab（`←→` 切换），下面是一张**三列表格**：每行一个模型，它自己的思考等级与用量在同一行。
+一张**表格**：每行一个模型，右侧是它自己的思考等级与该模型自己的 token 消耗（数字 + 比例柱）。
 
 ```
 pi-Coworkflow · 模型面板
 [主会话]  子 agent   本会话
-当前：clinepass/deepseek-v4.1-flash · medium
+当前：clinepass/cline-pass/deepseek-v4.1-flash · high
 
-  模型                                   │ 思考等级       │ 用量
-→ ✓ deepseek-v4.1-flash [clinepass]      │ ● medium       │ ████████████ 143.9k→12.7k (1.6M) $0.01
-    glm-5.3-flash [buddy2api]            │                │ █░░░░░░░░░░░ 4.0k→300 $0.0009
+  模型                                │ 思考等级         │ 用量
+  ────────────────────────────────────┼──────────────────┼──────────────────────────────────────────
+→ ✓ cline-pass/deepseek-v4.1-flash […] │ ● high           │ ██████████ 143.9k→12.7k (1.6M) $0.01
+    glm-5.3-flash [buddy2api]         │                  │ █░░░░░░░░░ 4.0k→300 $0.0009
+    gpt-6-sol [lanin]                 │                  │ —
 
-当前生效：clinepass/deepseek-v4.1-flash · 思考 medium · 仅本会话
+当前生效：clinepass/cline-pass/deepseek-v4.1-flash · 思考 high · 仅本会话
 ```
 
-- **用量是数字 + 柱状图**：柱长按当前视图内最大消耗等比缩放，数字用紧凑写法 `in→out (cache) $cost`。
-- **模型列有宽度上限**（约 46 列），余量给用量列——之前模型 id 占了大半屏、用量被挤成三行。
-- **子 agent tab** 的用量按 **agent** 记账，所以表格下方单独列：
-
-```
-  子 agent 用量（本会话 5 次派单）
-  trellis-implement                        │ ████████████ 705.4k→130.0k (1.9M) $0.02
-  researcher                               │ ███░░░░░░░░░ 232.9k→41.3k (375.8k) $0.0080
-```
-
-- 思考等级列平时只显示当前生效值（`● medium`）；按 `Tab` 把光标移到思考列后，表格下方展开完整档位列表供选择。
-- 列宽全部按终端宽度计算（80 列可用、160 列更宽），用 pi-tui 的 `truncateToWidth` 截断，不会换行错位。
+- **对齐**：每个单元格先按列宽 pad 成纯文本、再上色（给已上色的字符串 pad 会把 ANSI 字节算进宽度，列就会歪），分隔线用 `─┼─` 与数据行的 ` │ ` 同宽。110/160/180 列下实测所有 `│`/`┼` 落在同一列。
+- **用量归属明确**：按键是 `provider/id`，只在**同一 provider 内**做前缀回退（`provider/cline-pass/id`）。早先按裸 id 匹配会把 `buddy2api/deepseek-v4.1-flash` 的消耗算到 `clinepass/…` 行上。
+- **柱状图**：柱长按当前表格内最大消耗等比缩放；数字是紧凑的 `in→out (cache) $cost`。没有消耗的行显示 `—`。
+- **子 agent tab** 的用量按 **agent** 记账（不是按模型），所以它在表格下方单独一块；`/Comodels` 不会把 agent 的消耗硬挂到模型行。
+- 思考等级列平时只显示当前值；`Tab` 把光标移进该列后才在下方展开完整档位。
 
 | 键 | 作用 |
 |---|---|
 | `↑↓` | 在当前列内移动 |
-| `Tab` | 在 模型 / 思考 两列之间切光标 |
+| `Tab` | 在 模型 / 思考 列之间切光标 |
 | `←→` | 切换 主会话 / 子 agent tab |
 | `Enter` | 应用当前项 |
 | `Esc` | 关闭 |
