@@ -7,9 +7,13 @@
 用户级装一次，之后**每个项目自己决定要不要采用**：没采用的项目里这个扩展什么都不做。
 
 ```bash
-pi install https://github.com/lyston11/pi-Coworkflow
-# 或本地开发用：pi install /Users/lyston/PycharmProjects/pi-Coworkflow
+pi install npm:pi-coworkflow                    # npm 发布后
+pi install https://github.com/lyston11/pi-Coworkflow   # 直接从仓库装
+pi install /path/to/pi-Coworkflow               # 本地开发
 ```
+
+三种源行为一致：扩展本身是**用户级**装的，装完任何项目都能用命令；每个项目要自己
+`/Coworkflow:init` 采用、`/Coworkflow:start` 加载。
 
 > 更名说明：本包曾叫 `pi-trellis-workflow`。已采用的项目无需手工迁移——旧配置
 > `.pi/trellis-workflow.json` 会被读入并在下次运行后写成 `.pi/Coworkflow.json`（前缀与开关保持），

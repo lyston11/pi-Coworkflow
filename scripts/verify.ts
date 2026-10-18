@@ -34,6 +34,9 @@ interface PanelLike {
   handleInput(data: string): void;
 }
 
+/** Resolve a package file relative to this script, so the harness is portable. */
+const here = (rel: string): string => new URL(rel, import.meta.url).pathname;
+
 const [projectDirArg, command, ...rest] = process.argv.slice(2);
 const projectDir = projectDirArg ?? process.cwd();
 
@@ -120,7 +123,7 @@ switch (command) {
 
   case "settings": {
     const { SettingsPanel, buildSettingRows } = (await import(
-      "/Users/lyston/PycharmProjects/pi-Coworkflow/modules/panel/index.ts"
+      here("../modules/panel/index.ts")
     )) as unknown as {
       SettingsPanel: new (
         io: unknown,
@@ -278,11 +281,12 @@ switch (command) {
 
   case "panel": {
     const { ModelPanel } = (await import(
-      "/Users/lyston/PycharmProjects/pi-Coworkflow/modules/panel/index.ts"
+      here("../modules/panel/index.ts")
     )) as unknown as { ModelPanel: new (port: unknown, theme: unknown, tui: unknown) => PanelLike };
+    const usageModule = "../core/usage.ts";
     const { collectChildUsage, collectSessionUsage, topEntries } = (await import(
-      "/Users/lyston/PycharmProjects/pi-Coworkflow/core/usage.ts"
-    )) as typeof import("/Users/lyston/PycharmProjects/pi-Coworkflow/core/usage.ts");
+      here(usageModule)
+    )) as typeof import("../core/usage.ts");
 
     // Real accounting inputs: session entries in Pi's shape and pi-subagents'
     // run metadata files, so the panel's usage block is exercised for real.
