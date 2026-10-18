@@ -7,7 +7,7 @@
 本区属于 `pi-Coworkflow`，该扩展在本项目**是否安装、哪几个模块生效、新会话是否自动跑**由项目配置 `.pi/Coworkflow.json` 决定：
 
 - 文件不存在 = 本项目未采用本工作流，扩展在项目里不做任何事（不安装、不注入、不记账）。
-- 文件里的 `modules` 是逐模块开关（`trellis` / `worktree` / `agents-md` / `subagents` / `subagent-context` / `lane-worktree` / `panel`）。
+- 文件里的 `modules` 是逐模块开关（`trellis` / `worktree` / `agents` / `subagents` / `subagent-context` / `lane-worktree` / `capacity` / `panel`）。
 - `autoEnable` 决定**新会话是否自动跑**运行时模块；默认不自动跑，需要时用 `/Coworkflow:start` 只为当前会话打开（派发的子 agent 会跟随，因为开关按会话 id 记录）。
 - 用 `/Coworkflow:init` 安装或刷新，`/Coworkflow:init --enable <id> --disable <id>` 改模块开关，`--auto-enable on|off` 改新会话自动跑，`/Coworkflow:status` 查看当前状态。关掉某个模块会收回它写下的东西（如本区、`config.yaml` 的 `after_start` 注册）。
 - 模型与思考等级用 `/Comodels` 面板调：主会话那一页只影响本会话，子 agent 那一页写本项目 `.pi/settings.json` 的 `subagents.*`（不写全局）。

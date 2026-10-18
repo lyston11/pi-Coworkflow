@@ -9,7 +9,7 @@
  *
  *   modules/trellis/           the modified Trellis itself (delegates to the CLI)
  *   modules/worktree/          the after_start hook that isolates every task
- *   modules/agents-md/         the AGENTS.md constraint region (policy)
+ *   modules/agents/            the two instruction files: project region + child guide
  *   modules/subagents/         reuse or project-install pi-subagents
  *   modules/subagent-context/  runtime: role-scoped Trellis context in a child
  *   modules/lane-worktree/     runtime: lane ledger + `/Coworkflow:lanes`

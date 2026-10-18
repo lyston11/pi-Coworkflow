@@ -40,7 +40,11 @@ export const TASKS_DIR = join(TRELLIS_DIR, "tasks");
  * wastes tokens and gives the child duties it must not perform. This file holds
  * only what a child needs, and is injected by `subagent-context`.
  */
-export const SUBAGENT_GUIDE = join(TRELLIS_DIR, "subagent-AGENTS.md");
+/**
+ * Child-facing instructions. Owned by pi-Coworkflow, not Trellis: `trellis update`
+ * must not treat it as something to reconcile.
+ */
+export const SUBAGENT_GUIDE = join(".pi", "Coworkflow", "subagent-AGENTS.md");
 
 export function readText(path: string): string | null {
   try {
@@ -481,12 +485,33 @@ export function buildRoleContext(
 }
 
 /** The system-prompt block a dispatched child receives. */
+/**
+ * Strip inherited project instructions out of a child's system prompt.
+ *
+ * Pi renders every discovered `AGENTS.md`/`CLAUDE.md` as
+ * `<project_instructions path="…">…</project_instructions>`. pi-subagents only
+ * includes them for agents declaring `inheritProjectContext: true`, but a child
+ * must never end up with two instruction sets — its own guide and the project's
+ * main-session policy — so the inherited block is removed before the child guide
+ * is added, regardless of what the agent declared.
+ */
+export function stripProjectInstructions(systemPrompt: string): string {
+  if (!systemPrompt) return systemPrompt;
+  const stripped = systemPrompt
+    .replace(/<project_instructions\b[^>]*>[\s\S]*?<\/project_instructions>\s*/g, "")
+    .replace(/\n{3,}/g, "\n\n");
+  return stripped.trim();
+}
+
 /** The project's child-facing instructions, or null when it has none. */
 export function readSubagentGuide(root: string): string | null {
-  const raw = readText(join(root, SUBAGENT_GUIDE));
-  if (raw === null) return null;
-  const trimmed = raw.trim();
-  return trimmed ? trimmed : null;
+  // The pre-move location (`.trellis/subagent-AGENTS.md`) is read as a fallback so
+  // an adopted project keeps working until the next `/Coworkflow:init`.
+  for (const rel of [SUBAGENT_GUIDE, join(TRELLIS_DIR, "subagent-AGENTS.md")]) {
+    const raw = readText(join(root, rel));
+    if (raw !== null && raw.trim()) return raw.trim();
+  }
+  return null;
 }
 
 export function renderInjection(

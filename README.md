@@ -37,7 +37,7 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
   "modules": {
     "trellis": true,
     "worktree": true,
-    "agents-md": true,
+    "agents": true,
     "subagents": true,
     "subagent-context": true,
     "lane-worktree": true,
@@ -112,7 +112,7 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 |---|---|---|---|---|
 | `trellis` | 安装 | 改版 Trellis 本体 | 无 `.trellis/` 时 `trellis init --pi -y`；已有项目**只报告不重写**（tasks/spec/workspace/.runtime 记录保留），范式对齐走 `trellis update` 或 `--trellis-update` | 只报告，不删（Trellis 资产归 CLI 管） |
 | `worktree` | 安装 | 任务隔离的**机制** | `.trellis/scripts/hooks/auto_worktree.py` + `.trellis/config.yaml` 的 `hooks.after_start` | 移除 `after_start` 注册（脚本保留） |
-| `agents-md` | 安装 | 任务隔离与派单的**策略** | `AGENTS.md` 受管区 | 移除受管区（其余内容不动） |
+| `agents` | 安装 | 两份指令文件 | `AGENTS.md` 受管区（主会话）+ `.pi/Coworkflow/subagent-AGENTS.md`（子 agent） | 移除受管区（其余内容不动） |
 | `subagents` | 安装 | 复用已装的 `pi-subagents`，缺失时项目级安装 | 检测用户级/项目级/npm 目录；必要时写项目 `.pi/settings.json` 的 `packages`；写 `subagents.projectRootResolution: "git-root"` | 移除 `projectRootResolution`（packages 保留） |
 | `subagent-context` | 运行时 | 子会话按角色注入 Trellis 上下文 | 在**子会话**里读角色 + 任务，注入 `implement.jsonl`/`check.jsonl`/spec 树 + prd/design/implement | 不注册钩子 = 不注入 |
 | `lane-worktree` | 运行时 | lane 账目与合并计划 | 在**主会话**里记录 lane 指针到 `.trellis/.runtime/lanes/`，提供 `/Coworkflow:lanes` | 不注册钩子 = 不记账 |
@@ -131,8 +131,8 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 
 - `tasks/` `spec/` `workspace/` `.developer/` `.runtime/` 是项目历史，本包**从不重写**；`trellis update` 也把它们列为 “User data (preserved)”。
 - 范式（Pi 扩展、`.pi/prompts/`、`.pi/agents/`、`.trellis/workflow.md` 等）由 `trellis update` 对齐到本仓版本；`/Coworkflow:init --trellis-update` 会先跑 `--dry-run` 报告差异，再跑 `update -s`（升级未被本地改动的文件、保留本地改动）。
-- 本包写过的 `.trellis/config.yaml`（`after_start` 注册）与 `.pi/settings.json`（`subagents.*`）算“本地改动”，会被 `-s` 保留；即使被覆盖，后面的模块也会重新写回（顺序：trellis → worktree → agents-md → subagents）。
-- `AGENTS.md` 已有手写等价章节时，`agents-md` 模块不追加受管区、只提示迁移——两份规则不会同时存在。
+- 本包写过的 `.trellis/config.yaml`（`after_start` 注册）与 `.pi/settings.json`（`subagents.*`）算“本地改动”，会被 `-s` 保留；即使被覆盖，后面的模块也会重新写回（顺序：trellis → worktree → agents → subagents）。
+- `AGENTS.md` 已有手写等价章节时，`agents` 模块不追加受管区、只提示迁移——两份规则不会同时存在。
 
 ## 会话内面板
 
@@ -243,20 +243,29 @@ parallel handoff manifest（`lane.status` / `lane.recordMerge` / `worktree.clean
 
 lane 指针写在 `.trellis/.runtime/lanes/<任务>/<runId>.json`，只要求**项目已初始化**，不要求本会话跑过 `/Coworkflow:start`——未加载状态下派的单同样产出 artifact，漏记会让 `/Coworkflow:lanes` 少报。项目没初始化（没有 `.pi/Coworkflow.json`）时一律不写。
 
-## 子 agent 的 AGENTS.md 是单独一份
+## 两份指令文件：主会话一份，子 agent 一份
 
 项目根的 `AGENTS.md` 写的是**主会话的职责**（规划、派单、审计、合并），子 agent 不做这些。让子 agent 继承它有两个代价：白烧 token，以及把"主会话才该做的事"写进子 agent 的指令里。
 
-所以 `agents-md` 模块写**两份**：
+`agents` 模块因此管理**两份**：
 
-| 文件 | 读者 | 内容 |
-|---|---|---|
-| `AGENTS.md`（受管区） | 主会话 | 开关说明、任务隔离规则、核心分工（主会话只做脑子）、派单与审计边界 |
-| `.trellis/subagent-AGENTS.md` | 被派发的子 agent | 你只做派单里那一段、不能建/改 Trellis 任务、不能合并 push、验证再报告、上下文从哪来、禁止清单 |
+| 文件 | 读者 | 内容 | 归属 |
+|---|---|---|---|
+| `AGENTS.md`（受管区 `<!-- pi-Coworkflow:start/end -->`） | 主会话 | 开关说明、任务隔离规则、核心分工（主会话只做脑子）、派单与审计边界 | 项目自己（受管区由本包覆盖） |
+| `.pi/Coworkflow/subagent-AGENTS.md` | 被派发的子 agent | 你只做派单里那一段、不能建/改 Trellis 任务、不能合并 push、验证再报告、上下文从哪来、禁止清单 | **本包** |
 
-注入方式：`subagent-context` 模块在子会话里把 `.trellis/subagent-AGENTS.md` 放在**角色上下文之前**（每次派单都带，与角色无关），再接角色那一份 `implement.jsonl`/`check.jsonl`/spec。两者都没有时（非 Trellis 角色、无约定文件）不注入。
+放在 `.pi/Coworkflow/` 而不是 `.trellis/`，是因为它是本包的产物；放进 `.trellis/` 会让 `trellis update` 把它当成需要协调的模板。旧位置 `.trellis/subagent-AGENTS.md` 仍被读取（迁移兜底），下次 `/Coworkflow:init` 后只保留新位置。
 
-与 pi-subagents 的关系：agent 定义里 `inheritProjectContext: true` 会让子会话也继承项目 `AGENTS.md`。**若要严格分离，把它设成 `false`**——三个 Trellis 角色 agent 由 Trellis CLI 生成、默认继承，目前靠注入的子 agent 约定覆盖语义；需要绝对隔离时在 agent frontmatter 里关掉继承。
+### 为什么不可能同时注入两份
+
+子会话拿到项目 `AGENTS.md` 只有一条途径：pi-subagents 的 agent 声明了 `inheritProjectContext: true`（Pi 把它渲染成 `<project_instructions path="…">`）。两道保险都关掉它：
+
+1. **agent 侧**：Trellis 的三个角色 agent（`trellis-implement`/`check`/`research`）在模板里声明了 `inheritProjectContext: false`。
+2. **注入侧**：`subagent-context` 在追加子 agent 约定之前，先把系统提示里所有 `<project_instructions>` 块**剥掉**——所以即使某个自定义 agent 忘了这个字段，也不可能拿到两套规则。
+
+注入顺序固定为：`子 agent 工作约定` → `Trellis 子任务上下文（role: …）` → `边界`。约定与角色无关，每次派单都带；角色上下文按角色给。
+
+实测：子会话系统提示含"子 agent 工作约定"、含角色上下文、**不含**"核心分工"（主会话专属那段）；模拟继承了项目 `AGENTS.md` 的提示经剥离后，`<project_instructions>` 内容消失而其余部分保留。
 
 ## 目录结构
 
@@ -273,7 +282,7 @@ pi-Coworkflow/
     ├── index.ts                 # 注册表：顺序 = 安装顺序
     ├── trellis/index.ts
     ├── worktree/index.ts + assets/auto_worktree.py
-    ├── agents-md/index.ts + assets/region.md
+    ├── agents/index.ts + assets/{main-AGENTS.region.md,subagent-AGENTS.md}
     ├── subagents/index.ts
     ├── subagent-context/index.ts
     ├── lane-worktree/index.ts
@@ -334,7 +343,7 @@ Pi 把 `.pi/settings.json`、`.pi/mcp.json`、`.pi/extensions`、`.pi/agents`、
 ```bash
 node scripts/verify.ts <项目目录> Coworkflow:init                       # 安装层（真实写文件）
 node scripts/verify.ts <项目目录> Coworkflow:status                      # 体检（不改文件）
-node scripts/verify.ts <项目目录> Coworkflow:init --disable agents-md   # 模块开关 + 收回
+node scripts/verify.ts <项目目录> Coworkflow:init --disable agents   # 模块开关 + 收回
 node scripts/verify.ts <项目目录> Coworkflow:init --auto-enable on      # 新会话自动跑
 node scripts/verify.ts <项目目录> Coworkflow:start                           # 本会话开关（写会话标记）
 node scripts/verify.ts <项目目录> commands                             # 已注册命令

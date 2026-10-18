@@ -4,7 +4,7 @@
  * The mechanism half of "one task = one branch + one worktree". It writes the
  * `after_start` hook that `task.py start` runs, and registers it in
  * `.trellis/config.yaml`, so isolation happens whether or not the model
- * remembers to do it. The policy half lives in the `agents-md` module.
+ * remembers to do it. The policy half lives in the `agents` module.
  *
  * Switching the module off removes the registration — that is what makes tasks
  * stop being isolated — and leaves the hook script and Trellis's own files in

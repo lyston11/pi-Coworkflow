@@ -10,7 +10,7 @@
  */
 
 import type { WorkflowModule } from "../core/module.ts";
-import { agentsMdModule } from "./agents-md/index.ts";
+import { agentsModule } from "./agents/index.ts";
 import { capacityModule } from "./capacity/index.ts";
 import { laneWorktreeModule } from "./lane-worktree/index.ts";
 import { panelModule } from "./panel/index.ts";
@@ -22,7 +22,7 @@ import { worktreeModule } from "./worktree/index.ts";
 export const MODULES: WorkflowModule[] = [
   trellisModule,
   worktreeModule,
-  agentsMdModule,
+  agentsModule,
   subagentsModule,
   subagentContextModule,
   laneWorktreeModule,

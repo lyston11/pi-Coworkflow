@@ -38,6 +38,7 @@ import {
   mainCheckout,
   readSubagentGuide,
   renderInjection,
+  stripProjectInstructions,
   repoRoot,
   resolveTaskDir,
   taskRefForDisplay,
@@ -136,7 +137,11 @@ export const subagentContextModule: WorkflowModule = {
       injected.add(key);
 
       const block = renderInjection(role, taskRef, context, guide);
-      const current = typeof event?.systemPrompt === "string" ? event.systemPrompt : "";
+      // Drop any inherited project instructions first: a child gets exactly one
+      // instruction set (its own guide), never the main session's policy too.
+      const current = stripProjectInstructions(
+        typeof event?.systemPrompt === "string" ? event.systemPrompt : "",
+      );
       return { systemPrompt: [current, block].filter(Boolean).join("\n\n") };
     });
   },
