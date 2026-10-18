@@ -243,6 +243,21 @@ parallel handoff manifest（`lane.status` / `lane.recordMerge` / `worktree.clean
 
 lane 指针写在 `.trellis/.runtime/lanes/<任务>/<runId>.json`，只要求**项目已初始化**，不要求本会话跑过 `/Coworkflow:start`——未加载状态下派的单同样产出 artifact，漏记会让 `/Coworkflow:lanes` 少报。项目没初始化（没有 `.pi/Coworkflow.json`）时一律不写。
 
+## 子 agent 的 AGENTS.md 是单独一份
+
+项目根的 `AGENTS.md` 写的是**主会话的职责**（规划、派单、审计、合并），子 agent 不做这些。让子 agent 继承它有两个代价：白烧 token，以及把"主会话才该做的事"写进子 agent 的指令里。
+
+所以 `agents-md` 模块写**两份**：
+
+| 文件 | 读者 | 内容 |
+|---|---|---|
+| `AGENTS.md`（受管区） | 主会话 | 开关说明、任务隔离规则、核心分工（主会话只做脑子）、派单与审计边界 |
+| `.trellis/subagent-AGENTS.md` | 被派发的子 agent | 你只做派单里那一段、不能建/改 Trellis 任务、不能合并 push、验证再报告、上下文从哪来、禁止清单 |
+
+注入方式：`subagent-context` 模块在子会话里把 `.trellis/subagent-AGENTS.md` 放在**角色上下文之前**（每次派单都带，与角色无关），再接角色那一份 `implement.jsonl`/`check.jsonl`/spec。两者都没有时（非 Trellis 角色、无约定文件）不注入。
+
+与 pi-subagents 的关系：agent 定义里 `inheritProjectContext: true` 会让子会话也继承项目 `AGENTS.md`。**若要严格分离，把它设成 `false`**——三个 Trellis 角色 agent 由 Trellis CLI 生成、默认继承，目前靠注入的子 agent 约定覆盖语义；需要绝对隔离时在 agent frontmatter 里关掉继承。
+
 ## 目录结构
 
 ```text

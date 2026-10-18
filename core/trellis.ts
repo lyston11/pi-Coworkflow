@@ -32,6 +32,15 @@ export const LANES_DIR = join(TRELLIS_DIR, ".runtime", "lanes");
 export const SESSION_FLAGS_FILE = join(TRELLIS_DIR, ".runtime", "workflow-sessions.json");
 export const SPEC_DIR = join(TRELLIS_DIR, "spec");
 export const TASKS_DIR = join(TRELLIS_DIR, "tasks");
+/**
+ * Instructions for dispatched children, separate from the project `AGENTS.md`.
+ *
+ * The project file is written for the session the user drives: planning,
+ * dispatch, audit, merge. A child never does any of that, so inheriting it both
+ * wastes tokens and gives the child duties it must not perform. This file holds
+ * only what a child needs, and is injected by `subagent-context`.
+ */
+export const SUBAGENT_GUIDE = join(TRELLIS_DIR, "subagent-AGENTS.md");
 
 export function readText(path: string): string | null {
   try {
@@ -472,9 +481,23 @@ export function buildRoleContext(
 }
 
 /** The system-prompt block a dispatched child receives. */
-export function renderInjection(role: SubagentRole, taskRef: string, context: string): string {
+/** The project's child-facing instructions, or null when it has none. */
+export function readSubagentGuide(root: string): string | null {
+  const raw = readText(join(root, SUBAGENT_GUIDE));
+  if (raw === null) return null;
+  const trimmed = raw.trim();
+  return trimmed ? trimmed : null;
+}
+
+export function renderInjection(
+  role: SubagentRole,
+  taskRef: string,
+  context: string,
+  guide?: string | null,
+): string {
   return [
     "<!-- pi-Coworkflow:subagent-context -->",
+    ...(guide ? ["## 子 agent 工作约定（本项目）", "", guide, ""] : []),
     `## Trellis 子任务上下文（role: ${role}）`,
     "",
     taskRef ? `Active task: ${taskRef}` : "Active task: (none)",

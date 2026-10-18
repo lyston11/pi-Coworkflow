@@ -11,7 +11,7 @@
  * without Pi installed. The Trellis Pi extension takes the same approach.
  */
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -42,6 +42,8 @@ export interface ModuleContext {
   read(path: string): string | null;
   /** Write when the content differs. Returns what happened; honours `dry`. */
   write(path: string, body: string, options?: { mode?: number }): Status;
+  /** Delete a file this package owns. A no-op when it is already gone. */
+  remove(path: string): Status;
 }
 
 export interface WorkflowModule {
@@ -131,6 +133,11 @@ export function createContext(options: {
         if (writeOptions?.mode !== undefined) chmodSync(path, writeOptions.mode);
       }
       return status;
+    },
+    remove(path) {
+      if (readText(path) === null) return "ok";
+      if (!options.dry) rmSync(path, { force: true });
+      return "updated";
     },
   };
 }

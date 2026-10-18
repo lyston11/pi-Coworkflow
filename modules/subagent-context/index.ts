@@ -36,6 +36,7 @@ import {
   activeTaskDir,
   buildRoleContext,
   mainCheckout,
+  readSubagentGuide,
   renderInjection,
   repoRoot,
   resolveTaskDir,
@@ -128,10 +129,13 @@ export const subagentContextModule: WorkflowModule = {
       if (injected.has(key)) return undefined;
 
       const context = buildRoleContext(root, taskDir, role);
-      if (!context) return undefined;
+      // The child-facing guide is independent of the role: every dispatched child
+      // gets it, and it replaces the project AGENTS.md a child must not follow.
+      const guide = readSubagentGuide(root);
+      if (!context && !guide) return undefined;
       injected.add(key);
 
-      const block = renderInjection(role, taskRef, context);
+      const block = renderInjection(role, taskRef, context, guide);
       const current = typeof event?.systemPrompt === "string" ? event.systemPrompt : "";
       return { systemPrompt: [current, block].filter(Boolean).join("\n\n") };
     });

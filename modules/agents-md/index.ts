@@ -16,6 +16,8 @@ import type { ModuleContext, WorkflowModule } from "../../core/module.ts";
 import { moduleAsset } from "../../core/module.ts";
 
 const REGION_START = "<!-- pi-Coworkflow:start -->";
+/** Where the child-facing instructions live, separate from the project AGENTS.md. */
+const SUBAGENT_GUIDE_REL = join(".trellis", "subagent-AGENTS.md");
 const REGION_END = "<!-- pi-Coworkflow:end -->";
 /** Markers written before this package was renamed to pi-Coworkflow. */
 const LEGACY_REGION_START = "<!-- pi-trellis-workflow:start -->";
@@ -65,6 +67,24 @@ export const agentsMdModule: WorkflowModule = {
   title: "AGENTS.md 约束受管区（任务隔离 + 派单策略）",
 
   apply(ctx: ModuleContext): void {
+    // The child-facing instructions are a separate file: the project AGENTS.md
+    // describes the main session's duties (planning, dispatch, audit, merge),
+    // which a dispatched child must not perform. Writing both from one module
+    // keeps them in step — the policy and the child contract are one decision.
+    const guide = moduleAsset(import.meta.url, "./assets/subagent-AGENTS.md");
+    if (guide === null) {
+      ctx.report("error", "资产缺失：modules/agents-md/assets/subagent-AGENTS.md");
+    } else {
+      const target = join(ctx.root, SUBAGENT_GUIDE_REL);
+      const status = ctx.write(target, guide);
+      ctx.report(
+        status,
+        status === "ok"
+          ? `${SUBAGENT_GUIDE_REL} 已是最新（子 agent 专用约定）`
+          : `${SUBAGENT_GUIDE_REL}（子 agent 专用约定，与项目 AGENTS.md 分开）`,
+      );
+    }
+
     const region = regionText(ctx);
     if (region === null) return;
 
@@ -101,6 +121,12 @@ export const agentsMdModule: WorkflowModule = {
   },
 
   remove(ctx: ModuleContext): void {
+    const guide = join(ctx.root, SUBAGENT_GUIDE_REL);
+    if (ctx.read(guide) !== null) {
+      ctx.remove(guide);
+      ctx.report("updated", `${SUBAGENT_GUIDE_REL} 已移除`);
+    }
+
     const target = join(ctx.root, "AGENTS.md");
     const current = ctx.read(target);
     if (current === null) {
