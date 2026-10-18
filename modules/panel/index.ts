@@ -726,37 +726,6 @@ export class ModelPanel extends Container {
       this.focus === "thinking" ? this.cursor(snapshot) : this.cursorOf(snapshot, "thinking");
     const currentThinking = thinkingRowsAll.find((row) => row.current)?.label ?? "—";
 
-    // Usage per row, drawn as a bar plus its numbers. Bars are scaled to the
-    // largest consumer in view, so the column reads as "who spent the most"
-    // rather than as raw digits that all look alike.
-    //
-    // Only the session tab maps usage onto model rows: children are accounted
-    // per *agent*, so the subagent tab shows that breakdown under the table
-    // instead of pretending it belongs to a model.
-    // Usage keys are `provider/id` (core/usage.ts `modelKey`), so match on the
-    // exact pair. Matching on the bare id was why rows for `deepseek-v4.1-flash`
-    // and `cline-pass/deepseek-v4.1-flash` could not show their own numbers.
-    const usageByKey = new Map<string, UsageTotals>();
-    if (this.tab === "session") {
-      for (const [key, totals] of snapshot.usage.sessionByModel) usageByKey.set(key, totals);
-    }
-    const usageFor = (model: PanelModel | null | undefined): UsageTotals | undefined => {
-      if (!model) return undefined;
-      const exact = usageByKey.get(`${model.provider}/${model.id}`);
-      if (exact) return exact;
-      // A provider may report the model id with its own prefix (cline-pass/…),
-      // so the recorded key can be `provider/prefix/id`. Only accept that when
-      // the provider matches: matching on the bare id would attribute one
-      // provider's spend to another provider's row of the same model name.
-      return [...usageByKey.entries()].find(
-        ([key]) => key.startsWith(`${model.provider}/`) && key.endsWith(`/${model.id}`),
-      )?.[1];
-    };
-    const usageMax = Math.max(
-      1,
-      ...[...usageByKey.values()].map((totals) => totals.input + totals.output + totals.cacheRead + totals.cacheWrite),
-    );
-
     const start = Math.max(
       0,
       Math.min(modelCursor - Math.floor(MAX_VISIBLE / 2), Math.max(0, filtered.length - MAX_VISIBLE)),
@@ -791,49 +760,6 @@ export class ModelPanel extends Container {
     if (filtered.length === 0) lines.push(`  ${theme.fg("muted", "无匹配模型")}`);
     if (start > 0 || end < filtered.length) {
       lines.push(`  ${theme.fg("muted", `(${modelCursor + 1}/${filtered.length})`)}`);
-    }
-
-    // Usage recorded for a model that is no longer in the list (removed from
-    // config, or used earlier) would otherwise be invisible: the rows above only
-    // cover models currently offered. List just those orphans, biggest first.
-    if (this.tab === "session") {
-      const offered = modelRowsAll.filter((row) => row.model).map((row) => row.model!);
-      const orphans = [...snapshot.usage.sessionByModel]
-        .filter(([key]) => !offered.some((model) => usageFor(model) !== undefined && `${model.provider}/${model.id}` === key))
-        .sort(
-          (a, b) =>
-            b[1].input + b[1].output + b[1].cacheRead + b[1].cacheWrite -
-            (a[1].input + a[1].output + a[1].cacheRead + a[1].cacheWrite),
-        );
-      if (orphans.length > 0) {
-        const max = Math.max(
-          1,
-          ...orphans.map(([, totals]) => totals.input + totals.output + totals.cacheRead + totals.cacheWrite),
-        );
-        const nameWidth = Math.max(18, Math.min(46, widths.model));
-        lines.push("");
-        lines.push(`  ${theme.fg("muted", "已不在列表中的模型消耗")}`);
-        for (const [key, totals] of orphans) {
-          lines.push(
-            `  ${theme.fg("muted", this.cell(key, nameWidth))}${theme.fg("dim", " │ ")}${this.usageCell(totals, max, widths.thinking + widths.usage + 3)}`,
-          );
-        }
-      }
-    }
-
-    if (this.tab === "subagent" && snapshot.usage.childRuns > 0) {
-      const entries = [...snapshot.usage.childrenByAgent];
-      const max = Math.max(
-        1,
-        ...entries.map(([, totals]) => totals.input + totals.output + totals.cacheRead + totals.cacheWrite),
-      );
-      lines.push("");
-      lines.push(`  ${theme.fg("muted", `子 agent 用量（本会话 ${snapshot.usage.childRuns} 次派单）`)}`);
-      for (const [agent, totals] of entries) {
-        lines.push(
-          `  ${this.cell(agent, Math.max(10, widths.model - 2))}${theme.fg("dim", " │ ")}${this.usageCell(totals, max, widths.thinking + widths.usage + 3)}`,
-        );
-      }
     }
 
     // The thinking list renders under the table only while it owns the cursor;
@@ -874,8 +800,8 @@ export class ModelPanel extends Container {
     if (series.days.length === 0) {
       return this.paint(this.cell("—", width), "dim");
     }
-    // Two columns per day: a single-row chart cannot be taller than one line, so
-    // width is what makes the shape readable. Levels are 1..8 block glyphs.
+    // Two columns per day, 8 levels: one row of blocks is the whole chart, so the
+    // width of the usage column is what makes the shape readable.
     const glyphs = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
     const bars = series.days
       .map((day) => {
@@ -886,34 +812,8 @@ export class ModelPanel extends Container {
         return theme.fg("accent", (glyphs[level - 1] ?? "█").repeat(2));
       })
       .join("");
-    const summary = `${bars} 7d ${formatTokens(series.total)}`;
+    const summary = `${bars} ${formatTokens(series.total)}`;
     return this.cell(summary, width);
-  }
-
-  /** `周五` style label for a local `YYYY-MM-DD`, so the axis is readable. */
-  private weekdayLabel(day: string): string {
-    const date = new Date(`${day}T00:00:00`);
-    if (Number.isNaN(date.getTime())) return " ";
-    return "日一二三四五六"[date.getDay()] ?? " ";
-  }
-
-  private usageCell(totals: UsageTotals, max: number, width: number): string {
-    const theme = this.theme;
-    const spent = totals.input + totals.output + totals.cacheRead + totals.cacheWrite;
-    const barWidth = Math.max(6, Math.min(10, Math.floor(width * 0.26)));
-    const filled = spent === 0 ? 0 : Math.max(1, Math.round((spent / max) * barWidth));
-    const bar = theme.fg("accent", "█".repeat(filled)) + theme.fg("dim", "░".repeat(barWidth - filled));
-
-    // Compact numbers: `in→out (cache) $cost`, padded as plain text to the
-    // remaining width so the bars line up across rows.
-    const parts = [`${formatTokens(totals.input)}→${formatTokens(totals.output)}`];
-    const cache = totals.cacheRead + totals.cacheWrite;
-    if (cache > 0) parts.push(`(${formatTokens(cache)})`);
-    if (totals.cost > 0) {
-      parts.push(`$${totals.cost < 0.01 ? totals.cost.toFixed(4) : totals.cost.toFixed(2)}`);
-    }
-    const numbers = this.cell(parts.join(" "), Math.max(6, width - barWidth - 1));
-    return `${bar} ${theme.fg("muted", numbers)}`;
   }
 
   private updateBody(): void {
@@ -931,9 +831,6 @@ export class ModelPanel extends Container {
     for (const line of this.tableBody(snapshot, width)) {
       this.body.addChild(new Text(line, 0, 0));
     }
-    for (const line of this.historyFooter(snapshot)) {
-      this.body.addChild(new Text(line, 0, 0));
-    }
     this.body.addChild(new Spacer(1));
     this.body.addChild(new Text(this.theme.fg("muted", this.currentModelLine(snapshot)), 0, 0));
     this.statusText.setText(this.status ? this.theme.fg("success", this.status) : "");
@@ -944,31 +841,6 @@ export class ModelPanel extends Container {
     return this.tab === "session"
       ? `当前生效：${snapshot.sessionModel || "(未设置)"} · 思考 ${snapshot.sessionThinking || "(未设置)"} · 仅本会话`
       : `当前生效：${snapshot.subagentModel || INHERIT_MODEL_LABEL} · 思考 ${snapshot.subagentThinking || INHERIT_THINKING_LABEL} · 本项目`;
-  }
-
-  /** Which model the 7-day chart belongs to, and its per-day breakdown. */
-  private historyFooter(snapshot: PanelSnapshot): string[] {
-    const theme = this.theme;
-    const series = snapshot.history.selected;
-    const model = snapshot.history.selectedModel;
-    if (!model || series.days.length === 0) return [];
-    const day = (value: number) => formatTokens(value);
-    const parts = series.days.map((entry) => {
-      const spent = entry.input + entry.output + entry.cacheRead + entry.cacheWrite;
-      return `${this.weekdayLabel(entry.day)} ${spent === 0 ? "—" : day(spent)}`;
-    });
-    const since = snapshot.history.since;
-    const scope = since
-      ? `Coworkflow 加载后（${new Date(since).toLocaleTimeString("zh-CN", { hour12: false })} 起）`
-      : "本会话未加载 Coworkflow，暂无统计";
-    return [
-      "",
-      theme.fg(
-        "muted",
-        `7 天窗口 · ${model} · 合计 ${day(series.total)}（含 cache；峰值 ${day(series.peak)}）· ${scope}`,
-      ),
-      `  ${theme.fg("dim", parts.join("  "))}`,
-    ];
   }
 
   /** Cursor of a column that does not currently own the focus. */
