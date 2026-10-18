@@ -303,6 +303,8 @@ export function collectModelDailyUsage(
   model: string,
   days: number,
   now = new Date(),
+  /** Only count records at or after this instant (ms), e.g. when the layer loaded. */
+  since?: number,
 ): DailySeries {
   const byDay = new Map<string, DailyTokens>();
   for (const entry of entries) {
@@ -333,6 +335,7 @@ export function collectModelDailyUsage(
 
     const at = typeof stamp === "string" || typeof stamp === "number" ? new Date(stamp) : null;
     if (at === null || Number.isNaN(at.getTime())) continue;
+    if (since !== undefined && at.getTime() < since) continue;
     const key = localDay(at);
     const bucket = byDay.get(key) ?? emptyDay(key);
     accumulateDay(bucket, usage);
@@ -353,6 +356,8 @@ export function collectChildModelDailyUsage(
   days: number,
   parentSessionId?: string | null,
   now = new Date(),
+  /** Only count runs at or after this instant (ms). */
+  since?: number,
 ): DailySeries {
   const byDay = new Map<string, DailyTokens>();
   for (const dir of artifactDirs) {
@@ -387,6 +392,7 @@ export function collectChildModelDailyUsage(
         }
       }
       if (at === null) continue;
+      if (since !== undefined && at.getTime() < since) continue;
 
       const key = localDay(at);
       const bucket = byDay.get(key) ?? emptyDay(key);

@@ -55,7 +55,7 @@ import type {
 } from "../../core/module.ts";
 import { fileContext } from "../../core/module.ts";
 import { configRoot, readConfig } from "../../core/config.ts";
-import { setSessionFlag } from "../../core/trellis.ts";
+import { sessionEnabledSince, setSessionFlag } from "../../core/trellis.ts";
 import {
   collectChildModelDailyUsage,
   collectChildUsage,
@@ -109,6 +109,8 @@ export interface PanelSnapshot {
     selected: DailySeries;
     effectiveModel: string;
     effective: DailySeries;
+    /** Epoch ms this session loaded Coworkflow; usage before it is excluded. */
+    since?: number;
   };
 }
 
@@ -955,11 +957,15 @@ export class ModelPanel extends Container {
       const spent = entry.input + entry.output + entry.cacheRead + entry.cacheWrite;
       return `${this.weekdayLabel(entry.day)} ${spent === 0 ? "—" : day(spent)}`;
     });
+    const since = snapshot.history.since;
+    const scope = since
+      ? `Coworkflow 加载后（${new Date(since).toLocaleTimeString("zh-CN", { hour12: false })} 起）`
+      : "本会话未加载 Coworkflow，暂无统计";
     return [
       "",
       theme.fg(
         "muted",
-        `7 天窗口 · ${model} · 合计 ${day(series.total)}（含 cache；峰值 ${day(series.peak)}）`,
+        `7 天窗口 · ${model} · 合计 ${day(series.total)}（含 cache；峰值 ${day(series.peak)}）· ${scope}`,
       ),
       `  ${theme.fg("dim", parts.join("  "))}`,
     ];
@@ -1144,20 +1150,30 @@ function createPort(
    * used the same model. Children are attributed by the model recorded in their
    * run metadata, so the bar reflects what that model actually consumed.
    */
+  const enabledSince = (cwd: string): number | undefined => {
+    const id = commandCtx?.sessionManager?.getSessionId?.();
+    return sessionEnabledSince(configRoot(cwd), typeof id === "string" ? id : null);
+  };
+
   const historyFor = (cwd: string, model: string): DailySeries => {
     if (!model) {
       return { days: [], total: 0, peak: 0 };
     }
     const entries = commandCtx?.sessionManager?.getEntries?.();
     const sessionId = commandCtx?.sessionManager?.getSessionId?.();
+    // Only tokens spent while Coworkflow was loaded count: that is the layer's
+    // own consumption, and counting earlier turns would inflate every number.
+    const since = enabledSince(cwd);
     const series = Array.isArray(entries)
-      ? collectModelDailyUsage(entries, model, HISTORY_DAYS)
+      ? collectModelDailyUsage(entries, model, HISTORY_DAYS, new Date(), since)
       : { days: [], total: 0, peak: 0 };
     const childSeries = collectChildModelDailyUsage(
       artifactDirs(cwd),
       model,
       HISTORY_DAYS,
       typeof sessionId === "string" ? sessionId : null,
+      new Date(),
+      since,
     );
     // Merge both sources per day so one bar covers everything that model spent.
     const days = series.days.map((day, index) => {
@@ -1198,6 +1214,7 @@ function createPort(
       selected: historyFor(cwd, selected),
       effectiveModel: effective,
       effective: historyFor(cwd, effective),
+      ...(enabledSince(cwd) !== undefined ? { since: enabledSince(cwd) } : {}),
     };
   };
 

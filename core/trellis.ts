@@ -500,6 +500,14 @@ const FLAG_MAX_ENTRIES = 200;
 interface FlagEntry {
   on: boolean;
   at: number;
+  /**
+   * When this session first turned Coworkflow on.
+   *
+   * Usage is only attributed to Coworkflow from this instant onward: tokens spent
+   * before the layer was loaded were not produced by it, so counting them would
+   * inflate every number the panel reports.
+   */
+  since?: number;
 }
 
 interface FlagFile {
@@ -522,9 +530,13 @@ function readFlags(root: string): FlagFile {
     const kept: Record<string, FlagEntry> = {};
     for (const [id, value] of Object.entries(sessions as Record<string, unknown>)) {
       if (value === null || typeof value !== "object") continue;
-      const entry = value as { on?: unknown; at?: unknown };
+      const entry = value as { on?: unknown; at?: unknown; since?: unknown };
       if (typeof entry.on !== "boolean" || typeof entry.at !== "number") continue;
-      kept[id] = { on: entry.on, at: entry.at };
+      kept[id] = {
+        on: entry.on,
+        at: entry.at,
+        ...(typeof entry.since === "number" ? { since: entry.since } : {}),
+      };
     }
     return { version: 1, sessions: kept };
   } catch {
@@ -537,10 +549,23 @@ function readFlags(root: string): FlagFile {
  * one, `undefined` when it never did (the project switch then decides).
  */
 export function sessionFlag(root: string, sessionId: string | null): boolean | undefined {
+  const entry = sessionFlagEntry(root, sessionId);
+  return entry?.on;
+}
+
+/** The whole stored flag, including when this session turned Coworkflow on. */
+export function sessionFlagEntry(root: string, sessionId: string | null): FlagEntry | undefined {
   if (!sessionId) return undefined;
   const entry = readFlags(root).sessions[sessionId];
   if (!entry) return undefined;
-  return Date.now() - entry.at < FLAG_MAX_AGE_MS ? entry.on : undefined;
+  return Date.now() - entry.at < FLAG_MAX_AGE_MS ? entry : undefined;
+}
+
+/** Epoch ms this session turned Coworkflow on, or undefined when it never did. */
+export function sessionEnabledSince(root: string, sessionId: string | null): number | undefined {
+  const entry = sessionFlagEntry(root, sessionId);
+  if (!entry || entry.on !== true) return undefined;
+  return entry.since ?? entry.at;
 }
 
 /** Record or clear the session switch, pruning stale entries. Best effort. */
@@ -550,8 +575,19 @@ export function setSessionFlag(root: string, sessionId: string, on: boolean | nu
   for (const [id, entry] of Object.entries(flags.sessions)) {
     if (now - entry.at >= FLAG_MAX_AGE_MS) delete flags.sessions[id];
   }
-  if (on === null) delete flags.sessions[sessionId];
-  else flags.sessions[sessionId] = { on, at: now };
+  if (on === null) {
+    delete flags.sessions[sessionId];
+  } else {
+    // Turning it on starts the attribution clock; re-stamping while already on
+    // keeps the original instant, so reloading does not reset the window.
+    const previous = flags.sessions[sessionId];
+    const since = on ? (previous?.on === true ? (previous.since ?? previous.at) : now) : undefined;
+    flags.sessions[sessionId] = {
+      on,
+      at: now,
+      ...(since !== undefined ? { since } : {}),
+    };
+  }
 
   const entries = Object.entries(flags.sessions).sort((a, b) => b[1].at - a[1].at);
   for (const [id] of entries.slice(FLAG_MAX_ENTRIES)) delete flags.sessions[id];
