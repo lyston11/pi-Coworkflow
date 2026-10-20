@@ -33,8 +33,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type {
   ModuleContext,
@@ -53,10 +52,11 @@ import {
   readConfig,
   writeConfig,
 } from "../core/config.ts";
-import { sessionFlag, setSessionFlag } from "../core/trellis.ts";
+import { sessionFlag, sessionKeys, setSessionFlag } from "../core/trellis.ts";
 import { activeRunsForSession } from "../core/capacity.ts";
+import { readUserConfig } from "../core/pi-subagents.ts";
 import { nearestTrustDecision, trustFilePath, trustProject } from "../core/trust.ts";
-import { MODULES, moduleIds } from "../modules/index.ts";
+import { MODULES, findModule, moduleIds } from "../modules/index.ts";
 import { installedPrefix } from "../modules/worktree/index.ts";
 
 const DEFAULT_PREFIX = "wt-";
@@ -226,34 +226,36 @@ function sessionIdOf(ctx: CommandContext | undefined, rt: RuntimeContext): strin
  * dispatched child cannot have its own switch, so it reads the flag of the
  * parent session id it was told about — which is why the flag lives in a file.
  */
+/**
+ * The first explicit switch among a session's known keys.
+ *
+ * A session can be addressed by its id or by its session file path, and both
+ * spellings have to resolve to the same entry: `/Coworkflow:start` writes the id,
+ * a dispatched child reads the parent's file path.
+ */
+function firstFlag(root: string, keys: string[]): boolean | undefined {
+  for (const key of keys) {
+    const flag = sessionFlag(root, key);
+    if (flag !== undefined) return flag;
+  }
+  return undefined;
+}
+
 /** Resolve both the switch and the reason for it. */
 function resolveLoadState(cwd: string): { enabled: boolean; state: RuntimeContext["loadState"] } {
   const root = configRoot(cwd);
   const config = readConfig(root);
   if (config === null) return { enabled: false, state: "off" };
   if (runtime.isChild) {
-    const flag = sessionFlag(root, runtime.parentSessionId);
+    // The parent is known here by whichever spelling the runner published — a
+    // session file path, or an id — so resolve through both key spaces.
+    const flag = firstFlag(root, sessionKeys(runtime.parentSessionId));
     const enabled = flag ?? config.autoEnable === true;
     return { enabled, state: enabled ? "child" : "off" };
   }
-  const flag = sessionFlag(root, runtime.sessionId);
+  const flag = firstFlag(root, sessionKeys(runtime.sessionId));
   if (flag !== undefined) return { enabled: flag, state: flag ? "started" : "off" };
   return config.autoEnable === true ? { enabled: true, state: "auto" } : { enabled: false, state: "off" };
-}
-
-function resolveEnabled(cwd: string): boolean {
-  const root = configRoot(cwd);
-  const config = readConfig(root);
-  if (config === null) return false;
-
-  // pi-subagents' runner exports PI_SUBAGENT_PARENT_SESSION before any session
-  // event, so a child can resolve its flag from the very first load. The parent's
-  // own session id only arrives with `session_start` (and again on `/reload`),
-  // which is why the session-scoped parts are re-evaluated there.
-  const id = runtime.isChild ? runtime.parentSessionId : runtime.sessionId;
-  const flag = sessionFlag(root, id);
-  if (flag !== undefined) return flag;
-  return config.autoEnable === true;
 }
 
 /**
@@ -392,18 +394,15 @@ function runSetup(args: string, ctx: CommandContext, forceDry: boolean): string 
     blocks.push("  ! 自动加载的改动在会话启动时读取：本会话仍是旧状态，重开会话生效");
   }
 
-  if (!dry) {
-    writeConfig(root, {
-      version: 1,
-      installedAt: new Date().toISOString(),
-      worktreePrefix: prefix,
-      ...(autoEnable ? { autoEnable: true } : {}),
-      modules: switches,
-    });
-  }
-
-  const runModule = (module: (typeof MODULES)[number], action: "apply" | "remove"): void => {
+  // The config is written *after* the modules run: it is the project's record of
+  // what is installed, so a module that fails must not be recorded as on. Only a
+  // dry run skips the write, and it is the only thing that reports without it.
+  const runModule = (
+    module: (typeof MODULES)[number],
+    action: "apply" | "remove",
+  ): "ok" | "failed" => {
     const steps: { status: Status; message: string }[] = [];
+    let failed = false;
     const context = createContext({
       root,
       prefix,
@@ -417,6 +416,7 @@ function runSetup(args: string, ctx: CommandContext, forceDry: boolean): string 
       report(status, message) {
         steps.push({ status, message });
         totals[status] = (totals[status] ?? 0) + 1;
+        if (status === "error") failed = true;
       },
     });
     try {
@@ -426,13 +426,28 @@ function runSetup(args: string, ctx: CommandContext, forceDry: boolean): string 
       context.report("error", `模块异常：${error instanceof Error ? error.message : String(error)}`);
     }
     if (steps.length > 0) blocks.push(renderModule(module, steps));
+    return failed ? "failed" : "ok";
   };
 
   for (const module of enabled) {
-    if (module.apply) runModule(module, "apply");
+    if (module.apply && runModule(module, "apply") === "failed") {
+      // A module that could not install is recorded as off, so the next
+      // `/Coworkflow:init` retries it instead of treating it as done.
+      switches[module.id] = false;
+    }
   }
   for (const module of switchedOff) {
     if (module.remove) runModule(module, "remove");
+  }
+
+  if (!dry) {
+    writeConfig(root, {
+      version: 1,
+      installedAt: new Date().toISOString(),
+      worktreePrefix: prefix,
+      ...(autoEnable ? { autoEnable: true } : {}),
+      modules: switches,
+    });
   }
 
   const runtimeBlock = runtimeReport();
@@ -508,8 +523,12 @@ function runStart(args: string, ctx: CommandContext): string {
   // so one id written and another read is exactly how a session silently falls
   // back to "not loaded". Writing both ids (and remembering them) removes the
   // guesswork.
-  const knownIds = new Set<string>([sessionId]);
-  if (runtime.sessionId) knownIds.add(runtime.sessionId);
+  // Every spelling a reader might use: the command's id, the process id, and the
+  // session file path's id — a child of this session looks itself up by the path
+  // its runner published.
+  const knownIds = new Set<string>(
+    sessionKeys(sessionId, runtime.sessionId, sessionFileOf(ctx)),
+  );
   for (const id of knownIds) setSessionFlag(root, id, on);
   const stored = [...knownIds].every((id) => sessionFlag(root, id) === on);
   const note = stored
@@ -521,33 +540,25 @@ function runStart(args: string, ctx: CommandContext): string {
 }
 
 /**
- * pi-subagents' own capacity limit, read for display only.
+ * The last session file Pi reported.
  *
- * It lives in pi-subagents' user-level config file and has no project override,
- * which is why this package enforces a project limit itself instead of writing
- * here. Shown in the settings panel so both numbers are visible at once.
+ * pi-subagents records runs per parent session *file*, and the settings panel has
+ * no command context of its own, so the path is remembered from the events that
+ * do carry one. Reading it through a `null` context — which is what this used to
+ * do — always produced `null`, and every "active run" number in the panel was
+ * therefore a hardcoded zero.
  */
-function readPiSubagentsLimit(): number | null {
-  const file = join(homedir(), ".pi", "agent", "extensions", "subagent", "config.json");
-  let raw: string;
-  try {
-    raw = readFileSync(file, "utf-8");
-  } catch {
-    return null;
-  }
-  try {
-    const value = (JSON.parse(raw) as { maxActiveAsyncRunsPerSession?: unknown })
-      .maxActiveAsyncRunsPerSession;
-    return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
-  } catch {
-    return null;
-  }
+let lastSessionFile: string | null = null;
+
+function noteSessionFile(ctx: any): string | null {
+  const file = ctx?.sessionManager?.getSessionFile?.();
+  if (typeof file === "string" && file) lastSessionFile = file;
+  return lastSessionFile;
 }
 
 /** The parent session file path, which is what pi-subagents records per run. */
 function sessionFileOf(ctx: any): string | null {
-  const file = ctx?.sessionManager?.getSessionFile?.();
-  return typeof file === "string" && file ? file : null;
+  return noteSessionFile(ctx);
 }
 
 /** The control surface the panels use; same operations as the slash commands. */
@@ -567,7 +578,7 @@ function createControl(): WorkflowControl {
     facts: () => {
       const root = rootOf();
       const config = readConfig(root);
-      const own = readPiSubagentsLimit();
+      const own = readUserConfig()?.maxActiveAsyncRunsPerSession ?? null;
       const sessionFile = sessionFileOf(null);
       const active = runtime.enabled ? activeRunsForSession(sessionFile) : [];
       return [
@@ -617,11 +628,23 @@ function createControl(): WorkflowControl {
       const root = rootOf();
       const config = readConfig(root);
       if (config === null) return `本项目未初始化：先 /${NS}:init`;
-      return runSetup(`--prefix ${value}`, { cwd: root }, false)
-        .split("\n")
-        .filter((line) => line.includes("前缀") || line.includes("worktree"))
-        .slice(0, 1)
-        .join("") || `worktree 前缀 → ${value}`;
+      // A prefix is one value in the config plus one line in the hook script.
+      // Running the whole install pipeline for it would rewrite the managed
+      // AGENTS.md region and re-register every module for a one-line change, and
+      // scraping the report for a return value is not a contract.
+      writeConfig(root, { ...config, worktreePrefix: value });
+      const context = createContext({
+        root,
+        prefix: value,
+        dry: false,
+        report: () => {},
+      });
+      try {
+        findModule("worktree")?.apply?.(context);
+      } catch (error) {
+        return `worktree 前缀 → ${value}，但钩子未更新：${error instanceof Error ? error.message : String(error)}`;
+      }
+      return `worktree 前缀 → ${value}（钩子已更新；已在运行的 worktree 不受影响）`;
     },
     subagentConcurrency: () => readConfig(rootOf())?.subagentConcurrency ?? null,
     setSubagentConcurrency: (value) => {

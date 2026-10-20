@@ -6,7 +6,7 @@
  *   1. **Opt-in.** No file means this project has not adopted the workflow, so
  *      the extension does nothing in it — no install steps, no runtime hooks,
  *      no prompt injection. A project that already has its own workflow design
- *      is unaffected until someone runs `/workflow-setup` there.
+ *      is unaffected until someone runs `/Coworkflow:init` there.
  *   2. **Per-module switches.** Each module can be enabled or disabled on its
  *      own, so a project can take the Trellis layer without the delegation
  *      policy, or the injection without the lane ledger.
@@ -15,7 +15,7 @@
  * lane pointers under `.trellis/.runtime/`.
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { mainCheckout, repoRoot } from "./trellis.ts";
 
@@ -25,14 +25,14 @@ export const LEGACY_CONFIG_REL = join(".pi", "trellis-workflow.json");
 
 export interface WorkflowConfig {
   version: 1;
-  /** ISO timestamp of the last `/workflow-setup`. */
+  /** ISO timestamp of the last `/Coworkflow:init`. */
   installedAt?: string;
   /** Worktree directory prefix this project installed with. */
   worktreePrefix?: string;
   /**
    * Whether a new session turns the runtime modules on by itself. Absent or
-   * false means the project is installed but inert: `/workflow-session on`
-   * enables it for one session.
+   * false means the project is installed but inert: `/Coworkflow:start` enables
+   * it for one session.
    */
   autoEnable?: boolean;
   /**
@@ -145,15 +145,8 @@ export function isEnabled(config: WorkflowConfig | null, id: string): boolean {
   return config !== null && config.modules[id] !== false;
 }
 
-export function enabledIds(config: WorkflowConfig | null, all: string[]): string[] {
-  return all.filter((id) => isEnabled(config, id));
-}
 /** One-line switch summary for reports, for example `trellis=on worktree=off`. */
 export function describeSwitches(config: WorkflowConfig | null, all: string[]): string {
   if (config === null) return "未安装（本项目的扩展不生效）";
   return all.map((id) => `${id}=${isEnabled(config, id) ? "on" : "off"}`).join(" ");
-}
-
-export function configExists(root: string): boolean {
-  return existsSync(configPath(root));
 }

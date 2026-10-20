@@ -133,21 +133,6 @@ function agentNameOf(status: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
-/**
- * Whether a `subagent` tool call would start a new run rather than read or
- * manage existing ones. Management actions (`status`, `lane.*`, `worktree.*`,
- * `mission.*`, `doctor`, …) must never be blocked, or a session at its cap could
- * not even ask what is running.
- */
-export function startsNewRun(input: Record<string, unknown>): boolean {
-  const action = typeof input.action === "string" ? input.action.trim() : "";
-  if (action && action !== "resume" && action !== "append-step") return false;
-  // A foreground call blocks the parent and reserves no async slot in
-  // pi-subagents' own accounting, so it is not counted here either.
-  if (input.async === false) return false;
-  return true;
-}
-
 /** Reservations older than this are dropped: the call must have failed. */
 const RESERVATION_TTL_MS = 5 * 60 * 1000;
 /** Allowance for the run's own timestamp lagging the reservation clock. */

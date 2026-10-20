@@ -27,21 +27,12 @@
  */
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { realpathSync } from "node:fs";
+import { agentDir } from "./agentdir.ts";
 
-/** Pi's agent directory, honouring the same env override Pi itself uses. */
-export function agentDir(): string {
-  const configured = process.env.PI_CODING_AGENT_DIR?.trim();
-  if (configured === "~") return homedir();
-  if (configured?.startsWith("~/") || configured?.startsWith("~\\")) {
-    return join(homedir(), configured.slice(2));
-  }
-  if (configured) return configured;
-  const configDir = process.env.PI_CONFIG_DIR?.trim() || ".pi";
-  return join(homedir(), configDir, "agent");
-}
+// One derivation of Pi's agent directory for the whole package.
+export { agentDir };
 
 export function trustFilePath(): string {
   return join(resolve(agentDir()), "trust.json");

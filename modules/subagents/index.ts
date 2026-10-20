@@ -25,21 +25,12 @@
  * instead of its role context.
  */
 
-import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ModuleContext, WorkflowModule } from "../../core/module.ts";
+import { userSettingsPath, userSubagentConfigPath } from "../../core/agentdir.ts";
+import { installedVersion, readUserConfig, subagentsPackageDir } from "../../core/pi-subagents.ts";
 
 const PROJECT_SETTINGS = join(".pi", "settings.json");
-const USER_SETTINGS = join(homedir(), ".pi", "agent", "settings.json");
-const USER_SUBAGENT_CONFIG = join(
-  homedir(),
-  ".pi",
-  "agent",
-  "extensions",
-  "subagent",
-  "config.json",
-);
-const NPM_SUBAGENTS = join(homedir(), ".pi", "agent", "npm", "node_modules", "pi-subagents");
 const PACKAGE = "pi-subagents";
 /** Settings spec for an npm source, in the form `pi install` itself writes. */
 const PACKAGE_SPEC = `npm:${PACKAGE}`;
@@ -69,11 +60,11 @@ function writeObject(ctx: ModuleContext, path: string, value: JsonObject): void 
 
 /** Where `pi-subagents` is already available, if anywhere. */
 function detect(ctx: ModuleContext): string | null {
-  const userSettings = readObject(ctx, USER_SETTINGS);
+  const userSettings = readObject(ctx, userSettingsPath());
   if (declaresPackage(userSettings)) return "用户级 settings.json";
   const projectSettings = readObject(ctx, PROJECT_SETTINGS);
   if (declaresPackage(projectSettings)) return "项目级 .pi/settings.json";
-  if (ctx.read(join(NPM_SUBAGENTS, "package.json")) !== null) return "Pi 的 npm 目录";
+  if (ctx.read(join(subagentsPackageDir(), "package.json")) !== null) return "Pi 的 npm 目录";
   return null;
 }
 
@@ -90,41 +81,24 @@ function packageName(spec: string): string {
   return at > 0 ? withoutPrefix.slice(0, at) : withoutPrefix;
 }
 
-function installedVersion(ctx: ModuleContext): string | undefined {
-  const raw = ctx.read(join(NPM_SUBAGENTS, "package.json"));
-  if (raw === null) return undefined;
-  try {
-    const version = (JSON.parse(raw) as { version?: unknown }).version;
-    return typeof version === "string" ? version : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function reportContextDefault(ctx: ModuleContext): void {
-  const raw = ctx.read(USER_SUBAGENT_CONFIG);
-  let preference: string | undefined;
-  if (raw !== null) {
-    try {
-      const value = (JSON.parse(raw) as { defaultSubagentContext?: unknown }).defaultSubagentContext;
-      if (typeof value === "string") preference = value;
-    } catch {
-      ctx.report("warn", `${USER_SUBAGENT_CONFIG} 不是合法的 JSON，未改动`);
-      return;
-    }
+  const config = readUserConfig();
+  if (config === null) {
+    ctx.report("warn", `${userSubagentConfigPath()} 不是合法的 JSON，未改动`);
+    return;
   }
-  if (preference === "fork") {
+  if (config.defaultSubagentContext === "fork") {
     ctx.report(
       "warn",
-      `你的 ${USER_SUBAGENT_CONFIG} 设了 defaultSubagentContext: "fork"；Trellis 角色子会话必须显式 context: "fresh"，否则会继承主会话上下文而不是拿到角色上下文（本项目不写这个全局文件）`,
+      `你的 ${userSubagentConfigPath()} 设了 defaultSubagentContext: "fork"；Trellis 角色子会话必须显式 context: "fresh"，否则会继承主会话上下文而不是拿到角色上下文（本项目不写这个全局文件）`,
     );
     return;
   }
   ctx.report(
     "ok",
-    preference === undefined
+    config.defaultSubagentContext === undefined
       ? "子会话上下文默认 fresh（pi-subagents 自带默认；本项目不写全局配置）"
-      : `子会话上下文默认 ${preference}（来自你的全局配置；本项目不写它）`,
+      : `子会话上下文默认 ${config.defaultSubagentContext}（来自你的全局配置；本项目不写它）`,
   );
 }
 
@@ -135,7 +109,7 @@ export const subagentsModule: WorkflowModule = {
   apply(ctx: ModuleContext): void {
     const found = detect(ctx);
     if (found) {
-      const version = installedVersion(ctx);
+      const version = installedVersion();
       ctx.report("ok", `复用已安装的 ${PACKAGE}${version ? ` v${version}` : ""}（来自${found}），未安装任何东西`);
     } else if (ctx.dry) {
       ctx.report(
@@ -183,7 +157,7 @@ export const subagentsModule: WorkflowModule = {
     // Drop the package declaration only when the user level still provides it,
     // so switching the module off never leaves the project without a runtime
     // that another project or session may still depend on.
-    const userSettings = readObject(ctx, USER_SETTINGS);
+    const userSettings = readObject(ctx, userSettingsPath());
     const packages = Array.isArray(settings.packages) ? settings.packages : [];
     if (declaresPackage(settings)) {
       if (declaresPackage(userSettings)) {

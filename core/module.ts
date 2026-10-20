@@ -3,15 +3,15 @@
  *
  * A module owns one layer of the workflow and nothing else: it writes its own
  * files, registers its own hooks, and reports what it did. The orchestrator in
- * `extensions/workflow.ts` only sequences modules and renders their reports, so
- * adding, removing, or skipping a layer never touches the others.
+ * `extensions/coworkflow.ts` only sequences modules and renders their reports, so
+ * adding, removing, or switching off a layer never touches the others.
  *
  * Modules never import Pi types: the surface they need from the host is tiny,
  * and declaring it here keeps every module self-contained and typecheckable
  * without Pi installed. The Trellis Pi extension takes the same approach.
  */
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -47,7 +47,7 @@ export interface ModuleContext {
 }
 
 export interface WorkflowModule {
-  /** Stable id used by `--only` / `--skip`. */
+  /** Stable id: `--enable` / `--disable`, the config's switch map, and reports. */
   id: string;
   /** One-line description rendered as the module's report header. */
   title: string;
@@ -67,10 +67,16 @@ export interface WorkflowModule {
    * session, in a dispatched child, or in both. Called once per session load,
    * with `runtime.isChild` telling the module which side it is on.
    *
-   * Hooks registered here are gated: unless the module is `alwaysActive`, the
-   * handler must return early while `runtime.enabled` is false, so the project
-   * switch and `/workflow-session` can turn the layer on and off within one
-   * session.
+   * Two gate levels, and a module states which one it uses:
+   *
+   *   session  hooks that act on the model's behaviour (injection, dispatch
+   *            gates, feature commands) must return early while
+   *            `runtime.enabled` is false, so `/Coworkflow:start off` really does
+   *            return the session to plain Pi.
+   *   project  hooks that only *record* what happened (the lane ledger) gate on
+   *            the project being adopted instead: a dispatch from a session that
+   *            never loaded the layer still produced artifacts, and dropping it
+   *            would make the record under-report.
    */
   activate?(host: PiRuntimeHost, runtime: RuntimeContext): void;
   /**
@@ -142,10 +148,6 @@ export function createContext(options: {
   };
 }
 
-export function pathExists(path: string): boolean {
-  return existsSync(path);
-}
-
 /**
  * A file-only context for code that needs `read`/`write` outside an install
  * run — a runtime command editing project settings, for example. Never dry:
@@ -188,7 +190,7 @@ export interface RuntimeContext {
   isChild: boolean;
   /**
    * Whether the workflow layer is on for this session. Mutable: the project
-   * switch sets it at load, `/workflow-session` changes it, and every hook
+   * switch sets it at load, `/Coworkflow:start` changes it, and every hook
    * reads it at call time.
    */
   enabled: boolean;

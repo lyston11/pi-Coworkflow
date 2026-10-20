@@ -39,6 +39,12 @@
     "node": ">=20"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test scripts/test.ts",
+    "verify": "node --experimental-strip-types scripts/verify.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5"
   }
 }

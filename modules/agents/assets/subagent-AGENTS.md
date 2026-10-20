@@ -24,9 +24,11 @@
 - 本文件（子 agent 约定）
 - 派单提示词里的任务描述，以及它点名的文件
 - 角色上下文：`implement` 拿到 `implement.jsonl` 列的 spec/research 正文 + `prd.md`/`design.md`/`implement.md`；`check` 拿到 `check.jsonl` + 同样三份工件；`research` 拿到 `.trellis/spec/` 目录树
-- 项目的 `CLAUDE.md` / `AGENTS.md`（如果 pi-subagents 的 agent 定义允许继承项目上下文）
+- 派单提示词里点名的项目 spec 文件
 
-你**不**继承主会话的对话历史。所以主会话在派单提示词里说清楚的事情，你才知道；没说清楚的，问。
+你**不**继承主会话的对话历史，**也拿不到项目根的 `AGENTS.md` / `CLAUDE.md`**：那是主会话的职责说明（规划、派单、审计、合并），
+`subagent-context` 会在注入本文件之前把它从你的系统提示里剥掉，避免你按主会话的规则行事。所以主会话在派单提示词里
+说清楚的事情，你才知道；没说清楚的，问。
 
 ## 禁止
 

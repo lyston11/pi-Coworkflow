@@ -27,7 +27,7 @@ import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PiRuntimeHost, RuntimeContext, WorkflowModule } from "../../core/module.ts";
 import { mainCheckout, readText, repoRoot, laneDir, activeTaskDir, taskRefForDisplay } from "../../core/trellis.ts";
-import { configRoot, readConfig } from "../../core/config.ts";
+import { attachLedger } from "../../core/ledger.ts";
 
 const HANDOFF_LINE_RE = /^Parallel handoff:\s*(.+?)\s*$/m;
 
@@ -280,46 +280,31 @@ export const laneWorktreeModule: WorkflowModule = {
   activate(host: PiRuntimeHost, runtime: RuntimeContext): void {
     if (runtime.isChild) return;
 
-    const launches = new Map<string, { agent?: string; task?: string; worktree?: boolean }>();
-
     // Recording is gated on the project being adopted, not on this session having
     // run `/Coworkflow:start`: a lane dispatched from a session that had not loaded
     // the layer still produced artifacts, and leaving it out of the ledger is how
-    // `/Coworkflow:lanes` silently under-reports. Only an uninitialized project —
-    // no `.pi/Coworkflow.json` — writes nothing at all.
-    const adopted = (ctx?: any): boolean =>
-      readConfig(configRoot(runtime.cwd ?? (ctx?.cwd ?? ""))) !== null;
+    // `/Coworkflow:lanes` silently under-reports. The shared ledger applies that
+    // rule once; this module only turns a recorded result into a pointer.
+    const ledger = attachLedger(host, runtime);
 
-    host.on?.("tool_call", (event: any, ctx: any) => {
-      if (!adopted(ctx)) return undefined;
-      if (event?.toolName !== "subagent") return undefined;
-      const callId = str(event?.toolCallId);
-      if (callId) {
-        launches.set(callId, {
-          agent: str(event?.input?.agent),
-          task: str(event?.input?.task),
-          worktree: event?.input?.worktree === true,
-        });
-      }
-      return undefined;
-    });
-
-    host.on?.("tool_result", (event: any, ctx: any) => {
-      if (!adopted(ctx)) return undefined;
-      if (event?.toolName !== "subagent") return undefined;
+    ledger.onResult((dispatch, event, ctx) => {
       const handoffPath = extractHandoffPath(event);
-      if (!handoffPath) return undefined;
+      if (!handoffPath) return;
 
       const root = resolveRootsFor(runtime, ctx);
       const sessionId = sessionIdOf(ctx, runtime);
       const taskDir = activeTaskDir(root, sessionId);
-      if (!taskDir) return undefined;
+      if (!taskDir) return;
 
-      const launch = launches.get(str(event?.toolCallId) ?? "");
+      const runId = runIdFromHandoffPath(handoffPath);
+      // Bind the run id back onto the dispatch, so a later completion or failure
+      // notification can be traced to the call that started it.
+      ledger.bindRun(dispatch.callId, runId);
+
       const record: LaneRecord = {
         version: 1,
-        runId: runIdFromHandoffPath(handoffPath),
-        agent: launch?.agent,
+        runId,
+        ...(dispatch.agent ? { agent: dispatch.agent } : {}),
         handoffPath,
         taskRef: taskRefForDisplay(root, taskDir),
         ...(sessionId ? { sessionId } : {}),
@@ -332,7 +317,6 @@ export const laneWorktreeModule: WorkflowModule = {
       } catch {
         // Losing a pointer must never break the tool result the model reads.
       }
-      return undefined;
     });
 
     if (runtime.enabled) registerLanesCommand(host, runtime);
@@ -340,7 +324,7 @@ export const laneWorktreeModule: WorkflowModule = {
 
   /**
    * The lane command only exists while the session has Coworkflow loaded; the
-   * recording hooks above stay registered but gate on `runtime.enabled`.
+   * recording hook above stays registered but does not depend on that.
    */
   onSessionActivate(host: PiRuntimeHost, runtime: RuntimeContext): void {
     if (runtime.isChild) return;

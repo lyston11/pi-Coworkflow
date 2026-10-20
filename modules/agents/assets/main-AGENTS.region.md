@@ -44,8 +44,10 @@
 
 主会话自己动手的唯一场合：**需要全局判断、或改动小到不值得派单**（一行修复、改个配置、回答一个问题）。除此之外，"我来写"不是理由——派出去、审回来。
 
+"小到不值得派单"有个可数的界线：本会话自行执行 **≥12 次工具调用、直接改动 ≥4 个文件**时，这已经是实现在而不是收尾，必须派单。`agents` 模块会数这个，越过阈值且一次没派单就在会话里出一条 `pi-Coworkflow` 记录（只显示、不进对话）——被点名说明确实越界了，不要再解释成"这次特殊"。
+
 - 授权：主会话可以主动派发子 agent，不必逐次询问。
-- 必须后台（`async: true`）。前台子会话是主进程内的一个会话、会占住主会话；后台派单后主会话继续做自己的事，用完成通知和 `subagent({ action: "status" })` 监控，子 agent 的提问走 `contact_supervisor` 转达。实测：后台子会话**会**加载项目 `AGENTS.md` 与 Magic Context（ambient 扩展），所以派单提示词只需给任务，不要把项目约定重抄一遍。
+- 必须后台（`async: true`）。前台子会话是主进程内的一个会话、会占住主会话；后台派单后主会话继续做自己的事，用完成通知和 `subagent({ action: "status" })` 监控，子 agent 的提问走 `contact_supervisor` 转达。实测：后台子会话由 harness 加载项目 `AGENTS.md` 与 Magic Context（ambient 扩展），但本包的 `subagent-context` 会在注入子 agent 约定之前把继承来的 `<project_instructions>` 剥掉——子 agent 只读 `.pi/Coworkflow/subagent-AGENTS.md`，不读本文件。所以派单提示词只需给任务，不要把项目约定重抄一遍。
 - **派单边界**：能独立验证的边界工作才派（有明确的输入、产物、验收方式）；探索性、需要全局判断、或跨多个模块协调的工作留在主会话。子 agent 不负责决定"做什么"，只负责"把它做好并报告"。
 - **审计边界**：子 agent 回结果不等于结果可用。主会话要对照 prd 的验收条件检查产物、核对它引用的文件与结论、跑该模块的测试；发现偏差就重派或自己修，不能直接把子 agent 的结论当成事实汇报给用户。
 - 子会话**不继承**主会话上下文：派单时显式写 `context: "fresh"`（三个 Trellis 角色 agent 也已声明 `defaultContext: fresh`；若你全局配了 `defaultSubagentContext: "fork"`，它会被覆盖，必须显式 `fresh`）。它拿到的 Trellis 上下文由 `pi-Coworkflow` 的 `subagent-context` 模块按角色注入：`trellis-implement` / `trellis-check` / `trellis-research` 分别得到 `implement.jsonl` / `check.jsonl` / spec 目录树，加上 prd.md、design.md、implement.md；字节预算沿用 `.trellis/config.yaml` 的 `context_injection`。 **注入按角色，不按 agent 名**：任何 agent 只要标记成这三个角色之一，就拿到对应那一份；`worker` / `researcher` / `reviewer` 等其它 agent 默认不注入。

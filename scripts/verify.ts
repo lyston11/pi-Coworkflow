@@ -16,6 +16,12 @@
  *   node scripts/verify.ts <project-dir> panel
  *   node scripts/verify.ts <project-dir> child-inject "<dispatch prompt>"
  *   node scripts/verify.ts <project-dir> lane-record <handoff.json>
+ *   node scripts/verify.ts <project-dir> session-start [reason]
+ *   node scripts/verify.ts <project-dir> subagent-call <agent> <task>
+ *
+ * The dispatch-retry scenario is gone on purpose: that retry was removed, and a
+ * harness that can still drive it would be describing behaviour this package no
+ * longer has.
  */
 
 import { execSync } from "node:child_process";
@@ -48,12 +54,24 @@ process.chdir(projectDir);
 // the child markers and the parent session id at load time.
 if (command === "child-inject") {
   process.env.PI_SUBAGENT_CHILD = "1";
-  process.env.PI_SUBAGENT_PARENT_SESSION = "parent-session-1";
+  // pi-subagents publishes the parent as a session *file* path, which is what the
+  // real child has to resolve back to a session id. Using an id here would hide a
+  // key-space mismatch — exactly the bug this harness exists to catch.
+  process.env.PI_SUBAGENT_PARENT_SESSION =
+    process.env.PI_VERIFY_PARENT_SESSION ??
+    `${process.env.HOME}/.pi/agent/sessions/--verify--/2026-01-01T00-00-00-000Z_parent-session-1.jsonl`;
 }
 
 const commands = new Map<string, CommandOptions>();
 const handlers = new Map<string, RuntimeEventHandler[]>();
 const printed: string[] = [];
+/**
+ * Messages the extension queued as user-role turns (`sendUserMessage`).
+ *
+ * Nothing should appear here: the layer reports to the transcript, never into the
+ * conversation. `subagent-call` prints it so a regression that starts talking to
+ * the model as a user is visible instead of silent.
+ */
 const userMessages: string[] = [];
 
 const host = {
@@ -123,7 +141,7 @@ switch (command) {
 
   case "settings": {
     const { SettingsPanel, buildSettingRows } = (await import(
-      here("../modules/panel/index.ts")
+      here("../modules/panel/settings.ts")
     )) as unknown as {
       SettingsPanel: new (
         io: unknown,
@@ -271,17 +289,9 @@ switch (command) {
     break;
   }
 
-  case "session": {
-    const selected = commands.get("workflow-session");
-    if (!selected) throw new Error("workflow-session is not registered");
-    await selected.handler(rest.join(" "), ctx);
-    console.log(printed.join("\n"));
-    break;
-  }
-
   case "panel": {
     const { ModelPanel } = (await import(
-      here("../modules/panel/index.ts")
+      here("../modules/panel/models.ts")
     )) as unknown as { ModelPanel: new (port: unknown, theme: unknown, tui: unknown) => PanelLike };
     const usageModule = "../core/usage.ts";
     const { collectChildUsage, collectSessionUsage, topEntries } = (await import(
@@ -348,6 +358,12 @@ switch (command) {
       subagentThinking: "",
       sessionEffectiveModel: models[0],
       subagentEffectiveModel: models[0],
+      // The panel charts the model under the cursor, so the snapshot carries one
+      // 7-day series rather than a map.
+      history: {
+        selectedModel: "clinepass/deepseek-v4.1-flash",
+        selected: { days: [], total: 0, peak: 0 },
+      },
       usage: usageSnapshot,
     };
     const port = {
@@ -377,16 +393,17 @@ switch (command) {
     const panel = new ModelPanel(port, theme, { requestRender: () => {} });
 
     const keys: [string, string][] = [
-      ["Tab → 思考（光标落在当前值 medium）", "\t"],
+      ["Right → 思考列（光标落在当前值 medium）", "\x1b[C"],
       ["Down → high", "\x1b[B"],
       ["Enter 应用思考", "\r"],
-      ["Right → 子 agent tab（仍停在思考）", "\x1b[C"],
+      ["Tab → 子 agent tab（仍停在思考）", "\t"],
       ["Enter → 思考设为默认", "\r"],
       ["Down → off", "\x1b[B"],
       ["Enter 应用子 agent 思考", "\r"],
-      ["Tab → 模型（光标落在 继承主会话模型）", "\t"],
+      ["Left → 模型列（光标落在 继承主会话模型）", "\x1b[D"],
       ["Down → 第一个模型", "\x1b[B"],
       ["Enter 应用子 agent 模型", "\r"],
+      ["Tab → 回到主会话 tab", "\t"],
     ];
 
     const panelWidth = Number(process.env.PI_VERIFY_WIDTH ?? "72");
@@ -407,28 +424,6 @@ switch (command) {
     console.log(`--- closed: ${closed} ---`);
     console.log("--- render at width 24 (truncation) ---");
     for (const line of panel.render(24)) console.log(`|${line}|`);
-    break;
-  }
-
-  case "child-fail": {
-    // Drive the real retry path: admit a launch, then deliver the failure
-    // notification exactly as pi-subagents writes it.
-    const [agent, ...taskWords] = rest;
-    const task = taskWords.join(" ");
-    await emit("tool_call", {
-      type: "tool_call",
-      toolName: "subagent",
-      toolCallId: "call-fail-1",
-      input: { agent, task, async: true },
-    });
-    const failure = {
-      type: "custom_message",
-      customType: "subagent-incremental-child-notify",
-      content: `Workflow child failed: **${agent}**\nError: Stream error occurred`,
-      details: { childKey: agent, outcome: "failed", childRunId: "run-failed-1", error: "Stream error occurred" },
-    };
-    await emit("message_start", { type: "message_start", message: failure });
-    console.log(userMessages.length === 0 ? "(no retry)" : `RETRY → ${userMessages.join("\n")}`);
     break;
   }
 
@@ -508,13 +503,16 @@ switch (command) {
         }
         continue;
       }
-      for (const verdict of verdicts) {
+    for (const verdict of verdicts) {
         const record = verdict as { block?: boolean; reason?: string };
         console.log(
           record.block === true ? `${toolCallId}: BLOCKED: ${record.reason}` : `${toolCallId}: ${JSON.stringify(verdict)}`,
         );
       }
     }
+    // A gate that refuses must not have talked to the model: the layer reports to
+    // the transcript, never as a user-role turn.
+    console.log(`user-role messages: ${userMessages.length} (expected 0)`);
     break;
   }
 

@@ -132,17 +132,26 @@ function contains(base: string, target: string): boolean {
   return target === base || target.startsWith(base.endsWith(sep) ? base : base + sep);
 }
 
-/** The task the given session is working on, from its Trellis session pointer. */
-export function activeTaskDir(root: string, sessionId: string | null): string | null {
-  if (!sessionId) return null;
-  const raw = readText(join(root, SESSIONS_DIR, `${contextKeyFor(sessionId)}.json`));
-  if (!raw) return null;
-  try {
-    const ref: unknown = (JSON.parse(raw) as { current_task?: unknown }).current_task;
-    return typeof ref === "string" ? resolveTaskDir(root, ref) : null;
-  } catch {
-    return null;
+/**
+ * The task the given session is working on, from its Trellis session pointer.
+ *
+ * Accepts either spelling of a session identity — the id Pi's context exposes, or
+ * the session file path pi-subagents publishes to a child — because the pointer is
+ * keyed by the former and a dispatched child only knows the latter.
+ */
+export function activeTaskDir(root: string, session: string | null): string | null {
+  for (const key of sessionKeys(session)) {
+    const raw = readText(join(root, SESSIONS_DIR, `${contextKeyFor(key)}.json`));
+    if (!raw) continue;
+    try {
+      const ref: unknown = (JSON.parse(raw) as { current_task?: unknown }).current_task;
+      const resolved = typeof ref === "string" ? resolveTaskDir(root, ref) : null;
+      if (resolved) return resolved;
+    } catch {
+      // A corrupt pointer is not this caller's problem; try the next key.
+    }
   }
+  return null;
 }
 
 /** `.trellis/tasks/<name>` for display and for the AGENTS.md dispatch protocol. */
@@ -535,6 +544,39 @@ export function renderInjection(
     "- 你是被派发的子 agent：只做派单提示词里指定给你的那部分，不要自己创建 Trellis 任务、不要改任务状态、不要合并或 push。",
     "- 任务状态、合并与清理由主会话负责；需要决策时用 `contact_supervisor` 提问，不要自行扩大范围。",
   ].join("\n");
+}
+
+/**
+ * The session id encoded in a session file path, when the path carries one.
+ *
+ * pi-subagents publishes `PI_SUBAGENT_PARENT_SESSION` as the parent session
+ * *file* (`~/.pi/agent/sessions/<dir>/<timestamp>_<sessionId>.jsonl`), because
+ * that is what it uses to attribute an async run. A child therefore knows its
+ * parent by path, while this package records the switch by session id — which is
+ * what Pi's command context exposes. Looking up one key space with the other's
+ * value never matched, so a dispatched child always read "no flag" and fell back
+ * to the project's `autoEnable`, quietly losing the workflow the parent had just
+ * started. Reducing the path to the id it contains makes both spellings resolve.
+ */
+export function sessionIdFromFile(file: string | null | undefined): string | null {
+  if (!file) return null;
+  const name = file.split(/[\\/]/).pop() ?? "";
+  const stem = name.replace(/\.jsonl$/i, "");
+  // `<timestamp>_<uuid>` is Pi's session file name; anything else is not ours.
+  const match = /_([0-9a-fA-F][0-9a-fA-F-]{7,})$/.exec(stem);
+  return match?.[1] ?? null;
+}
+
+/** Every id-based key a session can be recognised by, path spellings included. */
+export function sessionKeys(...candidates: (string | null | undefined)[]): string[] {
+  const keys = new Set<string>();
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    keys.add(candidate);
+    const fromFile = sessionIdFromFile(candidate);
+    if (fromFile) keys.add(fromFile);
+  }
+  return [...keys];
 }
 
 export function laneDir(root: string, taskDir: string): string {
