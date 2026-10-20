@@ -14,6 +14,8 @@
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import type { PiRuntimeHost, RuntimeContext, WorkflowControl } from "../../core/module.ts";
+import { refreshUsage } from "../../core/usage.ts";
+import { existingSubagentsBridge } from "../../core/subagents-client.ts";
 import { FALLBACK_KEYS, type PanelKeybindings, type PanelTheme } from "./shared.ts";
 
 /**
@@ -289,12 +291,20 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
  * yet.
  */
 export function registerSettingsPanel(host: PiRuntimeHost, runtime: RuntimeContext): void {
-  if (settingsPanelRegistered) return;
-  settingsPanelRegistered = true;
+  const registered = settingsPanelRegistered.get(host);
+  if (registered) { registered.runtime = runtime; return; }
+  const registration = { runtime };
+  settingsPanelRegistered.set(host, registration);
   host.registerCommand?.(`Coworkflow:settings`, {
     description:
       "Coworkflow 设置面板：模块开关、新会话是否自动加载、worktree 前缀、Trellis 范式对齐；未初始化时可从这里初始化本项目",
     handler: async (_args: string, commandCtx: any) => {
+      const runtime = registration.runtime;
+      runtime.refresh();
+      const epoch = runtime.sessionEpoch;
+      await refreshUsage(host, runtime, commandCtx);
+      if (runtime.enabled) await existingSubagentsBridge(host)?.observe();
+      if (epoch !== runtime.sessionEpoch || registration.runtime !== runtime) return;
       const control = runtime.control;
       const say = (text: string): void => {
         try {
@@ -349,4 +359,4 @@ export function registerSettingsPanel(host: PiRuntimeHost, runtime: RuntimeConte
   });
 }
 
-let settingsPanelRegistered = false;
+const settingsPanelRegistered = new WeakMap<object, { runtime: RuntimeContext }>();

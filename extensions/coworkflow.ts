@@ -53,8 +53,9 @@ import {
   writeConfig,
 } from "../core/config.ts";
 import { sessionFlag, sessionKeys, setSessionFlag } from "../core/trellis.ts";
-import { activeRunsForSession } from "../core/capacity.ts";
-import { readUserConfig } from "../core/pi-subagents.ts";
+import { existingSubagentsBridge } from "../core/subagents-client.ts";
+import { decodeNativeCompletions, readUserConfig } from "../core/pi-subagents.ts";
+import { disposeUsage, formatNativeCost, refreshUsage, usageSnapshot } from "../core/usage.ts";
 import { nearestTrustDecision, trustFilePath, trustProject } from "../core/trust.ts";
 import { MODULES, findModule, moduleIds } from "../modules/index.ts";
 import { installedPrefix } from "../modules/worktree/index.ts";
@@ -192,6 +193,7 @@ let runtime: RuntimeContext = {
   cwd: process.cwd(),
   sessionId: null,
   parentSessionId: null,
+  sessionEpoch: 0,
   control: {
     initialized: () => false,
     switches: () => ({}),
@@ -202,6 +204,7 @@ let runtime: RuntimeContext = {
     setSwitch: () => "control 尚未就绪",
     setAutoEnable: () => "control 尚未就绪",
     loadState: () => "off",
+    moduleEnabled: () => false,
     setPrefix: () => "control 尚未就绪",
     subagentConcurrency: () => null,
     setSubagentConcurrency: () => "control 尚未就绪",
@@ -259,35 +262,157 @@ function resolveLoadState(cwd: string): { enabled: boolean; state: RuntimeContex
 }
 
 /**
- * Re-resolve the switch and, if it just turned on, register the feature commands.
+ * Re-resolve the switch and make the runtime layer match it.
  *
  * Called at the start of every command and every agent turn, so a `/reload`, a
  * `/Coworkflow:start` from another window, or a flag written a moment ago all
  * take effect without a restart. Cheap: one small JSON read.
+ *
+ * Two things happen when the layer turns on here rather than at load:
+ *
+ *   - the runtime modules that were skipped at load are registered now
+ *     (`ensureRuntime`), so hooks act in this very session;
+ *   - the feature commands register (`activateSession`).
+ *
+ * Turning it *off* is not "do nothing": a hook that reads the switch at event
+ * time goes quiet by itself, but a resource the upstream package registered for
+ * this session (a workflow resource, a required child extension) has to be
+ * withdrawn explicitly. `notifyRuntimeChange` is what tells an owner that both
+ * gates moved; it is idempotent, so calling it on every command costs nothing.
  */
 function refreshSession(): void {
   const resolved = resolveLoadState(runtime.cwd);
-  const was = runtime.enabled;
   runtime.enabled = resolved.enabled;
   runtime.loadState = resolved.state;
-  if (runtime.enabled && !was) activateSession();
+  ensureRuntime();
+  if (runtime.enabled) activateSession();
+  // Unconditional and idempotent: a module's reconciliation is a comparison, so
+  // this costs nothing when the gates did not move, and it is the only way a
+  // switch written by another window reaches a session-scoped upstream
+  // registration between two `session_start` events.
+  notifyRuntimeChange();
+}
+
+/**
+ * Tell every registered module that the gates may have moved.
+ *
+ * Modules decide for themselves what "off" means: hooks read the gate at event
+ * time, while a module holding session-scoped upstream registrations withdraws
+ * them here and rebuilds them when the gate comes back on.
+ */
+function notifyRuntimeChange(): void {
+  if (runtimeHost && (!runtime.enabled || !runtime.control.moduleEnabled("panel"))) disposeUsage(runtimeHost);
+  if (!runtimeHost) return;
+  for (const module of MODULES) {
+    if (!module.onRuntimeChange || !runtimeActive.includes(module.id)) continue;
+    try {
+      module.onRuntimeChange(runtimeHost, runtime);
+    } catch (error) {
+      runtimeErrors.push(
+        `${module.id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+}
+
+/**
+ * Register any runtime module this session is allowed to have.
+ *
+ * Two switches decide it:
+ *
+ *   module switch     a module the project switched off installs nothing. This
+ *                     was the gap: registration used to look only at adoption,
+ *                     so a disabled module kept a live hook while its install
+ *                     artifacts were removed.
+ *   project adoption  without `.pi/Coworkflow.json` the project never opted in,
+ *                     so no module that acts on the model is installed. The
+ *                     exception is `alwaysActive`: the settings and model
+ *                     panels register anyway so an uninitialized project can be
+ *                     told why they are refusing, instead of the fuzzy matcher
+ *                     silently offering Pi's own command.
+ *
+ * Session state is not consulted here: hooks that act on the model read
+ * `runtime.enabled` at event time, and hooks that only record (the lane ledger)
+ * are deliberately adoption-gated so a dispatch from a session that never ran
+ * `/Coworkflow:start` is still recorded. `runtimeActive` makes the call
+ * idempotent, and every module's `activate` is required to be idempotent for its
+ * own registrations.
+ */
+function ensureRuntime(): void {
+  if (!runtimeHost) return;
+  const config = readConfig(configRoot(runtime.cwd));
+  for (const module of MODULES) {
+    if (!module.activate || runtimeActive.includes(module.id)) continue;
+    if (config !== null ? !isEnabled(config, module.id) : !module.alwaysActive) continue;
+    try {
+      module.activate(runtimeHost, runtime);
+      runtimeActive.push(module.id);
+    } catch (error) {
+      // A broken runtime hook must not take the session down; the status report
+      // names it instead.
+      runtimeErrors.push(
+        `${module.id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+}
+
+/**
+ * Release everything the runtime modules acquired for the session that ends here.
+ *
+ * `session_shutdown` arrives for quit, `/reload` and session replacement. A module
+ * that declares `onSessionEnd` releases its registrations there, so it must be
+ * activated again for the next session — it is dropped from `runtimeActive` for
+ * that reason. A module without `onSessionEnd` keeps its registrations on a host
+ * that outlives the session (the dispatch ledger is one ledger per host on
+ * purpose), so it stays marked active and nothing is registered twice.
+ */
+function endSession(): void {
+  if (runtimeHost) disposeUsage(runtimeHost);
+  for (const module of MODULES) {
+    if (!module.onSessionEnd) continue;
+    try {
+      module.onSessionEnd(runtimeHost!, runtime);
+    } catch (error) {
+      runtimeErrors.push(
+        `${module.id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const index = runtimeActive.indexOf(module.id);
+    if (index !== -1) runtimeActive.splice(index, 1);
+  }
+  sessionActivated.length = 0;
+  runtime.enabled = false;
+  runtime.loadState = "off";
 }
 
 function runtimeReport(): string | null {
   const runtimes = MODULES.filter((module) => module.activate);
   if (runtimes.length === 0) return null;
+  const states: string[] = [];
+  for (const module of runtimes) {
+    try {
+      for (const line of module.runtimeStatus?.(runtimeHost!) ?? []) states.push(`  [${module.id}]${line}`);
+    } catch (error) {
+      runtimeErrors.push(`${module.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   return [
     `[runtime] 本会话（isChild=${runtime.isChild ? "true" : "false"}，Coworkflow ${runtime.enabled ? "已加载" : "未加载"}）`,
     ...runtimes.map((module) => {
       if (!runtimeActive.includes(module.id)) {
-        return `  - ${module.id} 未注册（本会话加载时未启用，/${NS}:start 后生效）`;
+        const config = readConfig(configRoot(runtime.cwd));
+        return config === null
+          ? `  - ${module.id} 未注册（本项目未初始化）`
+          : `  - ${module.id} 未注册（本项目把该模块关掉了）`;
       }
       if (module.alwaysActive) return `  = ${module.id} 常驻`;
       return runtime.enabled
         ? `  = ${module.id} 已注册并生效`
-        : `  = ${module.id} 已注册（未加载：不生效，/${NS}:start 打开）`;
+        : `  = ${module.id} 已注册（本会话未加载：不生效，/${NS}:start 打开）`;
     }),
     ...runtimeErrors.map((entry) => `  x ${entry}`),
+    ...states,
   ].join("\n");
 }
 
@@ -512,7 +637,18 @@ function runStart(args: string, ctx: CommandContext): string {
   const on = action === "on";
   const sessionId = sessionIdOf(ctx, runtime);
   runtime.enabled = on;
-  if (on) activateSession();
+  if (on) {
+    // `refresh()` runs first in every command handler, so the runtime modules
+    // were already registered before this command got here; activation adds the
+    // feature commands. Both are idempotent, and both run here too in case a
+    // caller drove the control surface directly.
+    ensureRuntime();
+    activateSession();
+  }
+  // The session switch is one of the two gates a module reads, so the owners of
+  // session-scoped upstream registrations have to hear about it: off withdraws
+  // them, on reinstates them — in this same session.
+  notifyRuntimeChange();
 
   if (!sessionId) {
     return `本会话 Coworkflow → ${on ? "已加载" : "未加载"}，但拿不到 session id：子 agent 不会跟随本会话状态，建议 /${NS}:init --auto-enable on。`;
@@ -579,14 +715,14 @@ function createControl(): WorkflowControl {
       const root = rootOf();
       const config = readConfig(root);
       const own = readUserConfig()?.maxActiveAsyncRunsPerSession ?? null;
-      const sessionFile = sessionFileOf(null);
-      const active = runtime.enabled ? activeRunsForSession(sessionFile) : [];
+      const activity = runtimeHost ? existingSubagentsBridge(runtimeHost)?.activity() : undefined;
       return [
         `配置: ${configPath(root)}${config === null ? "（不存在）" : ""}`,
         `初始化于: ${config?.installedAt ?? "-"}`,
         `本会话: ${runtime.enabled ? "已加载" : `未加载（/${NS}:start）`}`,
         `pi-subagents 自身上限: ${own === null ? "不限（用户级配置）" : `${own}（用户级配置）`}`,
-        `活跃 async run: ${active.length}${active.length > 0 ? `（${active.map((run) => run.agent ?? "?").join("、")}）` : ""}`,
+        `活跃 async run: ${activity?.kind === "known" ? activity.active : `未知（${activity?.reason ?? "尚未读取公开状态"}）`}`,
+        formatNativeCost(runtimeHost ? usageSnapshot(runtimeHost, runtime).cost : { kind: "unknown", reason: "会话未就绪" }),
       ];
     },
     setSwitch: (id, on) => {
@@ -610,10 +746,26 @@ function createControl(): WorkflowControl {
       } catch (error) {
         return `${id} → ${on ? "on" : "off"}，但应用失败：${error instanceof Error ? error.message : String(error)}`;
       }
-      const runtimeNote = RUNTIME_IDS.includes(id) ? "（运行时模块：重开会话生效）" : "";
-      return `${id} → ${on ? "on" : "off"}${runtimeNote}`;
+      if (on && module.activate) {
+        // A switched-on runtime module attaches now instead of at the next
+        // reload. A module holding session-scoped upstream registrations also
+        // has to rebuild them; `notifyRuntimeChange` below is what makes that
+        // work without a reload in either direction.
+        try {
+          ensureRuntime();
+          if (runtime.enabled) activateSession();
+        } catch (error) {
+          return `${id} → on，但运行时注册失败：${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
+      notifyRuntimeChange();
+      if (on && module.activate) return `${id} → on（本会话已生效）`;
+      // Off: hooks stay attached but read the switch at event time, and a module
+      // that holds session-scoped upstream registrations withdraws them here.
+      return `${id} → ${on ? "on" : "off"}`;
     },
     loadState: () => runtime.loadState,
+    moduleEnabled: (id) => isEnabled(readConfig(rootOf()), id),
     setAutoEnable: (on) => {
       const root = rootOf();
       const config = readConfig(root);
@@ -675,6 +827,11 @@ export function controlSurface(): WorkflowControl {
 
 export default function coworkflowExtension(pi: PiRuntimeHost): void {
   runtimeHost = pi;
+  // A fresh factory call is a fresh extension runtime: whatever a previous one
+  // registered belonged to the session it was loaded for.
+  runtimeActive.length = 0;
+  sessionActivated.length = 0;
+  runtimeErrors.length = 0;
   const isChild =
     process.env.PI_SUBAGENT_CHILD === "1" || process.env.TRELLIS_SUBAGENT_CHILD === "1";
   runtime = {
@@ -685,6 +842,7 @@ export default function coworkflowExtension(pi: PiRuntimeHost): void {
     cwd: process.cwd(),
     sessionId: process.env.PI_SESSION_ID ?? null,
     parentSessionId: process.env.PI_SUBAGENT_PARENT_SESSION ?? null,
+    sessionEpoch: 0,
     control: createControl(),
   };
 
@@ -696,44 +854,76 @@ export default function coworkflowExtension(pi: PiRuntimeHost): void {
     runtime.loadState = resolved.state;
   }
 
-  for (const module of MODULES) {
-    if (!module.activate) continue;
-    const allowed = module.alwaysActive || runtime.enabled;
-    if (!allowed && readConfig(configRoot(runtime.cwd)) === null) continue;
-    try {
-      module.activate(pi, runtime);
-      runtimeActive.push(module.id);
-    } catch (error) {
-      // A broken runtime hook must not take the session down; the status report
-      // names it instead.
-      runtimeErrors.push(
-        `${module.id}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-  }
+  // Refresh before module hooks read their gates. Keep this single host listener
+  // inert after shutdown until the next session starts.
+  let sessionEnded = false;
+  pi.on?.("before_agent_start", () => {
+    if (!sessionEnded) runtime.refresh();
+  });
+
+  /**
+   * Register the runtime modules this session may use.
+   *
+   * An adopted project always gets the `alwaysActive` control surfaces (the
+   * settings and model panels) plus, when the layer is on, the rest. A session
+   * that starts with the layer *off* still registers nothing that acts on the
+   * model — `ensureRuntime` adds those the moment `/Coworkflow:start` turns it
+   * on, which is what used to require a reload.
+   */
+  ensureRuntime();
   // A session that starts with the layer on (autoEnable, or its own flag from an
   // earlier `/Coworkflow:start`) also gets the feature commands right away.
   if (runtime.enabled) activateSession();
 
   /**
-   * Re-resolve the session scope whenever Pi tells us the session (again).
+   * Re-resolve the session scope whenever Pi says the session started.
    *
-   * `session_start` fires on a fresh session *and* on `/reload`, and it carries
-   * the real session id — which the load-time resolution did not have yet. This
-   * is the difference between "my project auto-enables" and "this session asked
-   * for the workflow": after `/reload`, the flag written by `/Coworkflow:start`
-   * must still apply, and a session that never asked must stay plain Pi even if
-   * the project auto-enables.
+   * `session_start` fires on a fresh session, on `/reload`, and on a session
+   * replacement, and it carries the real session id — which the load-time
+   * resolution did not have yet. This is the difference between "my project
+   * auto-enables" and "this session asked for the workflow": after `/reload`, the
+   * flag written by `/Coworkflow:start` must still apply, and a session that never
+   * asked must stay plain Pi even if the project auto-enables.
+   *
+   * Identity is updated before anything reads it: the epoch moves first, so a
+   * module holding per-session state knows to rebuild, and every dependent hook
+   * sees the new session id and cwd.
    */
   pi.on?.("session_start", (_event: any, ctx: any) => {
+    sessionEnded = false;
     const cwd = typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : runtime.cwd;
     const id = sessionIdOf(ctx, runtime);
+    // Identity first, then everything that depends on it: the epoch moves before
+    // any dependent hook runs, and `notifyRuntimeChange` below is what re-registers
+    // session-scoped upstream resources for the new id.
+    runtime.sessionEpoch += 1;
     if (id) runtime.sessionId = id;
     runtime.cwd = cwd;
     const resolved = resolveLoadState(cwd);
     runtime.enabled = resolved.enabled;
     runtime.loadState = resolved.state;
+    ensureRuntime();
     if (runtime.enabled) activateSession();
+    notifyRuntimeChange();
+    return refreshUsage(pi, runtime, ctx);
+  });
+
+  pi.on?.("agent_settled", (_event: unknown, ctx: any) => refreshUsage(pi, runtime, ctx));
+  pi.on?.("message_end", (event: any, ctx: any) => {
+    if (decodeNativeCompletions(event?.message).length > 0) return refreshUsage(pi, runtime, ctx);
+    return undefined;
+  });
+
+  /**
+   * Release session-scoped state on quit, `/reload`, and session replacement.
+   *
+   * A listener registered for one session would otherwise keep acting in the
+   * next one — for a child injector that means injecting the finished child's
+   * context into whoever runs here later.
+   */
+  pi.on?.("session_shutdown", () => {
+    sessionEnded = true;
+    endSession();
     return undefined;
   });
 

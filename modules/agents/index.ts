@@ -14,37 +14,33 @@
  * both:
  *
  * The enforcement lives in `subagent-context`, not in agent frontmatter: it
- * strips inherited project instructions from a child's system prompt before
- * adding the child guide. Doing it there keeps the rule independent of which
- * agent was dispatched (including agents this package does not own), and it
- * only runs in a project that ran `/Coworkflow:init`.
+ * strips the managed parent-duty region out of a child's inherited project
+ * instructions before adding the child guide, and leaves the rest of what the
+ * project wrote. Doing it there keeps the rule independent of which agent was
+ * dispatched (including agents this package does not own), and it only runs in a
+ * project that ran `/Coworkflow:init`.
  *
  * Placement note: the child guide lives under `.pi/Coworkflow/` rather than
  * `.trellis/`. It is this package's artifact, not Trellis's, and `trellis
  * update` must not see it as something to reconcile.
  *
- * ## The runtime half
+ * ## What this module deliberately no longer does
  *
- * A policy that lives only in a file is a suggestion, and this one was read as
- * exactly that: a loaded session read the region, did the work itself, and
- * dispatched nobody. Files cannot enforce a division of labour, so the module also
- * measures it. In a main session it counts the tool calls it sees and, once the
- * work has clearly crossed the region's own threshold — enough calls, enough
- * distinct files, no child dispatched — it puts one line into the prompt naming
- * the rule and the exact call to make. Once per session, and only while the
- * workflow is loaded for that session.
- *
- * That is deliberately a nudge rather than a block: the region itself says the
- * main session may do work that is too small to be worth delegating, and the
- * threshold is the same judgement written down.
+ * It used to count the main session's tool calls and, past a threshold, inject a
+ * "you should delegate" line. Measuring is not the same as enforcing: the count
+ * was a heuristic over an already-decided turn, the line arrived mid-run, and
+ * upstream already reports the division that matters (which child ran which
+ * task). The policy stays where a policy belongs — in the region's text — and
+ * the runtime keeps no counter, no nudge, and no custom message.
  */
 
 import { join } from "node:path";
-import type { ModuleContext, PiRuntimeHost, RuntimeContext, WorkflowModule } from "../../core/module.ts";
+import type { ModuleContext, WorkflowModule } from "../../core/module.ts";
 import { moduleAsset } from "../../core/module.ts";
+import { MANAGED_REGION_END, MANAGED_REGION_START } from "../../core/trellis.ts";
 
-const REGION_START = "<!-- pi-Coworkflow:start -->";
-const REGION_END = "<!-- pi-Coworkflow:end -->";
+const REGION_START = MANAGED_REGION_START;
+const REGION_END = MANAGED_REGION_END;
 /** Child-facing instructions. Owned by this package, not by Trellis. */
 export const SUBAGENT_GUIDE_REL = join(".pi", "Coworkflow", "subagent-AGENTS.md");
 
@@ -91,122 +87,9 @@ function writeChildGuide(ctx: ModuleContext): void {
   );
 }
 
-/**
- * What "too big to do yourself" means, in the terms the region uses.
- *
- * Both numbers are calls, not minutes: a session that has made 12 tool calls
- * across 4 files is doing implementation work, and implementation work is what a
- * child exists for. Below either number the region's own exception ("小到不值得
- * 派单") applies and the nudge stays silent.
- */
-const NUDGE_MIN_TOOL_CALLS = 12;
-const NUDGE_MIN_FILES = 4;
-
-/** Tools that mutate the repository, as opposed to reading or reporting. */
-const WRITE_TOOLS = new Set(["write", "edit", "bash", "codemode"]);
-
-/** A path-shaped token in a tool call, for counting distinct files touched. */
-const PATH_RE = /[\w./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|md|json|yaml|yml|toml|css|scss|html|sql|sh)\b/g;
-
-/**
- * A path-shaped token in a tool call, for counting distinct files touched.
- *
- * Matched against the call's *arguments*, not its serialized form: a
- * `write`/`edit` whose body happens to contain `foo.ts` in a comment is not a
- * file being changed, and counting those is how the threshold went off on a
- * session that had touched far fewer files than it claimed.
- */
-function pathsIn(input: unknown, into: Set<string>): void {
-  if (input === null || typeof input !== "object") return;
-  const record = input as Record<string, unknown>;
-  // Only the fields that name a target, in the order the tools use them.
-  for (const key of ["path", "file_path", "filePath", "file", "files", "target"]) {
-    const value = record[key];
-    if (typeof value === "string") {
-      for (const match of value.matchAll(PATH_RE)) into.add(match[0]);
-    } else if (Array.isArray(value)) {
-      for (const entry of value) {
-        if (typeof entry === "string") {
-          for (const match of entry.matchAll(PATH_RE)) into.add(match[0]);
-        }
-      }
-    }
-  }
-}
-
-/**
- * Count the main session's own work, and report it where it belongs.
- *
- * Runs in the main session only: a child is *supposed* to do the work, so the
- * measurement means nothing there.
- *
- * Where the report goes matters as much as what it says. An earlier version
- * returned it from `before_agent_start`, and Pi delivers a handler's returned
- * message as a **user-role message** at the head of the run — so the middle of a
- * debugging session suddenly contained a wall of bold text attributed to the user,
- * rewriting the task and declaring work "越界". It read as a prompt injection and
- * interrupted the run far more than it helped. The measurement is still real, but
- * it is now reported the way every other Coworkflow status is: as a display-only
- * `custom_message` entry, which renders in the transcript and is not part of the
- * conversation the model continues from.
- *
- * Deliberately *not* counted: management calls (`subagent({ action: "status" })`)
- * are dispatches in spirit, and a session that has dispatched once has answered the
- * question this metric asks.
- */
-export function watchDivisionOfWork(host: PiRuntimeHost, runtime: RuntimeContext): void {
-  if (!host.on) return;
-
-  let toolCalls = 0;
-  let writeCalls = 0;
-  let dispatches = 0;
-  const files = new Set<string>();
-  let reported = false;
-
-  const report = (): void => {
-    if (reported) return;
-    reported = true;
-    const line = [
-      `分工：本会话已自行执行 ${toolCalls} 次工具调用、直接改动了 ${files.size} 个文件（其中 ${writeCalls} 次写操作），尚未派发任何子 agent。`,
-      "受管区的界线是 ≥12 次工具调用且 ≥4 个文件时应当派单。若剩余工作有可独立验证的边界，用 `subagent({ agent, async: true, context: \"fresh\", task: \"Active task: …\" })` 交出去。",
-    ].join("\n");
-    try {
-      host.sendMessage?.({ customType: "pi-Coworkflow", content: line, display: true });
-    } catch {
-      // A report that cannot be delivered must not break the tool call that triggered it.
-    }
-  };
-
-  host.on("tool_call", (event: any) => {
-    if (!runtime.enabled) return undefined;
-    const name = typeof event?.toolName === "string" ? event.toolName : "";
-    if (name === "subagent") {
-      dispatches += 1;
-      return undefined;
-    }
-    toolCalls += 1;
-    if (!WRITE_TOOLS.has(name)) return undefined;
-    writeCalls += 1;
-    pathsIn(event?.input, files);
-    // Report at the crossing rather than on the next model turn: a tool call is
-    // the moment the work becomes implementable-by-a-child, and reporting here
-    // keeps it out of the prompt entirely.
-    if (dispatches === 0 && toolCalls >= NUDGE_MIN_TOOL_CALLS && files.size >= NUDGE_MIN_FILES) {
-      report();
-    }
-    return undefined;
-  });
-}
-
 export const agentsModule: WorkflowModule = {
   id: "agents",
-  title: "指令文件（主会话 AGENTS.md 受管区 + 子 agent 专用约定）与分工测量",
-
-  activate(host: PiRuntimeHost, runtime: RuntimeContext): void {
-    // Only the main session is measured: a child doing the work is the design.
-    if (runtime.isChild) return;
-    watchDivisionOfWork(host, runtime);
-  },
+  title: "指令文件（主会话 AGENTS.md 受管区 + 子 agent 专用约定）",
 
   apply(ctx: ModuleContext): void {
     writeChildGuide(ctx);

@@ -49,7 +49,7 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 - **文件不存在 = 本项目未初始化**：扩展在项目里不安装、不注入、不记账；只有 `/Coworkflow:init` 会创建它。
 - **初始化 ≠ 加载**：`autoEnable` 默认 `false`，所以已初始化的项目里**新开会话也不加载** Coworkflow——就是原生 Pi。在该会话运行 `/Coworkflow:start` 才加载（开关按会话 id 记录，派发的子 agent 会跟随），或 `--auto-enable on` 让新会话直接加载。
 - 会话状态与项目开关的优先级：**会话显式设置优先**（`/Coworkflow:start off` 即使项目 `autoEnable: on` 也保持未加载）。
-- `modules.<id>` 是逐模块开关：**显式 `false` 才是关闭**；键缺失表示“该模块是在这份配置写出之后新增的”，默认开启（每次运行都会把整张开关表写全）。运行时模块在**会话启动时**读取开关；改开关后重开会话生效。
+- `modules.<id>` 是逐模块开关：**显式 `false` 才是关闭**；键缺失表示“该模块是在这份配置写出之后新增的”，默认开启（每次运行都会把整张开关表写全）。运行时模块在事件/命令边界读取开关；关闭会撤销资源，重新启用可在本会话恢复。
 - 一切都是项目级的：不写用户的全局设置（`~/.pi/agent/*`）——**唯一的例外是项目信任决定**：
   `/Coworkflow:init` 会把本项目写进 Pi 自己的信任库 `~/.pi/agent/trust.json`（理由与边界见
   [项目信任](#项目信任pi-的安全边界不是本包的限制)，`--no-trust` 可跳过）。`pi-subagents`
@@ -64,6 +64,7 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 | `/Coworkflow:settings` | 设置面板：模块开关、新会话是否自动加载、worktree 前缀、Trellis 范式对齐；未初始化时可直接从面板初始化 |
 | `/Coworkflow:status` | 查看初始化状态、模块开关、自动加载、安装产物与本会话是否已加载（等价 `--dry-run`，不改文件） |
 | `/Comodels` | 模型面板（需先 /Coworkflow:start）：主会话 / 子 agent 两个 tab，三列 = 模型 \| 思考等级 \| 用量 |
+| `/Coworkflow:run [focus]` | 在宿主验证过的当前任务 worktree 运行原生 `coworkflow.implement-review`，交付后仍需主会话验收 |
 | `/Coworkflow:lanes` | 当前 Trellis 任务的 lane（worktree 隔离派单）状态、patch 路径与合并计划（需先 /Coworkflow:start） |
 | `--enable <id,...>` / `--disable <id,...>` | `/Coworkflow:init` 的参数：改模块开关并持久化；关掉某模块会收回它写下的东西 |
 | `--auto-enable on\|off` | 新会话是否自动加载 Coworkflow（默认 off） |
@@ -106,18 +107,15 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 - **主会话自己动手的唯一场合**：需要全局判断，或改动小到不值得派单（一行修复、改个配置、答一个问题）。
 - **派单边界**：有明确输入、产物、验收方式的工作才派；探索性、跨模块协调的留主会话。
 - **审计边界**：子 agent 回结果 ≠ 结果可用。对照 prd 验收条件核对产物与它引用的文件、跑该模块测试，偏差就重派或自己修，不能把子 agent 的结论直接当成事实汇报。
-- **注入按角色，不按 agent 名**：`worker` 加了 `<!-- trellis-agent: implement -->` 就拿到 implement 那份上下文，不必改名成 `trellis-implement`；未标记的 agent 不注入。
+- **多阶段工作用命名的 workflow 表达**（例如上游的 implement → review 资源），单步工作直接派一个有边界的子 agent；无论哪种，子步骤都在原生侧执行、有稳定的 child key 和验收结论，主会话只接收产物与结论，不把几个阶段串起来自己做。
+- **注入按角色，不按 agent 名**：`worker` 加了 `<!-- trellis-agent: implement -->` 就拿到 implement 那份上下文，不必改名成 `trellis-implement`；未标记的 agent 也会拿到子 agent 约定（角色上下文除外）——"不知道你是谁"不等于"不给任何约束"。
 
-**这条规则不只是写在文件里，还会被测量。** 只写进 `AGENTS.md` 的约定会被读成建议：一个已加载的会话读完受管区，
-仍然自己动手改完了所有文件，一次子 agent 都没派。所以 `agents` 模块还有运行时的一半：在主会话里数
-`tool_call`，当本会话已自行执行 **≥12 次工具调用、直接改动 ≥4 个文件、且一次都没派单**时，在会话里出一条
-`pi-Coworkflow` 记录，点名受管区的界线与该派的 `subagent(...)` 形状。每会话一次，只在 Coworkflow 已加载时生效。
-
-这条记录**只显示、不进对话**。早期版本是把它从 `before_agent_start` 返回的——Pi 会把 handler 返回的
-message 当成一条**用户消息**插在那一轮的最前面，于是调试到一半会突然出现一大段"用户"说的话，改写任务、
-断言"越界"，读起来像提示注入，比它想纠正的问题更打断工作。测量是真的，报告方式是它原来错了。
-
-阈值就是受管区里那句"小到不值得派单"的量化版本：低于它不打扰，高于它说明这是在实现而不是在收尾。
+**这条规则只写在文件里，不在运行时计数。** 早期版本还有运行时的一半：在主会话里数 `tool_call`，越过
+「≥12 次工具调用 + ≥4 个文件且一次没派单」的阈值就派一条 `pi-Coworkflow` 记录。它已被删除，原因有三：
+计数是对已经发生的那一轮做事后判断，改不了当时的决策；阈值把"该不该派"变成两个数字，而真正的判据是
+"能不能独立验证"；上游原生的完成通知已经给出真正有用的事实（哪个 child 跑了哪个任务、产物在哪）。
+那个返回给 `before_agent_start` 的提醒还曾经以**用户消息**的形式插进对话，读起来像提示注入——这条路径
+也一并没有了：本包不再有 `sendUserMessage` 调用，也没有任何被动状态会以用户身份说话。
 
 ## 模块
 
@@ -125,10 +123,10 @@ message 当成一条**用户消息**插在那一轮的最前面，于是调试�
 |---|---|---|---|---|
 | `trellis` | 安装 | 改版 Trellis 本体 | 无 `.trellis/` 时 `trellis init --pi -y`；已有项目**只报告不重写**（tasks/spec/workspace/.runtime 记录保留），范式对齐走 `trellis update` 或 `--trellis-update` | 只报告，不删（Trellis 资产归 CLI 管） |
 | `worktree` | 安装 | 任务隔离的**机制** | `.trellis/scripts/hooks/auto_worktree.py` + `.trellis/config.yaml` 的 `hooks.after_start` | 移除 `after_start` 注册（脚本保留） |
-| `agents` | 安装 + 运行时 | 两份指令文件，以及分工的测量 | `AGENTS.md` 受管区（主会话）+ `.pi/Coworkflow/subagent-AGENTS.md`（子 agent）；主会话里数工具调用，越过阈值且一次没派单时插一条提醒 | 移除受管区（其余内容不动）；提醒随之消失 |
+| `agents` | 安装 | 两份指令文件 | `AGENTS.md` 受管区（主会话）+ `.pi/Coworkflow/subagent-AGENTS.md`（子 agent）；不注册任何运行时钩子 | 移除受管区与子 agent 约定（其余内容不动） |
 | `subagents` | 安装 | 复用已装的 `pi-subagents`，缺失时项目级安装 | 检测用户级/项目级/npm 目录；必要时写项目 `.pi/settings.json` 的 `packages`；写 `subagents.projectRootResolution: "git-root"` | 移除 `projectRootResolution`（packages 保留） |
 | `subagent-context` | 运行时 | 子会话按角色注入 Trellis 上下文 | 在**子会话**里读角色 + 任务，注入 `implement.jsonl`/`check.jsonl`/spec 树 + prd/design/implement | 不注册钩子 = 不注入 |
-| `lane-worktree` | 运行时 | lane 账目与合并计划 | 在**主会话**里记录 lane 指针到 `.trellis/.runtime/lanes/`，提供 `/Coworkflow:lanes` | 不注册钩子 = 不记账 |
+| `lane-worktree` | 运行时 | lane 账目与合并计划 | 在**主会话**里记录原生身份链接（兼容旧 lane 指针），提供 `/Coworkflow:lanes` | 不注册钩子 = 不记账 |
 | `capacity` | 运行时 | 项目级子 agent 并发上限 | 在**主会话**里拦截超出本项目上限的派单（`tool_call` gate）；不写 pi-subagents 的配置文件；**失败不自动重派**（早期版本的自动重派会重跑错的任务，已删除） | 不注册钩子 = 不拦截 |
 | `panel` | 常驻 | 模型面板 | `/Comodels`：主会话（本会话）/ 子 agent（本项目）两个 tab，模型 + 思考等级 + token 用量；不写全局 | 关掉即无面板 |
 
@@ -151,7 +149,7 @@ message 当成一条**用户消息**插在那一轮的最前面，于是调试�
 
 ### `/Comodels`
 
-一张**表格**：每行一个模型，右侧是它自己的思考等级；**用量列是一整块 7 天柱状图**，占满该列的整列高度（与可见模型行数同高），而不是一行迷你字符。
+一张**表格**：模型与思考等级是各自独立的列，思考列始终显示全部可用等级；**用量列是一整块 7 天柱状图**，占满该列的整列高度（与可见模型行数同高），而不是一行迷你字符。
 
 ```
 pi-Coworkflow · 模型面板
@@ -178,13 +176,13 @@ pi-Coworkflow · 模型面板
 - **口径**：`input + output + cacheRead + cacheWrite`，按 `provider/model` 精确匹配（不同 provider 的同名模型不串账），且**只统计 `/Coworkflow:start` 之后**的消耗。
 - 对齐：单元格先按列宽 pad 成纯文本再上色；分隔线 `─┼─` 与数据行 ` │ ` 同宽。
 - 表格之外没有任何附加块。
-- **性能**：一次按键只取一次快照（`ModelPanel.snapshot()` 按渲染周期缓存，输入到达或应用后失效）。快照会读本会话全部条目与全部子 agent 产物，早先一次按键要取 5 次，实测 21 ms → **5 ms**；7 天序列只算光标所在的那个模型（原先还额外算了一份面板并不显示的序列）。
+- **性能**：会话启动、`agent_settled`、原生完成通知和打开面板时刷新公开数据；渲染/按键只对内存历史做投影，不扫描磁盘、不请求 RPC、没有轮询。
 
 | 键 | 作用 |
 |---|---|
 | `↑↓` | 在当前列内移动（模型列移动即切换统计的模型） |
-| `Tab` | 在 模型 / 思考 列之间切光标 |
-| `←→` | 切换 主会话 / 子 agent tab |
+| `Tab` | 切换 主会话 / 子 agent tab |
+| `←→` | 在 模型 / 思考 列之间切光标 |
 | `Enter` | 应用当前项 |
 | `Esc` | 关闭 |
 | 直接打字 | 搜索过滤（只在模型列） |
@@ -193,15 +191,35 @@ pi-Coworkflow · 模型面板
 
 ## 面板里的用量统计
 
-面板顶部常驻一块用量，按「谁花的」拆开，数据全部来自 Pi 与 pi-subagents **已经写到磁盘的记录**（不是估算，也没有自己的账本）：
+原生总量与模型日图有不同口径，不把无法归属的总量分摊到某个模型：
 
-| 行 | 来源 | 口径 |
+| 数据 | 来源 | 口径 |
 |---|---|---|
-| 主会话 | Pi 的会话条目（`sessionManager.getEntries()`）：assistant 消息的 `{provider, model, usage}`，以及 `usage`（cache_warm）、compaction、branch summary 条目 | **本会话**，按模型分行（切换过模型就能看出各模型各花多少） |
-| 子 agent | pi-subagents 的运行元数据 `<sessionDir>/subagent-artifacts/<runId>_<agent>_meta.json`（`artifacts: "session"` 默认位置）与 `<cwd>/.pi/subagents/artifacts/`（project 模式） | **本会话派单**（按 `parentSessionId` 过滤），按 agent + 模型分行 |
-| 本项目累计 | 同上目录下的全部 meta | 该项目所有会话的派单汇总（包括其他会话派出去的），仅在本会话派单之外还有记录时显示 |
+| 本会话原生合计 | 公开 RPC `cost` v1：`parent`、`children`、`childTotal`、`total` | pi-subagents 当前会话分支的父子用量；显示在模型面板已有说明行和设置事实中 |
+| 主会话日图 | Pi `sessionManager.getEntries()` 的 assistant、usage、compaction、branch_summary | 保留本地日期、精确 `provider/model`、启用时间之后的 7 天图 |
+| 子会话日图 | 仅由原生 cost 明确给出的 `children[].sessionFile` | 读取对应 Pi JSONL 的真实模型与时间，合并到同一模型日图；两个 tab 继续使用这一合并口径 |
 
-显示 `in / out / cache / $ / turns`，金额只在记录里有非零 cost 时出现（例如 clinepass 没配价格就不显示 `$`）。这与 pi-subagents 自己的 `/subagent-cost`（它返回 `parent` + `children` + `childTotal`）是同一套账，只是从已记录的 artifact 读、并按本项目的作用域拆分展示。
+`unresolvedAsyncChildren > 0` 时原生总量显示 **≥ / 不完整**。公开能力不可用、协议无效或超时则显示**未知**，不补零。缺少 sessionFile、文件不可读、记录缺少模型/时间、坏行或读取预算不足时，图表保留已知数据并标记不完整；没有可见数据则显示“未知 / 不完整”，不画成已知零。真实可确认的零消耗仍显示零。
+
+历史读取每次最多 128 个去重路径、单文件 8 MiB、合计 32 MiB；超过预算不截断后假装完整。只读原生给出的绝对路径，不搜索私有临时目录或 meta 文件，也不把文件 mtime 当作使用日期。原生 cost 没有跨会话项目累计或模型/每日分组，本包不推算这些数据。总量中的 `$` 只在原生金额非零时显示。
+
+缓存只属于当前宿主、会话与 epoch；关模块、会话替换、reload/shutdown 后，旧异步结果不能写回新会话。面板打开时刷新一次，保持打开期间不定时刷新；关闭后重新打开可读取新记录。
+
+## 原生 implement → review 工作流
+
+`/Coworkflow:run [focus]` 使用 `coworkflow.implement-review`。Trellis 负责任务要求、当前任务指针和隔离 worktree；pi-subagents 负责执行、mission、稳定 child key、原生验收门、恢复记录与完成通知；Coworkflow 只做公开 API 适配、项目策略与任务到原生身份的关联。
+
+宿主在 resolver 之外校验当前任务的 `task.json`、真实路径、同仓库 Git linked-worktree 成员关系及任务记录的分支，拒绝主检出、别的仓库、普通目录与不一致分支。纯 resolver 只接受准备好的当前任务引用及可选 focus/agent 名，拒绝调用方覆盖 worktree/mainCheckout 或传入未准备好的任务。必需的子扩展注册先于工作流；关闭/重载/会话切换会撤销注册。
+
+工作流依次 await 稳定键 `implement`、`review`，两个 child 都使用 `context: "fresh"`、同一已验证 cwd 与 `worktree: false`；只有最外层异步。实现必须给出有效 completed 结果及验收证据，独立审查必须明确 pass 且没有阻塞 findings；失败、字段缺失或矛盾 verdict 都失败。原生 mission/run/artifact 引用会返回给主会话；**流程完成不代表最终验收、合并或发布**。
+
+支持下限按公开能力检查：RPC v1 `ping/status/spawn/cost`、版本化 fleet/status projection、进程内完成事件，以及文档导出的 workflow-resource/required-child-extension 注册接口。已核对 pi-subagents 0.79.1；不能只凭版本号宣称支持。缺能力会显示诊断，不加载第二套 runtime，也不回退到 CLI 启动。RPC 请求有 UUID、超时与监听清理；spawn 回复超时可能已经启动，只能用 `rpc-spawn-<requestId>` 查询恢复，**绝不自动重发**。不启用 goal/watchdog、提醒或自动重试。
+
+### 项目并发边界
+
+`.pi/Coworkflow.json` 的 `subagentConcurrency` 保持有效，按公开 `fleet.topLevelAsyncCapacity.used` 加尚未被原生状态接管的本地预留决定准入。缺少可靠计数时，配置了上限的派单明确拒绝；不把未知当作 0。只有顶层 async 执行/恢复占位，管理调用与前台调用不占位；原生工作流内部 fanout 仍由上游限制。
+
+同一门控覆盖 `subagent` 工具和本包 `/Coworkflow:run` 的 RPC spawn。它不控制其它扩展直接发出的 RPC，也不承诺跨进程协调；不会改用户级上游容量配置。已确认的 no-launch/完成会释放预留，模糊超时保留关联直到公开状态确认或会话结束，不靠 TTL 假设运行消失。
 
 ## 运行时模块怎么工作
 
@@ -224,7 +242,7 @@ pi-Coworkflow · 模型面板
 | `check` | `check.jsonl` + `prd.md` + `design.md` + `implement.md` |
 | `research` | `.trellis/spec/` 目录树 + 搜索提示（不需要任务） |
 
-所有文件都从**主检出**读（worktree 里只有已提交内容），每个 (角色, 任务) 只注入一次，且只在子会话里生效——
+所有文件都从**主检出**读（worktree 里只有已提交内容），每轮启动都幂等重建本包的注入块，且只在子会话里生效——
 主会话的 Trellis 扩展自己负责它那份，本模块不重复。
 
 注意：三个角色 agent 来自 `.pi/agents/trellis-*.md`，由 pi-subagents 从项目发现，**需要项目被信任**；
@@ -236,33 +254,17 @@ pi-Coworkflow · 模型面板
 parallel handoff manifest（`lane.status` / `lane.recordMerge` / `worktree.cleanup`）。本模块**不重造**这些，
 只补 Trellis 这一侧缺的账：
 
-1. 主会话每次派单带 worktree 隔离时，从结果里的 `Parallel handoff: <path>`（或 `details.handoffPath`）
-   取出 manifest 路径，记一条指针到 `.trellis/.runtime/lanes/<任务>/<runId>.json`。
-   放在 `.runtime/` 下是因为它已被 gitignore：lane 指针是机器状态，不该提交。
-2. `/Coworkflow:lanes` 读这些指针 + 每个 manifest，打印 lane 的 agent/status/worktree/branch/patch、
-   证据状态（`terminal-eligible` / `terminal-blocked` …）以及合并计划。
+1. 从已关联的工具/RPC 成功回执取得原生 run/mission 身份，将任务与身份及显式 artifact 引用存到 `.trellis/.runtime/native-runs.json`。这不是状态数据库，不保存生命周期、任务提示词或重试队列。
+2. 从原生 `subagent-notify.details.runs` 和公开 status 更新可见引用，读取明确指定的 handoff/receipt；每个 child 按精确 runId 或原生索引对应它自己的 patch/output/worktree，不解析通知正文、不按数组顺序猜身份。
+3. `/Coworkflow:lanes` 保留证据、合并与清理指导；git apply 的目标使用已验证的任务 integration worktree。目标不合法时只显示原因和产物，不生成应用命令。
 
-它**不合并、不 apply patch、不删 worktree**：合并由主会话审计后执行，破坏性清理仍走 pi-subagents 自己的授权策略。
+原来的 `.trellis/.runtime/lanes/<任务>/<runId>.json` 指针保持可读，不迁移或删除已有 lane 产物。新版本删除私有运行目录探测及 `core/ledger.ts`；不会从旧 meta 扫描结果重建原生生命周期。完成通知/唤醒、mission 恢复记录和执行状态始终由上游负责。
 
-## 失败处理
+## 失败与记录边界
 
-**失败不自动重派。** 早期版本会在 `message_start`/`message_end` 上监听 pi-subagents 的
-`subagent-incremental-child-notify`（`details.outcome: "failed"`）并自动重派一次。那个实现是错的，
-而且错在会被静默放大的地方：通知里标识子会话的是 pi-subagents 自己的 `childRunId`/`childKey`，
-而重派依据是一张以 **Pi 的 `toolCallId`** 为键的表，两个键空间不相交。于是"按 run id 查"恒空，
-退回"当前只有一个未重派派单就重派它"——只要历史上记过恰好一次派单，之后**任何**一条失败通知
-（包括 `contact_supervisor` 调起来的、前台 `subagent` 失败的）都会让模型去重跑一条早就结束的任务。
+**失败不自动重派。** 启动回执不是终态，终态也不是主会话验收。重试、恢复、最终集成及清理仍由人或主会话决定；本包不合并、不 apply patch、不删 worktree、不运行自己的调度器。
 
-现在失败只报告、不动作：
-
-- 派单记录（`core/ledger.ts`）把 `toolCallId`、`runId`、`childKey` 记在同一处，并在拿到
-  `Parallel handoff` 时把 run id 绑回那次派单，所以"这条失败属于哪次派单"是查出来的，不是猜的。
-- 重派由主会话（或你）决定，用的是同一条记录里的 `agent`/`task`。
-- `capacity` 只做它名字里的事：并发上限。
-
-## lane 记账的边界
-
-派单记录由 `core/ledger.ts` 统一维护（每个会话一份，`capacity` 与 `lane-worktree` 都只读它，不再各自 hook 一遍 `tool_call`），lane 指针写在 `.trellis/.runtime/lanes/<任务>/<runId>.json`，只要求**项目已初始化**，不要求本会话跑过 `/Coworkflow:start`——未加载状态下派的单同样产出 artifact，漏记会让 `/Coworkflow:lanes` 少报。项目没初始化（没有 `.pi/Coworkflow.json`）时一律不写。
+lane 观察要求项目已采用且 `lane-worktree` 开启；会话尚未 `/start` 时也可保留明确的任务/原生身份关联。未知完成不附到“唯一待办”上。容量、工作流命令与子上下文各自遵守模块/会话开关，清理不因模块关闭而跳过。被动内部状态不发送用户消息或自定义上下文消息。
 
 ## 两份指令文件：主会话一份，子 agent 一份
 
@@ -281,20 +283,24 @@ parallel handoff manifest（`lane.status` / `lane.recordMerge` / `worktree.clean
 
 子会话拿到项目 `AGENTS.md` 只有一条途径：pi-subagents 的 agent 声明了 `inheritProjectContext: true`（Pi 把它渲染成 `<project_instructions path="…">`）。
 
-**这道隔离放在兼容层，不写进任何 agent 的 frontmatter。** `subagent-context` 在子会话里、追加自己的内容之前，先把系统提示里所有 `<project_instructions>` 块剥掉：
+**这道隔离放在兼容层，不写进任何 agent 的 frontmatter。** `subagent-context` 在子会话里、追加自己的内容之前，先把每个继承来的 `<project_instructions>` 里**本包的受管区**（`<!-- pi-Coworkflow:start -->` 到 `:end`）剪掉，项目自己写在区外的东西原样保留：
 
 | 场景 | 结果 |
 |---|---|
-| Trellis 角色子会话（`trellis-implement`/`check`/`research`） | 剥掉项目 AGENTS.md → 注入子 agent 约定 + 角色上下文 |
-| 任意其它 agent（`worker`、`reviewer`、自定义） | 剥掉项目 AGENTS.md → **不注入**任何本包内容（不是 Trellis 角色，就没有角色上下文） |
-| 未初始化本包的项目 | 钩子**根本不注册**，系统提示一字不动 |
+| Trellis 角色子会话（`trellis-implement`/`check`/`research`） | 剪掉受管区 → 注入子 agent 约定 + 角色上下文 |
+| 任意其它 agent（`worker`、`reviewer`、自定义） | 剪掉受管区 → 注入子 agent 约定（通用兜底或项目自己的那份），**不注入**角色上下文 |
+| 未初始化本包的项目 / 模块被关掉 | 事件时门控不注入，系统提示一字不动；已注册清理钩子仍可执行 |
 | 主会话 | 钩子只在子会话里生效（`runtime.isChild`），主会话照常继承项目 AGENTS.md |
+
+剪整块 `<project_instructions>` 是早期版本的写法，它连"怎么构建、代码怎么组织"一起删掉了——子 agent 于是不知道这个仓库怎么跑测试。现在只剪本包写进去的那一段：项目自己的构建命令、代码规范、目录说明都还在。
 
 为什么不改 agent frontmatter：那要写进 `trellis-{implement,check,research}.md`，属于 Trellis 的模板（`trellis update` 会覆盖，而且改的是别人的默认配置）；而且只能覆盖我们自己拥有的三个 agent，用户自定义的 agent 仍会继承。放在注入层则**对所有 agent 生效、随本包一起升级、且只在采用本包的项目里生效**。
 
-副作用要说明：非 Trellis 角色的子 agent 也会失去项目 `AGENTS.md`。这是有意的——一个只做一件事的子 agent 不该拿到主会话的规划/派单/审计职责。它仍然有自己的 agent 系统提示、项目 `CLAUDE.md` 之外的其它上下文，以及派单提示词。
+**重复运行也是幂等的。** `before_agent_start` 每一轮都会触发，注入必须能被反复执行：块写进 `systemPromptOptions.sections.pi_coworkflow_child`，Pi 自己负责渲染和 diff，第二次是替换而不是追加；宿主没有结构化 options 时退回字符串路径，先剪掉自己上一轮的块再重新拼。同一个子会话跑十轮，系统提示里仍然只有一份。
 
-注入顺序固定为：`子 agent 工作约定` → `Trellis 子任务上下文（role: …）` → `边界`。约定与角色无关，每次派单都带；角色上下文按角色给。
+**无效的任务引用不会被改写成父会话的任务。** 派单提示词写了 `Active task: .trellis/tasks/typo` 而该目录不存在时，注入会在块首明说这个引用无效、并告诉子 agent 不要猜；只有**完全没写**任务时才回落到父会话的 Trellis 指针。
+
+注入顺序固定为：`Trellis 子任务上下文（role: …）`（角色会话才有）→ `子 agent 工作约定` → `边界`。
 
 ## 目录结构
 
@@ -305,11 +311,12 @@ pi-Coworkflow/
 ├── core/module.ts               # 模块契约（WorkflowModule / ModuleContext / PiRuntimeHost / RuntimeContext）
 ├── core/config.ts               # 项目配置与开关（.pi/Coworkflow.json）
 ├── core/agentdir.ts             # Pi 的 agent 目录与其中几个已知路径（唯一一处推导）
-├── core/pi-subagents.ts         # pi-subagents 契约：版本、用户级配置、run 记录探测
-├── core/ledger.ts               # 派单记录（toolCallId ↔ runId ↔ childKey），capacity 与 lane-worktree 共用
+├── core/pi-subagents.ts         # 公开回执/完成与引用产物的解码
+├── core/subagents-client.ts     # RPC v1、能力/状态/cost 解码与共享准入
+├── core/subagents-workflow.ts   # 原生工作流注册、验收与任务身份链接
 ├── core/trellis.ts              # Trellis 布局、上下文注入原语、会话开关标记
-├── core/usage.ts                # token/成本统计（Pi 会话条目 + pi-subagents 运行元数据）
-├── core/capacity.ts             # pi-subagents 活跃 async run 的观测（并发上限用）
+├── core/usage.ts                # 公开 native cost 缓存 + Pi/sessionFile 每日历史
+├── core/capacity.ts             # async 执行/管理分类（公开准入由 client 拥有）
 ├── core/trust.ts                # 项目信任决定（写 Pi 自己的 trust.json）
 ├── scripts/test.ts              # 契约 fixture 测试（node --test，无第三方依赖）
 └── modules/
@@ -340,7 +347,10 @@ pi-Coworkflow/
 
 1. `modules/<id>/index.ts` 导出 `WorkflowModule`：`id`、`title`、可选的 `apply(ctx)`（安装）、
    `remove(ctx)`（关闭时收回）、`activate(host, runtime)`（运行时）、`onSessionActivate(host, runtime)`
-   （只在会话已加载时注册的功能命令）、`alwaysActive: true`（控制面，工作流关闭时也用）。
+   （只在会话已加载时注册的功能命令）、`onRuntimeChange(host, runtime)`（会话开关或项目模块开关
+   变动时重新对齐自己持有的会话级资源，如 pi-subagents 按 session 注册的工作流资源）、
+   `runtimeStatus(host)`（`/Coworkflow:status` 里的一行状态，存下来按需读，不主动发消息）、
+   `onSessionEnd(host, runtime)`（会话结束时收回）、`alwaysActive: true`（控制面，工作流关闭时也用）。
    钩子的 gate 分两级：作用于模型行为的按 `runtime.enabled` 在调用时 gate；只记录事实的（lane 账目）
    按"项目已采纳" gate——未加载会话派的单同样产出 artifact，漏记只会让记录少报；
 2. 需要模板就放 `modules/<id>/assets/`，用 `moduleAsset` 读；
@@ -405,7 +415,8 @@ node scripts/verify.ts <项目目录> Coworkflow:lanes                       # �
 派单记录里 run id 与失败通知的 child id 对得上（`core/ledger.ts`）、`trellis update` 重排
 `config.yaml` 之后 `after_start` 仍能被移除（`modules/worktree`）、失败的模块不会被记成已安装
 （`extensions/coworkflow.ts`）、用户级路径跟随 `PI_CODING_AGENT_DIR`/`PI_CONFIG_DIR`
-（`core/agentdir.ts`）、分工测量只在越过阈值且没派单时才触发一次（`modules/agents`）。
+（`core/agentdir.ts`）、子会话注入在重复运行/通用 agent/模块开关/会话替换下都正确
+（`modules/subagent-context` + `core/trellis.ts`）。
 
 ## 卸载
 

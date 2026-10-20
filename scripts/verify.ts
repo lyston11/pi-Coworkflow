@@ -106,8 +106,7 @@ const ctx = {
     // `PI_VERIFY_SESSION_ID` lets a test keep the load-time env id empty while
     // still handing Pi a real session id, which is what a `/reload` looks like.
     getSessionId: () => process.env.PI_VERIFY_SESSION_ID ?? process.env.PI_SESSION_ID ?? "verify-session",
-    // pi-subagents records the parent session *file* per run, which is what the
-    // capacity gate matches on.
+    // Parent history may use this path; capacity uses the public current-session RPC.
     getSessionFile: () => process.env.PI_VERIFY_SESSION_FILE,
   },
   ui: {
@@ -274,10 +273,11 @@ switch (command) {
       toolCallId: "call-1",
       input: { agent: "trellis-implement" },
       content: [{ type: "text", text: `child finished\n\nParallel handoff: ${handoffPath}` }],
-      details: { handoffPath },
+      details: { runId: handoffPath.replace(/\.json$/, "").split("/").pop(),
+        parallelHandoff: { version: 1, path: handoffPath } },
       isError: false,
     });
-    console.log("lane record written");
+    console.log("native lane link observed (requires a valid current task)");
     break;
   }
 
@@ -294,14 +294,12 @@ switch (command) {
       here("../modules/panel/models.ts")
     )) as unknown as { ModelPanel: new (port: unknown, theme: unknown, tui: unknown) => PanelLike };
     const usageModule = "../core/usage.ts";
-    const { collectChildUsage, collectSessionUsage, topEntries } = (await import(
+    const { collectUsageHistory, formatNativeCost } = (await import(
       here(usageModule)
     )) as typeof import("../core/usage.ts");
 
-    // Real accounting inputs: session entries in Pi's shape and pi-subagents'
-    // run metadata files, so the panel's usage block is exercised for real.
-    const sessionDir = process.env.PI_VERIFY_SESSION_DIR;
-    const sessionId = "sess-current";
+    // Pi history stays chartable when native cost is unavailable. Production
+    // public RPC and sessionFile ingestion are covered by usage.test.ts.
     const entries = [
       {
         type: "message",
@@ -329,18 +327,10 @@ switch (command) {
       },
       { type: "usage", kind: "cache_warm", provider: "clinepass", model: "cline-pass/deepseek-v4.1-flash", usage: { input: 0, output: 0, cacheRead: 6000, cacheWrite: 0, cost: { total: 0.0002 } } },
     ];
-    const session = collectSessionUsage(entries);
-    const dirs = sessionDir ? [`${sessionDir}/subagent-artifacts`] : [];
-    const mine = collectChildUsage(dirs, sessionId);
-    const project = collectChildUsage(dirs);
-    const usageSnapshot = {
-      sessionByModel: topEntries(session.byModel, 3),
-      sessionTotal: session.total,
-      childrenByAgent: topEntries(mine.byAgent, 3),
-      childRuns: mine.runs,
-      childTotal: mine.total,
-      projectChildRuns: project.runs,
-      projectChildTotal: project.total,
+    const observation = {
+      cost: { kind: "unknown" as const, reason: "verify fixture 未连接原生 cost" },
+      parentEntries: entries.map((entry) => ({ ...entry, timestamp: new Date().toISOString() })),
+      childEntries: [], historyIssues: ["verify fixture 未连接原生 cost"],
     };
 
     const calls: string[] = [];
@@ -362,9 +352,9 @@ switch (command) {
       // 7-day series rather than a map.
       history: {
         selectedModel: "clinepass/deepseek-v4.1-flash",
-        selected: { days: [], total: 0, peak: 0 },
+        selected: collectUsageHistory(observation, "clinepass/cline-pass/deepseek-v4.1-flash", 7),
+        costSummary: formatNativeCost(observation.cost),
       },
-      usage: usageSnapshot,
     };
     const port = {
       snapshot: () => snapshot,
@@ -470,8 +460,7 @@ switch (command) {
     const calls = rest.join(" ").split(";;").filter(Boolean);
     let index = 0;
     for (const raw of calls) {
-      // `!<shell>` runs a command between two calls, so a test can make a run
-      // appear on disk while a reservation is still held.
+      // `!<shell>` can change the temporary project settings between calls.
       if (raw.startsWith("!")) {
         execSync(raw.slice(1), { cwd: projectDir, stdio: "inherit" });
         continue;
@@ -498,7 +487,7 @@ switch (command) {
             input,
             content: [{ type: "text", text: "ok" }],
             details: {},
-            isError: false,
+            isError: true, // This harness launched nothing; an explicit failure frees the slot.
           });
         }
         continue;

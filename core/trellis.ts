@@ -493,24 +493,87 @@ export function buildRoleContext(
   return parts.join("\n\n");
 }
 
-/** The system-prompt block a dispatched child receives. */
+/** Sentinels around the region `/Coworkflow:init` writes into the project `AGENTS.md`. */
+export const MANAGED_REGION_START = "<!-- pi-Coworkflow:start -->";
+export const MANAGED_REGION_END = "<!-- pi-Coworkflow:end -->";
+/** Sentinels around the block this package appends to a child's system prompt. */
+export const CHILD_BLOCK_START = "<!-- pi-Coworkflow:subagent-context -->";
+export const CHILD_BLOCK_END = "<!-- pi-Coworkflow:subagent-context:end -->";
+
 /**
- * Strip inherited project instructions out of a child's system prompt.
+ * Remove the managed region (and its heading) from a piece of inherited text.
+ *
+ * Only the region between the sentinels goes. Everything a project wrote by
+ * itself — how to build, which files matter, its own conventions — is what a
+ * child still needs, and an earlier version of this function deleted it together
+ * with the parent-duty policy because both arrived in the same container.
+ *
+ * An older block may have been written without the end sentinel; it was always
+ * appended last, so the tail is taken as the block. That keeps a prompt that this
+ * package already extended from being extended twice.
+ */
+export function stripManagedRegion(text: string): string {
+  if (!text) return text;
+  let out = text;
+  for (;;) {
+    const start = out.indexOf(MANAGED_REGION_START);
+    if (start === -1) break;
+    const end = out.indexOf(MANAGED_REGION_END, start);
+    if (end === -1) break;
+    // The region carries its own heading between the sentinels, so cutting
+    // exactly between them leaves no orphan title behind.
+    const rest = out.slice(end + MANAGED_REGION_END.length).replace(/^\s*/, "");
+    out = `${out.slice(0, start).replace(/\s*$/, "")}\n${rest}`;
+  }
+  return out.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/**
+ * Strip this package's managed region out of inherited project instructions.
  *
  * Pi renders every discovered `AGENTS.md`/`CLAUDE.md` as
- * `<project_instructions path="…">…</project_instructions>`. pi-subagents includes
- * them for agents declaring `inheritProjectContext: true`, which the Trellis role
- * templates do, and a child must never end up with two instruction sets — its own
- * guide and the project's main-session policy. Removing the inherited block here
- * keeps that true for any agent, including ones this package does not own, and
- * touches nothing outside a project that adopted the workflow.
+ * `<project_instructions path="…">…</project_instructions>`, and pi-subagents
+ * includes them for agents declaring `inheritProjectContext: true` — which the
+ * Trellis role templates do. The child must not receive the parent's own duties
+ * (planning, dispatch, audit, merge), but it does need the rest of the file, so
+ * only the managed region is removed. A container left empty is dropped whole.
  */
-export function stripProjectInstructions(systemPrompt: string): string {
+export function stripManagedRegionFromPrompt(systemPrompt: string): string {
   if (!systemPrompt) return systemPrompt;
-  const stripped = systemPrompt
-    .replace(/<project_instructions\b[^>]*>[\s\S]*?<\/project_instructions>\s*/g, "")
-    .replace(/\n{3,}/g, "\n\n");
-  return stripped.trim();
+  const withoutContainers = systemPrompt.replace(
+    /<project_instructions\b([^>]*)>([\s\S]*?)<\/project_instructions>/g,
+    (whole: string, attrs: string, body: string) => {
+      const next = stripManagedRegion(body);
+      if (!next) return "";
+      if (next === body.trim()) return whole;
+      return `<project_instructions${attrs}>\n${next}\n</project_instructions>`;
+    },
+  );
+  // A copy outside a container (an unwrapped file, or a prompt Pi built another
+  // way) still carries the same policy, so the sentinel scan runs on the rest.
+  return stripManagedRegion(withoutContainers);
+}
+
+/**
+ * Remove a child block this package appended on an earlier run.
+ *
+ * `before_agent_start` fires for every run of a session, and a session that was
+ * injected once must not accumulate one block per run. Building the prompt
+ * idempotently means starting from the host's prompt minus our own previous
+ * block, never from the host's prompt plus whatever it already carried.
+ */
+export function stripOwnInjection(systemPrompt: string): string {
+  if (!systemPrompt) return systemPrompt;
+  let out = systemPrompt;
+  for (;;) {
+    const start = out.indexOf(CHILD_BLOCK_START);
+    if (start === -1) break;
+    const end = out.indexOf(CHILD_BLOCK_END, start);
+    const stop = end === -1 ? out.length : end + CHILD_BLOCK_END.length;
+    const rest = out.slice(stop).replace(/^\s*/, "");
+    out = `${out.slice(0, start).replace(/\s*$/, "")}\n${rest}`;
+  }
+  return out.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 /** The project's child-facing instructions, or null when it has none. */
@@ -522,28 +585,6 @@ export function readSubagentGuide(root: string): string | null {
     if (raw !== null && raw.trim()) return raw.trim();
   }
   return null;
-}
-
-export function renderInjection(
-  role: SubagentRole,
-  taskRef: string,
-  context: string,
-  guide?: string | null,
-): string {
-  return [
-    "<!-- pi-Coworkflow:subagent-context -->",
-    ...(guide ? ["## 子 agent 工作约定（本项目）", "", guide, ""] : []),
-    `## Trellis 子任务上下文（role: ${role}）`,
-    "",
-    taskRef ? `Active task: ${taskRef}` : "Active task: (none)",
-    "",
-    context,
-    "",
-    "## 边界",
-    "",
-    "- 你是被派发的子 agent：只做派单提示词里指定给你的那部分，不要自己创建 Trellis 任务、不要改任务状态、不要合并或 push。",
-    "- 任务状态、合并与清理由主会话负责；需要决策时用 `contact_supervisor` 提问，不要自行扩大范围。",
-  ].join("\n");
 }
 
 /**

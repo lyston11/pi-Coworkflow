@@ -65,18 +65,27 @@ export interface WorkflowModule {
   /**
    * Runtime layer: hooks the module registers in a Pi session, in the parent
    * session, in a dispatched child, or in both. Called once per session load,
-   * with `runtime.isChild` telling the module which side it is on.
+   * with `runtime.isChild` telling the module which side it is on, and again when
+   * a session that started with the layer off turns it on (`ensureRuntime`).
    *
    * Two gate levels, and a module states which one it uses:
    *
    *   session  hooks that act on the model's behaviour (injection, dispatch
-   *            gates, feature commands) must return early while
-   *            `runtime.enabled` is false, so `/Coworkflow:start off` really does
-   *            return the session to plain Pi.
+   *            gates, feature commands) must read `runtime.enabled` at event
+   *            time — never capture it — so `/Coworkflow:start off` really does
+   *            return the session to plain Pi, and turning it back on works
+   *            without a restart. `runtime.refresh()` re-reads the switch;
+   *            `runtime.sessionEpoch` changes when the host starts another
+   *            session, so a module with cached state resets on it.
    *   project  hooks that only *record* what happened (the lane ledger) gate on
    *            the project being adopted instead: a dispatch from a session that
    *            never loaded the layer still produced artifacts, and dropping it
    *            would make the record under-report.
+   *
+   * `activate` must be idempotent for its own registrations, because a session
+   * can turn the layer on after load. Register the cleanup it needs even while
+   * the layer is off: a hook that never fires still owns a listener, and
+   * `onSessionEnd` is the only place to release whatever `activate` acquired.
    */
   activate?(host: PiRuntimeHost, runtime: RuntimeContext): void;
   /**
@@ -88,6 +97,33 @@ export interface WorkflowModule {
    * the workflow is already on.
    */
   onSessionActivate?(host: PiRuntimeHost, runtime: RuntimeContext): void;
+  /**
+   * Re-read both live gates (`runtime.enabled` and the project's module switch)
+   * and make this module's runtime registrations match them. Idempotent.
+   *
+   * The orchestrator calls it after it updates session identity on
+   * `session_start`, when the session switch flips, and when a project module
+   * switch is written — so a module that owns session-scoped resources which the
+   * upstream package registers *per session* (a workflow resource, a required
+   * child extension) can withdraw them when the layer goes off and reinstate them
+   * when it comes back on, with no reload and no timer.
+   */
+  onRuntimeChange?(host: PiRuntimeHost, runtime: RuntimeContext): void;
+  /**
+   * Idempotent cleanup for everything `activate` acquired, called when the host
+   * ends this session: quit, `/reload`, or a session replacement (`new`,
+   * `resume`, `fork`). It must not throw, must tolerate being called twice, and
+   * must leave nothing behind that would act on the *next* session.
+   */
+  onSessionEnd?(host: PiRuntimeHost, runtime: RuntimeContext): void;
+  /**
+   * Lines describing this module's runtime state, for `/Coworkflow:status`.
+   *
+   * A passive state is stored here and read on demand: it never becomes a
+   * message of its own, because a status line that arrives as a user message
+   * starts a turn and rewrites the run it was meant to describe.
+   */
+  runtimeStatus?(host: PiRuntimeHost): string[] | null;
   /**
    * Control surfaces that stay usable while the workflow layer is off — the
    * settings panel and the workflow commands themselves.
@@ -159,9 +195,27 @@ export function fileContext(root: string): ModuleContext {
 
 /** Minimal host surface. Declared here so the package needs no Pi types. */
 export type RuntimeEventHandler = (event: any, ctx: any) => any;
+/** What `pi.on` returns: dropping one registration, which lifecycle cleanup uses. */
+export type Unsubscribe = () => void;
+
+/**
+ * Pi's shared extension event bus (`pi.events`), reduced to what is used here.
+ *
+ * It is a plain string-keyed channel with no request/response of its own, so a
+ * caller that needs a reply carries the reply channel in its own payload. That is
+ * how pi-subagents publishes its RPC surface, and talking to it means using this
+ * bus rather than reading its private files. `on` returns the unsubscribe for
+ * that single listener, which session cleanup must call.
+ */
+export interface ExtensionEvents {
+  emit(channel: string, data: unknown): void;
+  on(channel: string, handler: (data: unknown) => void): Unsubscribe;
+}
 
 export interface PiRuntimeHost {
-  on?(event: string, handler: RuntimeEventHandler): unknown;
+  on?(event: string, handler: RuntimeEventHandler): Unsubscribe | void;
+  /** Shared bus between extensions; absent when the host does not expose one. */
+  events?: ExtensionEvents;
   registerCommand?(
     name: string,
     options: {
@@ -171,9 +225,14 @@ export interface PiRuntimeHost {
   ): void;
   sendMessage?(message: { customType: string; content: string; display?: boolean }): void;
   /**
-   * Queue a user-role message, which starts a turn. Used to hand the model a
-   * follow-up instruction it must act on (e.g. re-dispatch a failed lane)
-   * without the user typing anything.
+   * Queue a user-role message, which starts a turn.
+   *
+   * Declared because a host may expose it, and this package deliberately never
+   * calls it: a status line that arrives as the user's own words reads as a
+   * prompt injection and rewrites the run it was meant to describe. Explicit
+   * command reports use `sendMessage` with `display: true`; that flag controls
+   * transcript visibility, not exclusion from model context. Passive status
+   * must stay out of messages.
    */
   sendUserMessage?(message: { content: string }): void;
   /** The session's display name; a child's is `<agent>: <task excerpt>`. */
@@ -200,6 +259,16 @@ export interface RuntimeContext {
   sessionId: string | null;
   /** Parent session id, set only in a child. */
   parentSessionId: string | null;
+  /**
+   * Incremented every time the host announces another session in this runtime
+   * (`session_start`: startup, reload, new, resume, fork).
+   *
+   * A module that caches anything session-scoped records the epoch it built at
+   * and rebuilds when the number moves. It is the only signal that arrives
+   * *before* the session-scoped hooks of the new session, which is why the
+   * orchestrator updates identity and this counter first.
+   */
+  sessionEpoch: number;
   /**
    * Why this session is (not) running the layer, in the user's words.
    *
@@ -251,6 +320,16 @@ export interface WorkflowControl {
   setSubagentConcurrency(value: number | null): string;
   /** Why this session is (not) loaded: `off`, `auto`, `started`, or `child`. */
   loadState(): RuntimeContext["loadState"];
+  /**
+   * Whether the project still has this module switched on, read from
+   * `.pi/Coworkflow.json` right now.
+   *
+   * A hook registered while a module was on cannot be unregistered by switching
+   * it off, so a module asks this at event time instead of trusting the fact that
+   * it was activated. Both gates are then live: the project switch says whether
+   * the layer exists here, `runtime.enabled` says whether this session runs it.
+   */
+  moduleEnabled(id: string): boolean;
   /** Run the full init/refresh pass, as `/Coworkflow:init` does. */
   init(args: string): string;
 }

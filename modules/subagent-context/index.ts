@@ -20,27 +20,50 @@
  *           Trellis's own dispatch protocol already requires. pi-subagents wraps
  *           the prompt, so the line arrives as `Task: Active task: <path>`;
  *           then the task path appearing in the session name; then the parent
- *           session's Trellis pointer, resolved in the main checkout.
+ *           session's Trellis pointer, resolved in the main checkout — but only
+ *           when the child named no task at all. A task reference that *is*
+ *           present and does not resolve is reported as invalid instead of being
+ *           replaced by the parent's task, which is how a generic child used to
+ *           end up implementing whatever the parent had open.
  *
  * Everything is read from the main checkout, not the child's cwd: a lane
  * worktree only carries whatever was committed, while the task artifacts the
  * parent is still editing live in the main checkout.
  *
- * Injection happens once per (role, task) pair and only in a child session.
- * The main session is left untouched — its own Trellis extension already owns
- * that, and this module must not double up on it.
+ * ## How the prompt is built
+ *
+ * `before_agent_start` fires for every run of the session, and Pi re-renders the
+ * system prompt from `event.systemPromptOptions` after each handler. So this
+ * module edits the *structured* options and lets Pi render and diff them:
+ *
+ *   - the managed parent-duty region is stripped out of every inherited context
+ *     file, leaving the rest of what the project wrote intact (a child still
+ *     needs the build commands and the code conventions; it does not need the
+ *     parent's planning and merge duties);
+ *   - the child block lives in one named section, so a second run replaces it
+ *     instead of appending a second copy.
+ *
+ * Both steps are pure functions of the host's current state, which is what makes
+ * repeated runs — and agents this package does not own — idempotent. A host that
+ * does not expose `systemPromptOptions` gets the same treatment applied to the
+ * rendered prompt string and returned as `systemPrompt`.
+ *
+ * The guide is appended for **every** child, role or not: an unknown role means
+ * "generic child", never "no instructions".
  */
 
 import type { PiRuntimeHost, RuntimeContext, WorkflowModule } from "../../core/module.ts";
+import { statSync } from "node:fs";
 import {
   activeTaskDir,
   buildRoleContext,
   mainCheckout,
   readSubagentGuide,
-  renderInjection,
-  stripProjectInstructions,
   repoRoot,
   resolveTaskDir,
+  stripManagedRegion,
+  stripManagedRegionFromPrompt,
+  stripOwnInjection,
   taskRefForDisplay,
   type SubagentRole,
 } from "../../core/trellis.ts";
@@ -59,6 +82,24 @@ const MARKER_RE = /<!--\s*trellis-agent:\s*(implement|check|research)\s*-->/;
  */
 const ACTIVE_TASK_RE = /Active task:\s*([^\s`'"\n]+)/;
 const TASK_PATH_RE = /\.trellis\/tasks\/[A-Za-z0-9._-]+/;
+
+/** The section name Pi renders (and diffs) for this module's contribution. */
+export const SECTION = "pi_coworkflow_child";
+
+/**
+ * Guidance a child gets even when the project never wrote its own.
+ *
+ * The project guide is the richer text; this is the floor, so an unknown agent in
+ * an adopted project is never left without the boundary that says it does one
+ * delegated piece of work and reports it.
+ */
+const GENERIC_GUIDE = [
+  "你是被主会话派来执行一件已定义工作的子 agent，不是主会话。",
+  "",
+  "- 任务是派单提示词里那一段：交付它要求的产物，然后报告事实（改了哪些文件、跑了哪些命令、结果如何、还有什么不确定）。",
+  "- 不要扩大范围、不要顺手重构、不要改别的 bug；发现需要产品/架构判断时用 `contact_supervisor` 问主会话。",
+  "- 不能创建或推进 Trellis 任务、不能改任务状态、不能合并、不能 push。",
+].join("\n");
 
 function asRole(value: string | undefined): SubagentRole | null {
   if (!value) return null;
@@ -82,25 +123,238 @@ export function detectRole(
   return null;
 }
 
-/** The task directory this child should work on, resolved against `root`. */
-export function detectTaskDir(
-  root: string,
+/** A task reference exactly as the child named it, or null when it named none. */
+export function taskReference(
   sessionName: string | undefined,
   ...texts: (string | undefined)[]
 ): string | null {
   for (const text of texts) {
     const ref = text ? ACTIVE_TASK_RE.exec(text)?.[1] : undefined;
-    if (!ref) continue;
-    const resolved = resolveTaskDir(root, ref.replace(/[`'"]/g, ""));
-    if (resolved) return resolved;
+    if (ref) return ref.replace(/[`'"]/g, "").trim() || null;
   }
   const fromName = TASK_PATH_RE.exec(sessionName ?? "")?.[0];
-  if (fromName) {
-    const resolved = resolveTaskDir(root, fromName);
-    if (resolved) return resolved;
-  }
-  return null;
+  return fromName ?? null;
 }
+
+/**
+ * The task directory this child should work on, resolved against `root`.
+ *
+ * `invalid` is a different answer from "no task": a child that was told
+ * `Active task: .trellis/tasks/typo` must not be handed the parent's task
+ * instead, because then it writes to a task nobody dispatched it for.
+ */
+export type TaskResolution =
+  | { kind: "task"; dir: string; ref: string }
+  | { kind: "invalid"; ref: string }
+  | { kind: "none" };
+
+export function resolveChildTask(
+  root: string,
+  sessionName: string | undefined,
+  ...texts: (string | undefined)[]
+): TaskResolution {
+  const ref = taskReference(sessionName, ...texts);
+  if (!ref) return { kind: "none" };
+  const dir = resolveTaskDir(root, ref);
+  // `resolveTaskDir` resolves lexically so a caller may create a task; a child
+  // only ever reads one, so here a reference to a directory that does not exist
+  // is a bad reference (usually a typo in the dispatch prompt).
+  if (!dir) return { kind: "invalid", ref };
+  try {
+    return statSync(dir).isDirectory() ? { kind: "task", dir, ref } : { kind: "invalid", ref };
+  } catch {
+    return { kind: "invalid", ref };
+  }
+}
+
+/** The block this module contributes, for one run of one child. */
+interface ChildPrompt {
+  /** Project guide or the built-in floor. */
+  guide: string;
+  role: SubagentRole | null;
+  task: TaskResolution;
+  /** The task as the child should see it, for the prompt. */
+  displayRef: string;
+  context: string;
+}
+
+function blockFor(prompt: ChildPrompt): string {
+  const { role, task, displayRef } = prompt;
+  const lines = [`<!-- pi-Coworkflow:subagent-context -->`];
+
+  if (task.kind === "invalid") {
+    // Said plainly, and the model is told not to guess: an unresolved reference
+    // is the parent's mistake to fix, not an invitation to pick a task.
+    lines.push(
+      `> 派单提示词里的任务引用 \`${task.ref}\` 在本项目的 .trellis/tasks 下不存在。`,
+      "> 不要猜测或改用其它任务；先按派单提示词本身工作，并在报告里指出这个无效引用。",
+      "",
+    );
+  }
+
+  if (role) {
+    lines.push(
+      `## Trellis 子任务上下文（role: ${role}）`,
+      "",
+      task.kind === "task" ? `Active task: ${displayRef}` : "Active task: (none)",
+      "",
+      prompt.context,
+      "",
+    );
+  } else if (task.kind === "task") {
+    // No role marker, but the parent named a task: tell the child, without
+    // pretending it has an implement/check context it never asked for.
+    lines.push(`## Trellis 任务`, "", `Active task: ${displayRef}`, "");
+  }
+
+  // The guide goes in for every child — a generic agent included — and after the
+  // role context so the task-specific material comes first.
+  lines.push("## 子 agent 工作约定（本项目）", "", prompt.guide, "");
+
+  lines.push(
+    "## 边界",
+    "",
+    "- 你是被派发的子 agent：只做派单提示词里指定给你的那部分，不要自己创建 Trellis 任务、不要改任务状态、不要合并或 push。",
+    "- 任务状态、合并与清理由主会话负责；需要决策时用 `contact_supervisor` 提问，不要自行扩大范围。",
+    "",
+    "<!-- pi-Coworkflow:subagent-context:end -->",
+  );
+  return lines.join("\n");
+}
+
+/**
+ * The host's prompt with this package's own contributions removed.
+ *
+ * Detection runs on this, not on the raw prompt. Our block names the roles
+ * (`trellis-implement`, `trellis-check`, …) and the region spells the dispatch
+ * line (`Active task: <任务目录>`), so a second run reading its own output would
+ * find a role and a task that the parent never wrote — a generic child would turn
+ * into an implement child on its second turn.
+ */
+function inheritedPrompt(event: any): string {
+  const raw = typeof event?.systemPrompt === "string" ? event.systemPrompt : "";
+  return stripOwnInjection(stripManagedRegionFromPrompt(raw));
+}
+
+/** Everything this module needs to know about one run, read fresh each time. */
+function readChildPrompt(
+  root: string,
+  sessionName: string | undefined,
+  event: any,
+  runtime: RuntimeContext,
+): ChildPrompt {
+  const inherited = inheritedPrompt(event);
+  const role = detectRole(sessionName, event?.prompt, inherited);
+  let task = resolveChildTask(root, sessionName, event?.prompt, inherited);
+
+  if (task.kind === "none" && role && role !== "research") {
+    // The child named no task: the parent's pointer is the only remaining
+    // evidence, and a Trellis role without one has nothing to work from.
+    const parentTask = activeTaskDir(root, runtime.parentSessionId);
+    if (parentTask) {
+      task = { kind: "task", dir: parentTask, ref: taskRefForDisplay(root, parentTask) };
+    }
+  }
+
+  const displayRef =
+    task.kind === "task"
+      ? taskRefForDisplay(root, task.dir)
+      : task.kind === "invalid"
+        ? task.ref
+        : "";
+  const context =
+    role === null ? "" : buildRoleContext(root, task.kind === "task" ? task.dir : null, role);
+
+  return {
+    guide: readSubagentGuide(root) ?? GENERIC_GUIDE,
+    role,
+    task,
+    displayRef,
+    context,
+  };
+}
+
+/**
+ * Strip this package's parent-duty region out of the host's context files.
+ *
+ * `contextFiles` is the structured form of what Pi renders as
+ * `<project_instructions>`; editing it here keeps Pi's own rendering and diffing
+ * in charge, and limits the change to the region this package wrote.
+ */
+function stripInherited(options: any): void {
+  const files = options?.contextFiles;
+  if (!Array.isArray(files) || files.length === 0) return;
+  const kept: unknown[] = [];
+  for (const file of files) {
+    if (file === null || typeof file !== "object") {
+      kept.push(file);
+      continue;
+    }
+    const record = file as { path?: unknown; content?: unknown };
+    if (typeof record.content !== "string") {
+      kept.push(file);
+      continue;
+    }
+    const next = stripManagedRegion(record.content);
+    // A file that held nothing but the region carries no instruction any more.
+    if (!next) continue;
+    kept.push(next === record.content ? file : { ...record, content: next });
+  }
+  options.contextFiles = kept;
+}
+
+function buildPrompt(
+  runtime: RuntimeContext,
+  host: PiRuntimeHost,
+  event: any,
+  ctx: any,
+): { systemPrompt?: string } | undefined {
+  const cwd = typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : runtime.cwd;
+  // Read from the main checkout: a lane worktree only holds committed state.
+  const root = mainCheckout(repoRoot(cwd));
+  // Read at call time: a child is renamed after dispatch, so a name captured at
+  // load would be stale by the first run.
+  const sessionName = host.getSessionName?.();
+  const prompt = readChildPrompt(root, sessionName, event, runtime);
+  const block = blockFor(prompt);
+
+  const options = event?.systemPromptOptions;
+  if (options !== null && typeof options === "object") {
+    // Structured path: Pi re-renders from these options after every handler, and
+    // the section is replaced, so a repeat run cannot accumulate copies.
+    stripInherited(options);
+    const sections = options.sections;
+    if (sections !== null && typeof sections === "object") {
+      sections[SECTION] = block;
+    } else {
+      options.sections = { [SECTION]: block };
+    }
+    // Guard against a host that ignores custom sections but still honours a
+    // forced prompt: options and the returned prompt must not disagree.
+    return undefined;
+  }
+
+  const current = inheritedPrompt(event);
+  return { systemPrompt: [current, block].filter(Boolean).join("\n\n") };
+}
+
+/**
+ * One subscription per host, reused across the sessions that host serves.
+ *
+ * Keyed by host rather than kept in a single variable: a host that is still alive
+ * keeps its own registration, and cleanup can only ever drop the one that belongs
+ * to the session ending. The record carries the runtime the handler reads, so a
+ * handler that cannot be unsubscribed still answers for the *current* session
+ * instead of the one it was attached in.
+ */
+interface HostInjection {
+  /** Refreshed by `activate` on every session: the handler reads it per run. */
+  runtime: RuntimeContext;
+  /** The host's own unsubscribe, when it returned one. */
+  off: (() => void) | null;
+}
+
+const REGISTRATIONS = new WeakMap<PiRuntimeHost, HostInjection>();
 
 export const subagentContextModule: WorkflowModule = {
   id: "subagent-context",
@@ -108,56 +362,60 @@ export const subagentContextModule: WorkflowModule = {
 
   activate(host: PiRuntimeHost, runtime: RuntimeContext): void {
     if (!runtime.isChild || !host.on) return;
-
-    const injected = new Set<string>();
-
-    host.on("before_agent_start", (event: any, ctx: any) => {
-      if (!runtime.enabled) return undefined;
-
-      const cwd = typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : runtime.cwd;
-      // Read from the main checkout: a lane worktree only holds committed state.
-      const root = mainCheckout(repoRoot(cwd));
-      const sessionName = host.getSessionName?.();
-      const role = detectRole(sessionName, event?.prompt, event?.systemPrompt);
-      const guide = readSubagentGuide(root);
-
-      // Separation is enforced for *every* child of an adopted project, not only
-      // for the three Trellis roles: a custom agent that inherits the project
-      // AGENTS.md would otherwise plan and audit duties it does not have. The
-      // rule lives here rather than in agent frontmatter so it keeps holding for
-      // agents this package does not own, and applies to nothing outside a
-      // project that ran `/Coworkflow:init`.
-      const current = stripProjectInstructions(
-        typeof event?.systemPrompt === "string" ? event.systemPrompt : "",
-      );
-
-      if (!role) {
-        // Not a Trellis role: only the separation rule applies. Replacing the
-        // prompt is required because a hook cannot mutate it in place.
-        return current === (event?.systemPrompt ?? "") ? undefined : { systemPrompt: current };
+    const existing = REGISTRATIONS.get(host);
+    if (existing !== undefined) {
+      // The listener is already attached — either it could not be removed, or the
+      // orchestrator re-activated the module in the same session. Point it at the
+      // runtime that is live now and add nothing, so a repeated start cannot
+      // inject the same block twice.
+      existing.runtime = runtime;
+      return;
+    }
+    const entry: HostInjection = { runtime, off: null };
+    REGISTRATIONS.set(host, entry);
+    const unsubscribe = host.on("before_agent_start", (event: any, ctx: any) => {
+      // Both gates are read at event time, not captured: a session that runs
+      // `/Coworkflow:start off` stops injecting, a project that switches the
+      // module off stops injecting, and turning either back on needs no reload.
+      const live = entry.runtime;
+      if (!live.enabled) return undefined;
+      if (!live.control.moduleEnabled("subagent-context")) return undefined;
+      try {
+        return buildPrompt(live, host, event, ctx);
+      } catch {
+        // An injector failure must not break the run it was decorating.
+        return undefined;
       }
-
-      const taskDir =
-        detectTaskDir(root, sessionName, event?.prompt, event?.systemPrompt) ??
-        activeTaskDir(root, runtime.parentSessionId);
-      if (role !== "research" && !taskDir) {
-        return current === (event?.systemPrompt ?? "") ? undefined : { systemPrompt: current };
-      }
-
-      const taskRef = taskDir ? taskRefForDisplay(root, taskDir) : "";
-      const key = `${role}::${taskRef}`;
-      if (injected.has(key)) {
-        return current === (event?.systemPrompt ?? "") ? undefined : { systemPrompt: current };
-      }
-
-      const context = buildRoleContext(root, taskDir, role);
-      if (!context && !guide) {
-        return current === (event?.systemPrompt ?? "") ? undefined : { systemPrompt: current };
-      }
-      injected.add(key);
-
-      const block = renderInjection(role, taskRef, context, guide);
-      return { systemPrompt: [current, block].filter(Boolean).join("\n\n") };
     });
+    // `pi.on` documents an unsubscribe, and the host in front of us may still
+    // return nothing. When it does, the subscription is permanent by necessity:
+    // the record stays and the handler above stays inert while the gates are off.
+    entry.off = typeof unsubscribe === "function" ? unsubscribe : null;
+  },
+
+  /**
+   * Drop the subscription at the end of the session that owns it.
+   *
+   * A listener left behind would keep injecting one child's Trellis context into
+   * whatever runs in this runtime next — the case is a `/reload` or a session
+   * replacement, both of which fire `session_shutdown`.
+   *
+   * A host that gave no unsubscribe keeps its entry on purpose: deleting it would
+   * make the next session attach a second permanent handler, and every run would
+   * then be built twice. The handler reads the gates of the runtime `activate`
+   * last handed it, so an unremovable subscription is inert, not stale.
+   */
+  onSessionEnd(host: PiRuntimeHost): void {
+    const entry = REGISTRATIONS.get(host);
+    if (entry === undefined) return;
+    if (entry.off === null) return;
+    REGISTRATIONS.delete(host);
+    const off = entry.off;
+    entry.off = null;
+    try {
+      off();
+    } catch {
+      // A listener the host already dropped is not a failure to report.
+    }
   },
 };

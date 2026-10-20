@@ -44,13 +44,15 @@
 
 主会话自己动手的唯一场合：**需要全局判断、或改动小到不值得派单**（一行修复、改个配置、回答一个问题）。除此之外，"我来写"不是理由——派出去、审回来。
 
-"小到不值得派单"有个可数的界线：本会话自行执行 **≥12 次工具调用、直接改动 ≥4 个文件**时，这已经是实现在而不是收尾，必须派单。`agents` 模块会数这个，越过阈值且一次没派单就在会话里出一条 `pi-Coworkflow` 记录（只显示、不进对话）——被点名说明确实越界了，不要再解释成"这次特殊"。
+这条界线靠判断，不靠计数：本包不再统计本会话的工具调用次数，也不会因为"改动不少"就插入提醒。反过来，分不清该不该派时按工作量估：能独立验证、输入产物验收方式都说得清的执行工作就该派出去；需要全局判断、跨模块协调、或只有一两处改动的，留在这里自己做完更快。
 
 - 授权：主会话可以主动派发子 agent，不必逐次询问。
-- 必须后台（`async: true`）。前台子会话是主进程内的一个会话、会占住主会话；后台派单后主会话继续做自己的事，用完成通知和 `subagent({ action: "status" })` 监控，子 agent 的提问走 `contact_supervisor` 转达。实测：后台子会话由 harness 加载项目 `AGENTS.md` 与 Magic Context（ambient 扩展），但本包的 `subagent-context` 会在注入子 agent 约定之前把继承来的 `<project_instructions>` 剥掉——子 agent 只读 `.pi/Coworkflow/subagent-AGENTS.md`，不读本文件。所以派单提示词只需给任务，不要把项目约定重抄一遍。
+- 必须后台（`async: true`）。前台子会话是主进程内的一个会话、会占住主会话；后台派单后主会话继续做自己的事，用完成通知和 `subagent({ action: "status" })` 监控，子 agent 的提问走 `contact_supervisor` 转达。实测：后台子会话由 harness 加载项目 `AGENTS.md` 与 Magic Context（ambient 扩展），但本包的 `subagent-context` 会在注入子 agent 约定之前把**本受管区**（`<!-- pi-Coworkflow:start/end -->` 之间，含上面的核心分工）从继承来的 `<project_instructions>` 里剥掉，项目自己写在区外的内容照旧保留。所以派单提示词只需给任务，不要把本文件受管区的约定重抄一遍。
+- 多阶段工作用命名的 workflow 表达（例如本包注册的 implement → review），而不是在本会话里把几个阶段串起来自己做：workflow 的子步骤在原生侧执行、有稳定的 child key 与验收结论，主会话只接收产物与结论。
+- 单步工作可以直接派一个有边界的子 agent（`context: "fresh"`），不必套 workflow；子 agent 的数量与并行度按上游容量与项目并发上限来，不要用不限量的并行去换速度。
 - **派单边界**：能独立验证的边界工作才派（有明确的输入、产物、验收方式）；探索性、需要全局判断、或跨多个模块协调的工作留在主会话。子 agent 不负责决定"做什么"，只负责"把它做好并报告"。
 - **审计边界**：子 agent 回结果不等于结果可用。主会话要对照 prd 的验收条件检查产物、核对它引用的文件与结论、跑该模块的测试；发现偏差就重派或自己修，不能直接把子 agent 的结论当成事实汇报给用户。
-- 子会话**不继承**主会话上下文：派单时显式写 `context: "fresh"`（三个 Trellis 角色 agent 也已声明 `defaultContext: fresh`；若你全局配了 `defaultSubagentContext: "fork"`，它会被覆盖，必须显式 `fresh`）。它拿到的 Trellis 上下文由 `pi-Coworkflow` 的 `subagent-context` 模块按角色注入：`trellis-implement` / `trellis-check` / `trellis-research` 分别得到 `implement.jsonl` / `check.jsonl` / spec 目录树，加上 prd.md、design.md、implement.md；字节预算沿用 `.trellis/config.yaml` 的 `context_injection`。 **注入按角色，不按 agent 名**：任何 agent 只要标记成这三个角色之一，就拿到对应那一份；`worker` / `researcher` / `reviewer` 等其它 agent 默认不注入。
+- 子会话**不继承**主会话上下文：派单时显式写 `context: "fresh"`（三个 Trellis 角色 agent 也已声明 `defaultContext: fresh`；若你全局配了 `defaultSubagentContext: "fork"`，它会被覆盖，必须显式 `fresh`）。它拿到的 Trellis 上下文由 `pi-Coworkflow` 的 `subagent-context` 模块按角色注入：`trellis-implement` / `trellis-check` / `trellis-research` 分别得到 `implement.jsonl` / `check.jsonl` / spec 目录树，加上 prd.md、design.md、implement.md；字节预算沿用 `.trellis/config.yaml` 的 `context_injection`。 **注入按角色，不按 agent 名**：任何 agent 只要标记成这三个角色之一，就拿到对应那一份；`worker` / `researcher` / `reviewer` 等其它 agent 拿到的是子 agent 约定（不含角色上下文），不是什么都不给。
 - 因此派单提示词**首行必须是 `Active task: <任务目录>`**（Trellis 既有的派单协议）——注入靠它定位任务。角色按两级识别：① **会话名**里的 `trellis-<role>`（`subagent-<agent>-<runId>-<i>` 或 `<agent>: <task>` 都含 agent 名）；② agent 定义或派单提示词里的 `<!-- trellis-agent: <role> -->` 标记。所以想让任意 agent（例如 `worker`）拿到 implement 那份上下文，就在它的定义里加一行 `<!-- trellis-agent: implement -->`，不必把它改名成 `trellis-implement`。
 - 并行派单不要猜 API：`subagent({ workflow: "parallel", args: { tasks: [...] } })` 的每个 task **只接受 `agent` 和 `task`**（带 `output` 会被拒）；多步/带产出的 workflow 必须把 JS 脚本写成文件再用 `workflow: "<路径>"`，`workflow: true` 只在同一回复里写了 ```js 代码块时有效。先 `subagent({ action: "validate", workflow: "<路径>" })` 再 `async: true` 派发。
 - 只派可独立验证的边界工作，且文件/模块不相交才并行（同上一节）。共享文件、migration 序号、数据库或端口的任务一律串行。

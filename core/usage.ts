@@ -1,27 +1,11 @@
-/**
- * Token and cost accounting for the panel.
- *
- * Two sources, both already on disk because Pi and pi-subagents wrote them:
- *
- *   主会话  Pi's own session entries. Every assistant message carries
- *           `{provider, model, usage}`, and `usage` entries (cache warming) plus
- *           compaction/branch summaries carry usage too, so grouping the current
- *           session's entries by model gives exactly what each main-session model
- *           consumed. This is the same data Pi's footer totals.
- *   子 agent pi-subagents' run artifacts: `<sessionDir>/subagent-artifacts/
- *           <runId>_<agent>_meta.json` holds `{runId, parentSessionId, agent,
- *           model, usage}`, and project-mode artifacts hold the same under
- *           `<cwd>/.pi/subagents/artifacts/`. Summing them per agent is the
- *           child half of the same accounting pi-subagents' `/subagent-cost`
- *           renders (it reports `parent` + `children` + `childTotal`), read from
- *           the documented artifact rather than from its internals.
- *
- * Nothing is cached or persisted: the panel reads the files each time it opens,
- * so the numbers always match what Pi and pi-subagents just wrote.
- */
-
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+/** Usage totals come from public native cost; daily history keeps Pi's model/timestamp records. */
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
+import { isAbsolute } from "node:path";
+import type { PiRuntimeHost, RuntimeContext } from "./module.ts";
+import { attachSubagents, type NativeCost } from "./subagents-client.ts";
+import { sessionEnabledSince } from "./trellis.ts";
+import { configRoot } from "./config.ts";
 
 export interface UsageTotals {
   input: number;
@@ -63,8 +47,8 @@ function num(value: unknown): number {
 /**
  * Normalize a usage record.
  *
- * Pi writes `cost` as an object (`{input, output, cacheRead, cacheWrite, total}`);
- * pi-subagents' run metadata writes it as a plain number. Both are accepted.
+ * Pi session entries write cost as an object; numeric costs are accepted too.
+ * Native RPC data is decoded strictly by subagents-client, never by this helper.
  */
 export function normalizeUsage(raw: unknown, fallbackTurns = 1): UsageTotals | null {
   if (raw === null || typeof raw !== "object") return null;
@@ -134,70 +118,6 @@ export function collectSessionUsage(entries: unknown[]): {
   return { byModel, total };
 }
 
-export interface ChildUsage {
-  runs: number;
-  byAgent: Map<string, UsageTotals>;
-  total: UsageTotals;
-}
-
-/** Sum pi-subagents' per-run metadata files, optionally only one parent session. */
-export function collectChildUsage(
-  artifactDirs: string[],
-  parentSessionId?: string | null,
-): ChildUsage {
-  const byAgent = new Map<string, UsageTotals>();
-  const total = emptyUsage();
-  let runs = 0;
-
-  for (const dir of artifactDirs) {
-    for (const file of listMetaFiles(dir)) {
-      const meta = readJson(join(dir, file));
-      if (meta === null) continue;
-      if (
-        parentSessionId &&
-        typeof meta.parentSessionId === "string" &&
-        meta.parentSessionId !== parentSessionId
-      ) {
-        continue;
-      }
-      const usage = normalizeUsage(meta.usage, 0);
-      if (usage === null) continue;
-      runs += 1;
-      const agent = typeof meta.agent === "string" && meta.agent ? meta.agent : "(未知 agent)";
-      const model = typeof meta.model === "string" ? ` · ${meta.model}` : "";
-      const key = `${agent}${model}`;
-      const bucket = byAgent.get(key) ?? emptyUsage();
-      addUsage(bucket, usage);
-      byAgent.set(key, bucket);
-      addUsage(total, usage);
-    }
-  }
-  return { runs, byAgent, total };
-}
-
-/** pi-subagents names its per-run metadata `<runId>_<agent>_meta.json`. */
-function listMetaFiles(dir: string): string[] {
-  try {
-    return readdirSync(dir)
-      .filter((name) => name.endsWith("_meta.json"))
-      .sort();
-  } catch {
-    return [];
-  }
-}
-
-function readJson(path: string): Record<string, unknown> | null {
-  try {
-    if (statSync(path).size > 512 * 1024) return null;
-    const parsed: unknown = JSON.parse(readFileSync(path, "utf-8"));
-    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
 /** `12.3k` / `1.2M` / `512`, so a row stays one line wide. */
 export function formatTokens(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
@@ -244,6 +164,10 @@ export interface DailySeries {
   total: number;
   /** Largest single day, for scaling bars. */
   peak: number;
+  /** Missing native cost/history makes this a lower bound, never a complete zero. */
+  incomplete?: boolean;
+  unavailable?: boolean;
+  reason?: string;
 }
 
 /** Local `YYYY-MM-DD` for a timestamp, so "today" matches the user's clock. */
@@ -344,61 +268,214 @@ export function collectModelDailyUsage(
   return seriesFrom(byDay, days, now);
 }
 
-/**
- * Child usage per local day for one model, over a sliding window.
- *
- * Run metadata carries no per-run timestamp in every version, so the artifact
- * file's mtime is used as the best available evidence of when the run finished.
- */
-export function collectChildModelDailyUsage(
-  artifactDirs: string[],
-  model: string,
-  days: number,
-  parentSessionId?: string | null,
-  now = new Date(),
-  /** Only count runs at or after this instant (ms). */
-  since?: number,
-): DailySeries {
-  const byDay = new Map<string, DailyTokens>();
-  for (const dir of artifactDirs) {
-    for (const file of listMetaFiles(dir)) {
-      const path = join(dir, file);
-      const meta = readJson(path);
-      if (meta === null) continue;
-      if (
-        parentSessionId &&
-        typeof meta.parentSessionId === "string" &&
-        meta.parentSessionId !== parentSessionId
-      ) {
-        continue;
-      }
-      const recorded = typeof meta.model === "string" ? meta.model : "";
-      // Metadata stores `provider/id` sometimes with a `:thinking` suffix.
-      const normalised = recorded.replace(/:\w+$/, "");
-      if (normalised !== model) continue;
-      const usage = normalizeUsage(meta.usage, 0);
-      if (usage === null) continue;
-
-      let at: Date | null = null;
-      if (typeof meta.timestamp === "number" || typeof meta.timestamp === "string") {
-        const parsed = new Date(meta.timestamp);
-        if (!Number.isNaN(parsed.getTime())) at = parsed;
-      }
-      if (at === null) {
-        try {
-          at = statSync(path).mtime;
-        } catch {
-          at = null;
-        }
-      }
-      if (at === null) continue;
-      if (since !== undefined && at.getTime() < since) continue;
-
-      const key = localDay(at);
-      const bucket = byDay.get(key) ?? emptyDay(key);
-      accumulateDay(bucket, usage);
-      byDay.set(key, bucket);
+function validateParentHistory(entries: unknown[] | null): string[] {
+  if (entries === null) return ["主会话历史不可用"];
+  const issues: string[] = [];
+  for (const value of entries) {
+    if (value === null || typeof value !== "object") continue;
+    const row = value as Record<string, unknown>;
+    const message = row.type === "message" && row.message !== null && typeof row.message === "object"
+      ? row.message as Record<string, unknown> : null;
+    const usageBearing = message?.role === "assistant" || ["usage", "compaction", "branch_summary"].includes(String(row.type));
+    if (!usageBearing) continue;
+    const usage = message ? message.usage : row.usage;
+    if (usage === null || typeof usage !== "object" || Array.isArray(usage) ||
+      ["input", "output", "cacheRead", "cacheWrite"].some((key) =>
+        typeof (usage as Record<string, unknown>)[key] !== "number" ||
+        !Number.isFinite((usage as Record<string, number>)[key]) || (usage as Record<string, number>)[key]! < 0)) {
+      issues.push("主会话记录用量不完整");
+      continue;
+    }
+    const provider = message ? message.provider : row.provider;
+    const model = message ? message.model : row.model;
+    const stamp = row.timestamp ?? message?.timestamp;
+    if (typeof provider !== "string" || !provider || typeof model !== "string" || !model ||
+      (typeof stamp !== "string" && typeof stamp !== "number") || Number.isNaN(new Date(stamp).getTime())) {
+      issues.push("主会话记录缺少模型或时间，未猜测归属");
     }
   }
-  return seriesFrom(byDay, days, now);
+  return [...new Set(issues)];
+}
+
+/** No artifacts are discovered here: only exact sessionFile pointers from native cost. */
+export interface UsageSnapshot {
+  cost: NativeCost;
+  parentEntries: unknown[] | null;
+  childEntries: unknown[];
+  historyIssues: string[];
+  since?: number;
+}
+
+const unavailable = (reason: string): UsageSnapshot => ({
+  cost: { kind: "unknown", reason }, parentEntries: null, childEntries: [], historyIssues: [reason],
+});
+interface UsageState {
+  runtime: RuntimeContext;
+  epoch: number;
+  sessionId: string | null;
+  snapshot: UsageSnapshot;
+  pending?: Promise<void>;
+  revision: number;
+}
+const observations = new WeakMap<object, UsageState>();
+
+/** Read-only rendering access; no RPC, configuration reads or filesystem scans. */
+export function usageSnapshot(host: object, runtime: RuntimeContext): UsageSnapshot {
+  const state = observations.get(host);
+  return runtime.enabled && state?.runtime === runtime && state.epoch === runtime.sessionEpoch &&
+    state.sessionId === runtime.sessionId ? state.snapshot : unavailable("尚未读取本会话用量");
+}
+
+export function disposeUsage(host: object): void {
+  observations.delete(host);
+}
+
+interface UsageContext {
+  sessionManager?: { getSessionId?: () => string | undefined; getEntries?: () => unknown[] };
+}
+
+/** Session/open/settled/completion boundary only; concurrent refreshes share work, latest context wins. */
+export async function refreshUsage(host: PiRuntimeHost, runtime: RuntimeContext, ctx: UsageContext = {}): Promise<void> {
+  if (runtime.isChild || !runtime.enabled || !runtime.control.moduleEnabled("panel")) {
+    disposeUsage(host);
+    return;
+  }
+  const contextId = ctx.sessionManager?.getSessionId?.();
+  if (contextId && contextId !== runtime.sessionId) return;
+  let state = observations.get(host);
+  if (!state || state.runtime !== runtime || state.epoch !== runtime.sessionEpoch || state.sessionId !== runtime.sessionId) {
+    state = { runtime, epoch: runtime.sessionEpoch, sessionId: runtime.sessionId,
+      snapshot: unavailable("正在读取公开用量"), revision: 0 };
+    observations.set(host, state);
+  }
+  const current = state;
+  const entries = ctx.sessionManager?.getEntries?.();
+  current.snapshot = { ...current.snapshot, parentEntries: Array.isArray(entries) ? [...entries] : null,
+    historyIssues: validateParentHistory(Array.isArray(entries) ? entries : null),
+    since: sessionEnabledSince(configRoot(runtime.cwd), runtime.sessionId) };
+  current.revision += 1;
+  if (current.pending) return current.pending;
+  const valid = (): boolean => observations.get(host) === current && current.epoch === runtime.sessionEpoch &&
+    current.sessionId === runtime.sessionId && runtime.enabled;
+  const bridge = attachSubagents(host, { epoch: runtime.sessionEpoch, events: host.events });
+  current.pending = (async () => {
+    // One extra boundary arriving during I/O must not get a pre-completion cost snapshot.
+    // This drains explicit requests only; it never schedules a poll or timer.
+    let revision: number;
+    do {
+      revision = current.revision;
+      const cost = await bridge.client.cost();
+      if (!valid()) return;
+      const history = await readChildHistory(cost);
+      if (!valid()) return;
+      current.snapshot = { ...current.snapshot, cost,
+        childEntries: history.childEntries,
+        historyIssues: [...validateParentHistory(current.snapshot.parentEntries), ...history.historyIssues] };
+    } while (revision !== current.revision && valid());
+  })().finally(() => { current.pending = undefined; });
+  return current.pending;
+}
+
+const MAX_HISTORY_FILES = 128;
+const MAX_HISTORY_BYTES = 32 * 1024 * 1024;
+const MAX_FILE_BYTES = 8 * 1024 * 1024;
+
+async function readChildHistory(cost: NativeCost): Promise<Pick<UsageSnapshot, "childEntries" | "historyIssues">> {
+  const childEntries: unknown[] = [];
+  const historyIssues: string[] = [];
+  if (cost.kind === "unknown") return { childEntries, historyIssues: [cost.reason] };
+  if (cost.incomplete) historyIssues.push(`${cost.unresolvedAsyncChildren} 个子任务用量未解析`);
+  const seen = new Set<string>();
+  let bytesLeft = MAX_HISTORY_BYTES;
+  for (const child of cost.children) {
+    const path = child.sessionFile;
+    if (!path || !isAbsolute(path)) {
+      historyIssues.push("子任务缺少可用的原生 sessionFile");
+      continue;
+    }
+    if (seen.has(path)) continue;
+    if (seen.size >= MAX_HISTORY_FILES || bytesLeft <= 0) {
+      historyIssues.push("子会话历史超过读取预算");
+      break;
+    }
+    seen.add(path);
+    try {
+      // Explicit bounded reads prevent a growing log from bypassing the stat limit.
+      const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
+      let body: string;
+      try {
+        const stat = await file.stat();
+        if (!stat.isFile()) { historyIssues.push("原生 sessionFile 不是普通文件"); continue; }
+        const size = stat.size;
+        if (size > Math.min(MAX_FILE_BYTES, bytesLeft)) {
+          historyIssues.push("子会话历史超过读取预算");
+          continue;
+        }
+        const buffer = Buffer.alloc(size);
+        let offset = 0;
+        while (offset < size) {
+          const result = await file.read(buffer, offset, size - offset, offset);
+          if (!result.bytesRead) break;
+          offset += result.bytesRead;
+        }
+        bytesLeft -= size;
+        body = buffer.subarray(0, offset).toString("utf8");
+        if (offset !== size || (await file.stat()).size !== size) historyIssues.push("子会话历史读取时发生变化");
+      } finally { await file.close(); }
+      const entries: unknown[] = [];
+      for (const line of body.split("\n")) {
+        if (!line.trim()) continue;
+        try { entries.push(JSON.parse(line)); }
+        catch { historyIssues.push("子会话历史含未完整写入或无效的记录"); }
+      }
+      if (entries.length === 0 && !isZeroUsage(child.usage)) historyIssues.push("子会话历史为空");
+      const usable: unknown[] = [];
+      for (const entry of entries) {
+        if (entry === null || typeof entry !== "object") continue;
+        const row = entry as Record<string, unknown>;
+        const message = row.type === "message" && row.message !== null && typeof row.message === "object"
+          ? row.message as Record<string, unknown> : row;
+        if (message.usage === undefined) {
+          if (message.role === "assistant") historyIssues.push("子会话记录缺少用量");
+          continue;
+        }
+        const stamp = row.timestamp ?? message.timestamp;
+        if (typeof message.provider !== "string" || !message.provider || typeof message.model !== "string" || !message.model ||
+            (typeof stamp !== "string" && typeof stamp !== "number") || Number.isNaN(new Date(stamp).getTime())) {
+          historyIssues.push("子会话记录缺少模型或时间，未猜测归属");
+          continue;
+        }
+        const usage = message.usage as Record<string, unknown> | null;
+        if (!usage || typeof usage !== "object" || ["input", "output", "cacheRead", "cacheWrite"].some((key) =>
+          typeof usage[key] !== "number" || !Number.isFinite(usage[key]) || (usage[key] as number) < 0)) {
+          historyIssues.push("子会话记录用量不完整");
+          continue;
+        }
+        usable.push(entry);
+      }
+      if (usable.length === 0 && !isZeroUsage(child.usage)) historyIssues.push("子会话历史缺少原生已记录的用量");
+      childEntries.push(...usable);
+    } catch {
+      historyIssues.push("无法读取原生指向的子会话历史");
+    }
+  }
+  return { childEntries, historyIssues: [...new Set(historyIssues)] };
+}
+
+/** Keep the existing combined per-model chart; native totals have no model/day attribution. */
+export function collectUsageHistory(snapshot: UsageSnapshot, model: string, days: number, now = new Date()): DailySeries {
+  const series = collectModelDailyUsage([...(snapshot.parentEntries ?? []), ...snapshot.childEntries], model, days, now, snapshot.since);
+  const issues = [...snapshot.historyIssues];
+  if (snapshot.parentEntries === null) issues.push("主会话历史不可用");
+  if (snapshot.cost.kind === "unknown") issues.push(snapshot.cost.reason);
+  const incomplete = issues.length > 0;
+  return { ...series, incomplete, unavailable: incomplete && series.total === 0,
+    ...(incomplete ? { reason: [...new Set(issues)].join("；") } : {}) };
+}
+
+/** Whole-session native cost, separate from the since-enable/model/day chart. */
+export function formatNativeCost(cost: NativeCost): string {
+  if (cost.kind === "unknown") return `原生用量未知（${cost.reason}）`;
+  const suffix = cost.incomplete ? `（不完整：${cost.unresolvedAsyncChildren} 个子任务未解析）` : "";
+  return `原生本会话合计${cost.incomplete ? " ≥" : ""} ${formatUsage(cost.total)}${suffix}`;
 }

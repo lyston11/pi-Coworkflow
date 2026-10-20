@@ -1,333 +1,242 @@
-/**
- * Module: lane ledger and merge plan.
- *
- * Parallel lanes are pi-subagents' job, and it already does the hard parts: it
- * allocates a managed worktree per lane, captures each child's patch, and keeps
- * a parallel handoff manifest with lane status, merge evidence and cleanup
- * eligibility (`lane.status` / `lane.recordMerge` / `worktree.cleanup`). None of
- * that is re-implemented here.
- *
- * What was missing is the Trellis side of the ledger: a lane's manifest path
- * lived only in the run's result text (`Parallel handoff: <path>`), so it was
- * not bound to the task, and nothing gave the main session a merge plan. This
- * module therefore:
- *
- *   1. records a pointer per lane under `.trellis/.runtime/lanes/<task>/`
- *      (gitignored, next to Trellis's own session pointers — lane pointers are
- *      machine state and must not be committed),
- *   2. exposes `/Coworkflow:lanes`, which reads those pointers plus each manifest
- *      and prints lane facts and the Trellis-conformant merge sequence.
- *
- * It never merges, never applies a patch, and never removes a worktree: the main
- * session audits and merges, and destructive cleanup stays behind pi-subagents'
- * own authority policy.
- */
+/** Trellis → native identity/artifact pointers. Native status remains upstream-owned. */
+import { readdirSync, readFileSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import type { PiRuntimeHost, RuntimeContext, Unsubscribe, WorkflowModule } from "../../core/module.ts";
+import { configRoot, readConfig } from "../../core/config.ts";
+import { activeTaskDir, laneDir, repoRoot, resolveTaskDir, taskRefForDisplay } from "../../core/trellis.ts";
+import { decodeNativeCompletions, decodeNativeResult, mergeNativeChildren, readNativeHandoff,
+  readNativeWorkflowReceipt, type NativeChild, type NativeResult } from "../../core/pi-subagents.ts";
+import { resolveChildTask } from "../subagent-context/index.ts";
+import { planRun } from "../subagents/index.ts";
+import { attachSubagents } from "../../core/subagents-client.ts";
+import { readRunLink, readTaskLinks, recordLaunchLink, type NativeRunLink } from "../../core/subagents-workflow.ts";
 
-import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import type { PiRuntimeHost, RuntimeContext, WorkflowModule } from "../../core/module.ts";
-import { mainCheckout, readText, repoRoot, laneDir, activeTaskDir, taskRefForDisplay } from "../../core/trellis.ts";
-import { attachLedger } from "../../core/ledger.ts";
-
-const HANDOFF_LINE_RE = /^Parallel handoff:\s*(.+?)\s*$/m;
-
-export interface LaneRecord {
-  version: 1;
-  runId: string;
-  agent?: string;
-  handoffPath: string;
-  taskRef: string;
-  sessionId?: string;
-  recordedAt: string;
+const NS = "Coworkflow";
+const MAX_DISPLAY = 20;
+interface Target { root: string; taskRef: string; sessionId?: string }
+interface State {
+  runtime: RuntimeContext;
+  closed: boolean;
+  epoch: number;
+  calls: Map<string, Target>;
+  observations: Map<string, NativeResult>;
+  listeners: Map<string, Unsubscribe | void>;
+  commandRegistered: boolean;
 }
+const STATES = new WeakMap<PiRuntimeHost, State>();
 
-interface LaneFacts {
-  runId: string;
-  handoffPath: string;
-  agent?: string;
-  status?: string;
-  worktree?: string;
-  branch?: string;
-  patchPath?: string;
-  diffStat?: string;
-  filesChanged?: number;
-  eligibility?: string;
-  eligibilityReason?: string;
-  mergeCommit?: string;
-  prNumber?: number;
+function enabled(state: State): boolean {
+  const rt = state.runtime;
+  // Passive artifact adoption is project-gated; it does not require /start.
+  return !state.closed && !rt.isChild && rt.control.moduleEnabled("lane-worktree") &&
+    readConfig(configRoot(rt.cwd)) !== null;
 }
-
-function str(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+function resetEpoch(state: State): void {
+  if (state.epoch === state.runtime.sessionEpoch) return;
+  state.epoch = state.runtime.sessionEpoch;
+  state.calls.clear();
+  state.observations.clear();
 }
-
-function num(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+function remember(state: State, result: NativeResult): void {
+  const previous = state.observations.get(result.runId);
+  const fields = Object.fromEntries(Object.entries(result).filter(([, value]) => value !== undefined));
+  state.observations.set(result.runId, { ...previous, ...fields, runId: result.runId,
+    children: mergeNativeChildren(previous?.children ?? [], result.children) });
+  if (state.observations.size > 200) state.observations.delete(state.observations.keys().next().value!);
 }
-
-/** The manifest path pi-subagents reports for a worktree-isolated run. */
-export function extractHandoffPath(event: any): string | undefined {
-  const fromDetails = str(event?.details?.handoffPath);
-  if (fromDetails) return fromDetails;
-  const texts: string[] = Array.isArray(event?.content)
-    ? event.content
-        .map((part: unknown) =>
-          part !== null && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
-            ? (part as { text: string }).text
-            : "",
-        )
-        .filter(Boolean)
-    : [];
-  for (const text of texts) {
-    const match = HANDOFF_LINE_RE.exec(text);
-    if (match?.[1]) return match[1];
+function adoptResult(state: State, root: string, result: NativeResult): void {
+  const link = readRunLink(root, result.runId);
+  if (!link) return;
+  remember(state, result);
+  if ((result.handoffPath && result.handoffPath !== link.handoffPath) ||
+      (result.workflowReceiptPath && result.workflowReceiptPath !== link.workflowReceiptPath)) {
+    recordLaunchLink(root, { ...link,
+      ...(result.handoffPath ? { handoffPath: result.handoffPath } : {}),
+      ...(result.workflowReceiptPath ? { workflowReceiptPath: result.workflowReceiptPath } : {}),
+    });
   }
-  return undefined;
 }
-
-export function runIdFromHandoffPath(handoffPath: string): string {
-  const file = handoffPath.split("/").pop() ?? "";
-  const stem = file.replace(/\.json$/, "");
-  return stem && stem !== "handoff" ? stem : file || handoffPath;
-}
-
-function readLaneFacts(record: LaneRecord): LaneFacts {
-  const facts: LaneFacts = { runId: record.runId, handoffPath: record.handoffPath, agent: record.agent };
-  const raw = readText(record.handoffPath);
-  if (!raw) return facts;
-  let manifest: any;
-  try {
-    manifest = JSON.parse(raw);
-  } catch {
-    return facts;
-  }
-  if (manifest === null || typeof manifest !== "object") return facts;
-
-  const groups: any[] = Array.isArray(manifest.groups) ? manifest.groups : [];
-  for (const group of groups) {
-    const children: any[] = Array.isArray(group?.children) ? group.children : [];
-    const cleanups: any[] = Array.isArray(group?.cleanup?.tasks) ? group.cleanup.tasks : [];
-    for (const child of children) {
-      const patch = child?.patch ?? {};
-      facts.agent ??= str(child?.agent) ?? record.agent;
-      facts.status = str(child?.status) ?? facts.status;
-      facts.branch = str(patch?.branch) ?? facts.branch;
-      facts.patchPath = str(patch?.path) ?? facts.patchPath;
-      facts.diffStat = str(patch?.diffStat) ?? facts.diffStat;
-      facts.filesChanged = num(patch?.filesChanged) ?? facts.filesChanged;
-      const worktree = cleanups.find((task) => num(task?.index) === num(child?.index));
-      facts.worktree = str(worktree?.path) ?? facts.worktree;
-      facts.branch = str(worktree?.branch) ?? facts.branch;
-    }
-    for (const task of cleanups) {
-      facts.worktree ??= str(task?.path);
-      facts.branch ??= str(task?.branch);
-    }
-  }
-
-  const eligibility = manifest.cleanupEligibility;
-  facts.eligibility = str(eligibility?.state);
-  facts.eligibilityReason = str(eligibility?.reason);
-  facts.mergeCommit = str(manifest.merge?.mergeCommit);
-  facts.prNumber = num(manifest.merge?.prNumber);
-  return facts;
-}
-
-function readLaneRecords(root: string, taskDir: string): LaneRecord[] {
-  const dir = laneDir(root, taskDir);
-  let names: string[];
-  try {
-    names = readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
-  } catch {
-    return [];
-  }
-  const records: LaneRecord[] = [];
-  for (const name of names) {
-    const raw = readText(join(dir, name));
-    if (!raw) continue;
-    try {
-      const parsed: unknown = JSON.parse(raw);
-      if (parsed !== null && typeof parsed === "object") records.push(parsed as LaneRecord);
-    } catch {
-      // A corrupt pointer must not hide the other lanes.
-    }
-  }
-  return records;
-}
-
-function sessionIdOf(ctx: any, runtime: RuntimeContext): string | null {
-  const fromCtx = ctx?.sessionManager?.getSessionId?.();
-  return typeof fromCtx === "string" && fromCtx ? fromCtx : runtime.sessionId;
-}
-
-function renderLanes(root: string, taskDir: string, records: LaneRecord[]): string {
-  const taskRef = taskRefForDisplay(root, taskDir);
-  if (records.length === 0) {
-    return [
-      `任务: ${taskRef}`,
-      "  没有 lane 记录。",
-      "",
-      "只有 worktree 隔离的派单才会留下 lane 证据；主会话用 `subagent({ ..., async: true, worktree: true })` 派单后这里会出现记录。",
-    ].join("\n");
-  }
-
-  const lines = [`任务: ${taskRef}`, `lanes: ${records.length}`, ""];
-  const plans: string[] = [];
-
-  for (const record of records) {
-    const facts = readLaneFacts(record);
-    const size = facts.diffStat
-      ? ` (${facts.diffStat})`
-      : facts.filesChanged !== undefined
-        ? ` (${facts.filesChanged} files)`
-        : "";
-    lines.push(`lane ${facts.runId}  agent=${facts.agent ?? "?"}  status=${facts.status ?? "?"}`);
-    if (facts.worktree) lines.push(`  worktree: ${facts.worktree}`);
-    if (facts.branch) lines.push(`  branch:   ${facts.branch}`);
-    if (facts.patchPath) lines.push(`  patch:    ${facts.patchPath}${size}`);
-    else if (!readText(facts.handoffPath)) lines.push("  patch:    manifest 不可读（可能已被保留策略清理）");
-    lines.push(`  handoff:  ${facts.handoffPath}`);
-    if (facts.eligibility) {
-      lines.push(
-        `  证据状态: ${facts.eligibility}${facts.eligibilityReason ? ` — ${facts.eligibilityReason}` : ""}`,
-      );
-    }
-    if (facts.mergeCommit) {
-      lines.push(
-        `  已记录合并: commit ${facts.mergeCommit}${facts.prNumber !== undefined ? ` (PR #${facts.prNumber})` : ""}`,
-      );
-    }
-    lines.push("");
-
-    const apply = facts.patchPath
-      ? `cd ${root} && git apply --3way ${facts.patchPath}`
-      : `# 该 lane 没有 patch 文件，改动可能仍在 ${facts.worktree ?? "<worktree>"} 里，人工核对`;
-    plans.push(
-      [
-        `# lane ${facts.runId}`,
-        `1. 复核状态: subagent({ action: "lane.status", options: { laneId: "${facts.runId}", handoffPath: "${facts.handoffPath}" } })`,
-        `2. 取回改动: ${apply}`,
-        "3. 审计改动并跑受影响范围的最小充分检查，然后 commit（主会话的 worktree 里）",
-        `4. 记录证据: subagent({ action: "lane.recordMerge", options: { laneId: "${facts.runId}", handoffPath: "${facts.handoffPath}", merge: { prNumber: <n>, reviewedHead: "<sha>", mergeCommit: "<sha>", treeEquivalent: true, postMergeChecks: "recorded", attestedBy: "operator", attestedAt: "<iso>" } } })`,
-        `5. 清理: subagent({ action: "worktree.cleanup", options: { repo: "${root}", mode: "plan" } }) → 核对后 mode: "apply"`,
-      ].join("\n"),
-    );
-  }
-
-  lines.push("合并计划（主会话执行，本命令不会自动合并、不会删除 worktree）：", "", ...plans);
-  return lines.join("\n");
-}
-
-/** The checkout whose `.trellis/` state a command should read. */
-function resolveRootsFor(runtime: RuntimeContext, ctx: any): string {
-  const cwd = typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : runtime.cwd;
-  return mainCheckout(repoRoot(cwd));
-}
-
-/** Register `/Coworkflow:lanes`; idempotent, since a session may activate twice. */
-function registerLanesCommand(host: PiRuntimeHost, runtime: RuntimeContext): void {
-  if (lanesCommandRegistered) return;
-  lanesCommandRegistered = true;
-
-  host.registerCommand?.("Coworkflow:lanes", {
-    description:
-      "列出当前 Trellis 任务的 lane（worktree 隔离派单）状态、patch 路径与合并计划；不改动任何东西",
-    handler: (_args: string, ctx: any) => {
-      runtime.refresh();
-      if (!runtime.enabled) {
-        const message = "本会话未加载 Coworkflow：先运行 /Coworkflow:start";
-        try {
-          host.sendMessage?.({ customType: "pi-Coworkflow", content: message, display: true });
-        } catch {
-          ctx?.ui?.notify?.(message, "warning");
-        }
-        if (ctx?.mode !== "tui") {
-          try {
-            console.error(message);
-          } catch {
-            // stderr unavailable.
-          }
-        }
-        return;
-      }
-      const root = resolveRootsFor(runtime, ctx);
-      const taskDir = activeTaskDir(root, sessionIdOf(ctx, runtime));
-      const text = taskDir
-        ? renderLanes(root, taskDir, readLaneRecords(root, taskDir))
-        : `当前会话没有活跃 Trellis 任务（${root}），无法定位 lane 记录。`;
-      try {
-        host.sendMessage?.({ customType: "pi-Coworkflow", content: text, display: true });
-      } catch {
-        ctx?.ui?.notify?.(text, "info");
-      }
-      if (ctx?.mode !== "tui") {
-        try {
-          console.error(text);
-        } catch {
-          // stderr unavailable.
-        }
-      }
-    },
-  });
-}
-
-let lanesCommandRegistered = false;
 
 export const laneWorktreeModule: WorkflowModule = {
   id: "lane-worktree",
-  title: "lane 账目与合并计划（worktree 隔离的派单）",
-
-  activate(host: PiRuntimeHost, runtime: RuntimeContext): void {
-    if (runtime.isChild) return;
-
-    // Recording is gated on the project being adopted, not on this session having
-    // run `/Coworkflow:start`: a lane dispatched from a session that had not loaded
-    // the layer still produced artifacts, and leaving it out of the ledger is how
-    // `/Coworkflow:lanes` silently under-reports. The shared ledger applies that
-    // rule once; this module only turns a recorded result into a pointer.
-    const ledger = attachLedger(host, runtime);
-
-    ledger.onResult((dispatch, event, ctx) => {
-      const handoffPath = extractHandoffPath(event);
-      if (!handoffPath) return;
-
-      const root = resolveRootsFor(runtime, ctx);
-      const sessionId = sessionIdOf(ctx, runtime);
-      const taskDir = activeTaskDir(root, sessionId);
+  title: "Lane worktree（原生身份与交接指针）",
+  activate(host, runtime) {
+    if (runtime.isChild || !host.on) return;
+    let state = STATES.get(host);
+    if (!state) {
+      state = { runtime, closed: false, epoch: runtime.sessionEpoch, calls: new Map(), observations: new Map(),
+        listeners: new Map(), commandRegistered: false };
+      STATES.set(host, state);
+    }
+    state.runtime = runtime;
+    state.closed = false;
+    resetEpoch(state);
+    const current = state;
+    const listen = (name: string, handler: (event: any, ctx: any) => any) => {
+      if (!current.listeners.has(name)) current.listeners.set(name, host.on!(name, handler));
+    };
+    listen("tool_call", (event) => {
+      if (!enabled(current) || event?.toolName !== "subagent") return;
+      resetEpoch(current);
+      const input = event.input;
+      if (!input || typeof input !== "object" || (input.action && input.action !== "resume" && input.action !== "append-step")) return;
+      if (typeof event.toolCallId !== "string") return;
+      const root = configRoot(repoRoot(current.runtime.cwd));
+      const task = typeof input.task === "string" ? input.task : "";
+      const explicit = resolveChildTask(root, undefined, task);
+      // An explicit invalid reference cannot silently adopt a different active task.
+      const taskDir = explicit.kind === "task" ? explicit.dir : explicit.kind === "invalid" || /Active task:/i.test(task) ? null :
+        activeTaskDir(root, current.runtime.sessionId);
       if (!taskDir) return;
-
-      const runId = runIdFromHandoffPath(handoffPath);
-      // Bind the run id back onto the dispatch, so a later completion or failure
-      // notification can be traced to the call that started it.
-      ledger.bindRun(dispatch.callId, runId);
-
-      const record: LaneRecord = {
-        version: 1,
-        runId,
-        ...(dispatch.agent ? { agent: dispatch.agent } : {}),
-        handoffPath,
-        taskRef: taskRefForDisplay(root, taskDir),
-        ...(sessionId ? { sessionId } : {}),
-        recordedAt: new Date().toISOString(),
-      };
-      try {
-        const dir = laneDir(root, taskDir);
-        mkdirSync(dir, { recursive: true });
-        writeFileSync(join(dir, `${record.runId}.json`), `${JSON.stringify(record, null, 2)}\n`);
-      } catch {
-        // Losing a pointer must never break the tool result the model reads.
-      }
+      const taskRef = taskRefForDisplay(root, taskDir);
+      if (taskRef) current.calls.set(event.toolCallId, { root, taskRef, sessionId: current.runtime.sessionId ?? undefined });
+      // A blocked call from another extension may have no result. This is transient
+      // correlation only; dropping old entries loses no persisted native identity.
+      if (current.calls.size > 200) current.calls.delete(current.calls.keys().next().value!);
     });
-
-    if (runtime.enabled) registerLanesCommand(host, runtime);
+    listen("tool_result", (event) => {
+      if (event?.toolName !== "subagent") return;
+      resetEpoch(current);
+      const target = current.calls.get(event.toolCallId);
+      current.calls.delete(event.toolCallId);
+      if (!enabled(current)) return;
+      resetEpoch(current);
+      const result = decodeNativeResult(event.details);
+      if (!result) return;
+      if (target && event.isError !== true) recordLaunchLink(target.root, { taskRef: target.taskRef, sessionId: target.sessionId, runId: result.runId,
+        ...(result.missionId ? { missionId: result.missionId } : {}),
+        ...(result.handoffPath ? { handoffPath: result.handoffPath } : {}),
+        ...(result.workflowReceiptPath ? { workflowReceiptPath: result.workflowReceiptPath } : {}),
+      });
+      adoptResult(current, target?.root ?? configRoot(current.runtime.cwd), result);
+    });
+    listen("message_end", (event) => {
+      if (!enabled(current)) return;
+      resetEpoch(current);
+      const root = configRoot(current.runtime.cwd);
+      for (const result of decodeNativeCompletions(event?.message)) adoptResult(current, root, result);
+    });
   },
-
-  /**
-   * The lane command only exists while the session has Coworkflow loaded; the
-   * recording hook above stays registered but does not depend on that.
-   */
-  onSessionActivate(host: PiRuntimeHost, runtime: RuntimeContext): void {
-    if (runtime.isChild) return;
-    registerLanesCommand(host, runtime);
+  onSessionActivate(host, runtime) {
+    const state = STATES.get(host);
+    if (!state || state.commandRegistered || runtime.isChild || !host.registerCommand) return;
+    state.commandRegistered = true;
+    host.registerCommand(`${NS}:lanes`, {
+      description: "查看当前任务的原生子 run 与交接/补丁；最终验收和合并仍由主会话决定",
+      handler: async (args, ctx) => {
+        runtime.refresh();
+        const say = (text: string) => host.sendMessage?.({ customType: "pi-Coworkflow", content: text, display: true });
+        if (!runtime.enabled || !enabled(state)) { say(`本会话未加载或 lane-worktree 已关闭；先 /${NS}:start 并启用该模块。`); return; }
+        resetEpoch(state);
+        const epoch = runtime.sessionEpoch;
+        const root = configRoot(repoRoot(ctx.cwd));
+        const taskDir = args.trim() ? resolveTaskDir(root, args.trim()) : activeTaskDir(root, runtime.sessionId);
+        if (!taskDir) { say("没有可解析的任务；可传入 .trellis/tasks/<name>。"); return; }
+        const taskRef = taskRefForDisplay(root, taskDir) ?? taskDir;
+        let links = readTaskLinks(root, taskRef);
+        const legacy = readLegacyPointers(root, taskDir);
+        for (const pointer of legacy) if (!links.some((link) => link.runId === pointer.runId)) links.push({
+          runId: pointer.runId, taskRef, handoffPath: pointer.handoffPath, recordedAt: "legacy",
+        });
+        const shown = links.slice(-MAX_DISPLAY);
+        const bridge = attachSubagents(host, { epoch, events: host.events });
+        const activity = shown.length ? await bridge.observe() : null;
+        // Only current-session links are queried: RPC status is session-scoped.
+        await Promise.all(shown.filter((link) => link.sessionId === runtime.sessionId).map(async (link) => {
+          const response = await bridge.client.status({ id: link.runId });
+          if (!response.ok || state.closed || runtime.sessionEpoch !== epoch || !enabled(state)) return;
+          const result = decodeNativeResult(response.data.details);
+          if (result?.runId === link.runId) adoptResult(state, root, result);
+        }));
+        if (state.closed || runtime.sessionEpoch !== epoch || !runtime.enabled || !enabled(state)) return;
+        links = shown.map((link) => readRunLink(root, link.runId) ?? link);
+        const integration = planRun(root, args.trim() || null, taskDir);
+        const lines = [`任务: ${taskRef}`];
+        if (!links.length) lines.push("尚未记录原生 run；已有 legacy lane 文件保持原样。");
+        if (readTaskLinks(root, taskRef).length > MAX_DISPLAY) lines.push(`仅显示最近 ${MAX_DISPLAY} 个 run。`);
+        for (const link of links) {
+          const observation = state.observations.get(link.runId);
+          const nativeState = link.sessionId === runtime.sessionId && activity?.kind === "known"
+            ? activity.runs.find((run) => run.id === link.runId)?.state : undefined;
+          lines.push("", `- run ${link.runId} [${observation?.status ?? nativeState ?? "未知"}]`,
+            ...(link.missionId ? [`  mission: ${link.missionId}`] : []),
+            ...(link.worktree ? [`  worktree: ${shortPath(root, link.worktree)}`] : []));
+          const handoffRef = observation?.handoffPath ?? link.handoffPath;
+          const receiptRef = observation?.workflowReceiptPath ?? link.workflowReceiptPath;
+          // Artifact references keep their original root even when apply targets another tree.
+          const handoffPath = handoffRef ? resolve(root, handoffRef) : undefined;
+          const receiptPath = receiptRef ? resolve(root, receiptRef) : undefined;
+          if (handoffPath) lines.push(`  handoff: ${shortPath(root, handoffPath)}`);
+          if (receiptPath) lines.push(`  receipt: ${shortPath(root, receiptPath)}`);
+          const handoff = handoffPath ? readNativeHandoff(handoffPath, link.runId) : null;
+          if (handoff?.eligibility) lines.push(`  证据状态: ${handoff.eligibility}${handoff.eligibilityReason ? ` — ${handoff.eligibilityReason}` : ""}`);
+          if (handoff?.mergeCommit) lines.push(`  已记录合并: commit ${handoff.mergeCommit}${handoff.prNumber === undefined ? "" : ` (PR #${handoff.prNumber})`}`);
+          if (handoffPath && !handoff) lines.push("  patch: manifest 不可读或身份不匹配（可能已被保留策略清理）");
+          const children = mergeNativeChildren(
+            receiptPath ? readNativeWorkflowReceipt(receiptPath, link.runId) : [],
+            handoff?.children ?? [], observation?.children ?? []);
+          for (const child of children) lines.push(...renderChild(root, link.runId, child));
+          if (handoffPath) lines.push(...mergePlan(root, integration, link.runId, handoffPath, children));
+        }
+        say(lines.join("\n"));
+      },
+    });
   },
+  onSessionEnd(host) {
+    const state = STATES.get(host);
+    if (!state) return;
+    state.closed = true;
+    state.calls.clear(); state.observations.clear(); state.commandRegistered = false;
+    for (const [name, off] of state.listeners) if (typeof off === "function") { off(); state.listeners.delete(name); }
+  },
+  apply(ctx) { ctx.report("ok", `通过公开 result/completion 关联 task 与 run；/${NS}:lanes 展示每个子项的状态和交接补丁，不复制上游生命周期。`); },
+  remove(ctx) { ctx.report("ok", "停止 lane 观察；已有 task/native 链接及 legacy lane 文件保留"); },
 };
+
+function shortPath(root: string, path: string): string {
+  const rel = relative(root, resolve(root, path));
+  return rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel : path;
+}
+function renderChild(root: string, parent: string, child: NativeChild): string[] {
+  const identity = child.runId ?? `${parent} / index ${child.index}${child.stepIndex === undefined ? "" : ` / step ${child.stepIndex}`}`;
+  return [`  - ${identity}${child.workflowKey ? ` (${child.workflowKey})` : ""} · ${child.agent ?? "?"} [${child.status ?? "未知"}]`,
+    ...(child.outputPath ? [`    output: ${shortPath(root, child.outputPath)}`] : []),
+    ...(child.branch ? [`    branch: ${child.branch}`] : []),
+    ...(child.worktreePath ? [`    worktree: ${shortPath(root, child.worktreePath)}`] : []),
+    ...(child.patchPath ? [`    patch: ${shortPath(root, child.patchPath)}${child.diffStat ? ` (${child.diffStat})` : child.filesChanged === undefined ? "" : ` (${child.filesChanged} files)`}`] : ["    patch: 未提供"])];
+}
+
+/** Existing per-run pointers remain readable in their original task runtime directory. */
+function readLegacyPointers(root: string, taskDir: string): { runId: string; handoffPath: string }[] {
+  const dir = laneDir(root, taskDir);
+  try {
+    return readdirSync(dir).filter((name) => name.endsWith(".json")).sort().slice(-200).flatMap((name) => {
+      try {
+        const row: unknown = JSON.parse(readFileSync(join(dir, name), "utf8"));
+        if (!row || typeof row !== "object") return [];
+        const link = row as Record<string, unknown>;
+        return typeof link.runId === "string" && typeof link.handoffPath === "string" &&
+          link.taskRef === taskRefForDisplay(root, taskDir) ? [{ runId: link.runId, handoffPath: link.handoffPath }] : [];
+      } catch { return []; }
+    });
+  } catch { return []; }
+}
+
+function mergePlan(root: string, integration: ReturnType<typeof planRun>, runId: string, handoffPath: string, children: NativeChild[]): string[] {
+  const target = { laneId: runId, handoffPath };
+  const quote = (value: string) => "'" + value.replace(/'/g, "'\"'\"'") + "'";
+  return ["", "合并计划（主会话复核后执行；本命令不自动合并或清理）：",
+    `1. 复核状态: subagent(${JSON.stringify({ action: "lane.status", options: target })})`,
+    ...(integration.ok ? [`集成目标（任务 worktree）: ${integration.worktree}`]
+      : [`缺少已验证的任务集成 worktree，暂不提供补丁应用命令：${integration.message}`]),
+    ...children.map((child) => child.patchPath
+      ? integration.ok
+        ? `2. 取回 ${child.runId ?? `index ${child.index}`} 的改动: cd ${quote(integration.worktree)} && git apply --3way ${quote(resolve(root, child.patchPath))}`
+        : `2. ${child.runId ?? `index ${child.index}`} 的 patch 保留供复核: ${resolve(root, child.patchPath)}`
+      : `2. ${child.runId ?? `index ${child.index}`} 没有 patch；人工核对 ${child.worktreePath ?? "原生交接"}`),
+    integration.ok
+      ? "3. 审计改动并跑受影响范围的最小充分检查，然后在上述任务集成 worktree 里 commit。"
+      : "3. 继续复核交接与改动证据；先修复任务 worktree 前提，再重新生成合并计划。",
+    `4. 合并后记录证据: subagent({ action: "lane.recordMerge", options: { ...${JSON.stringify(target)}, merge: { prNumber: <n>, reviewedHead: "<sha>", mergeCommit: "<sha>", treeEquivalent: true, postMergeChecks: "recorded", attestedBy: "operator", attestedAt: "<iso>" } } })`,
+    `5. 清理计划: subagent(${JSON.stringify({ action: "worktree.cleanup", options: { repo: root, handoffPath, mode: "plan" } })})；核对后依上游计划执行 apply。`];
+}

@@ -53,6 +53,8 @@ export interface PanelSnapshot {
   history: {
     selectedModel: string;
     selected: DailySeries;
+    /** Public native cost summary, not attributed to the selected model. */
+    costSummary?: string;
     /** Epoch ms this session loaded Coworkflow; usage before it is excluded. */
     since?: number;
   };

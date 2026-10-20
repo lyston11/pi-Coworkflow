@@ -10,10 +10,9 @@
  *              which pi-subagents resolves with project settings taking
  *              precedence over the user's.
  *
- * The usage column is read from what Pi and pi-subagents already wrote
- * (`core/usage.ts`): the session's own assistant messages, plus the run
- * metadata of the children this session dispatched. Only tokens spent after the
- * session loaded Coworkflow are counted — the rest was not produced by the layer.
+ * The usage column consumes cached public cost and Pi history (`core/usage.ts`).
+ * Model/day attribution uses only session records, including child sessionFile
+ * pointers supplied by native cost. The chart keeps its since-enable window.
  */
 
 import { join } from "node:path";
@@ -31,11 +30,13 @@ import {
 import type { ModuleContext, PiRuntimeHost, RuntimeContext } from "../../core/module.ts";
 import { fileContext } from "../../core/module.ts";
 import { configRoot, readConfig } from "../../core/config.ts";
-import { sessionEnabledSince, setSessionFlag } from "../../core/trellis.ts";
+import { setSessionFlag } from "../../core/trellis.ts";
 import {
-  collectChildModelDailyUsage,
-  collectModelDailyUsage,
+  collectUsageHistory,
+  formatNativeCost,
   formatTokens,
+  refreshUsage,
+  usageSnapshot,
   type DailySeries,
 } from "../../core/usage.ts";
 import {
@@ -104,11 +105,8 @@ export class ModelPanel extends Container {
   /**
    * Snapshot cache for one render pass.
    *
-   * A snapshot reads every session entry and every subagent artifact, and one
-   * keystroke used to ask for it five times (sync, body, and each panel that
-   * wanted rows), which is what made the arrow keys feel sluggish. The cache is
-   * dropped when input arrives or a value is applied, so it never serves stale
-   * numbers.
+   * Snapshots project cached history in memory. No RPC or file reads occur in
+   * rendering; opening the panel refreshes the data at its command boundary.
    */
   private cached: PanelSnapshot | undefined;
   private readonly statusText = new Text("", 0, 0);
@@ -166,6 +164,7 @@ export class ModelPanel extends Container {
     const row = rows[this.focus === "model" ? this.cursor(snapshot) : this.cursorOf(snapshot, "model")];
     const model = row?.model;
     this.port.setCursorContext?.(this.tab, model ? `${model.provider}/${model.id}` : "");
+    this.cached = undefined;
   }
 
   /** Rows currently rendered in the focused column, for tests. */
@@ -504,9 +503,9 @@ export class ModelPanel extends Container {
     const theme = this.theme;
     const rows = Math.max(3, height);
     const barRows = rows - 1; // the last line is the day axis
-    if (series.days.length === 0) {
+    if (series.unavailable || series.days.length === 0) {
       const blank = Array.from({ length: rows }, () => "");
-      blank[0] = this.paint(this.cell("—", width), "dim");
+      blank[0] = this.paint(this.cell(series.unavailable ? "未知 / 不完整" : "—", width), "dim");
       return blank;
     }
 
@@ -536,7 +535,7 @@ export class ModelPanel extends Container {
         return label.padEnd(colWidth, " ");
       })
       .join("");
-    const total = `${formatTokens(series.total)}`;
+    const total = `${series.incomplete ? "≥" : ""}${formatTokens(series.total)}${series.incomplete ? " 不完整" : ""}`;
     const axisText = this.cell(` ${axis} ${total}`, width);
     lines.push(theme.fg("dim", axisText));
     return lines;
@@ -565,7 +564,8 @@ export class ModelPanel extends Container {
       this.body.addChild(new Text(line, 0, 0));
     }
     this.body.addChild(new Spacer(1));
-    this.body.addChild(new Text(this.theme.fg("muted", this.currentModelLine(snapshot)), 0, 0));
+    this.body.addChild(new Text(this.theme.fg("muted", [this.currentModelLine(snapshot), snapshot.history.costSummary,
+      snapshot.history.selected.reason ? `图表不完整：${snapshot.history.selected.reason}` : ""].filter(Boolean).join(" · ")), 0, 0));
     this.statusText.setText(this.status ? this.theme.fg("success", this.status) : "");
   }
 
@@ -681,99 +681,32 @@ function createPort(
   ctx: ModuleContext,
   host: PiRuntimeHost,
   commandCtx: any,
+  runtime: RuntimeContext,
   tui: { requestRender?(): void },
   done: () => void,
 ): PanelPort {
   // Pushed by the panel before each snapshot, so `history` can resolve the
   // model under the cursor rather than only the one in effect.
-  let cursorTab: Tab = "session";
   let cursorModel = "";
   const selectedModel = (): string => cursorModel;
-  const selectedTab = (): Tab => cursorTab;
 
   const findModel = (provider: string, id: string): PanelModel | undefined =>
     panelModels(commandCtx).find((model) => model.provider === provider && model.id === id);
 
-  /**
-   * Where pi-subagents writes run metadata. The session directory is the
-   * default (`artifacts: "session"`), and project mode puts the same files
-   * under `<cwd>/.pi/subagents/artifacts/`.
-   */
-  const artifactDirs = (cwd: string): string[] => {
-    const dirs: string[] = [];
-    const sessionDir = commandCtx?.sessionManager?.getSessionDir?.();
-    if (typeof sessionDir === "string" && sessionDir) dirs.push(join(sessionDir, "subagent-artifacts"));
-    dirs.push(join(cwd, ".pi", "subagents", "artifacts"));
-    return dirs;
-  };
-
-  /**
-   * The 7-day window for one model: session usage by day, plus child runs that
-   * used the same model. Children are attributed by the model recorded in their
-   * run metadata, so the bar reflects what that model actually consumed.
-   */
-  const enabledSince = (cwd: string): number | undefined => {
-    const id = commandCtx?.sessionManager?.getSessionId?.();
-    return sessionEnabledSince(configRoot(cwd), typeof id === "string" ? id : null);
-  };
-
-  const historyFor = (cwd: string, model: string): DailySeries => {
-    if (!model) {
-      return { days: [], total: 0, peak: 0 };
-    }
-    const entries = commandCtx?.sessionManager?.getEntries?.();
-    const sessionId = commandCtx?.sessionManager?.getSessionId?.();
-    // Only tokens spent while Coworkflow was loaded count: that is the layer's
-    // own consumption, and counting earlier turns would inflate every number.
-    const since = enabledSince(cwd);
-    const series = Array.isArray(entries)
-      ? collectModelDailyUsage(entries, model, HISTORY_DAYS, new Date(), since)
-      : { days: [], total: 0, peak: 0 };
-    const childSeries = collectChildModelDailyUsage(
-      artifactDirs(cwd),
-      model,
-      HISTORY_DAYS,
-      typeof sessionId === "string" ? sessionId : null,
-      new Date(),
-      since,
-    );
-    // Merge both sources per day so one bar covers everything that model spent.
-    const days = series.days.map((day, index) => {
-      const other = childSeries.days[index];
-      return {
-        day: day.day,
-        input: day.input + (other?.input ?? 0),
-        output: day.output + (other?.output ?? 0),
-        cacheRead: day.cacheRead + (other?.cacheRead ?? 0),
-        cacheWrite: day.cacheWrite + (other?.cacheWrite ?? 0),
-      };
-    });
-    const total = days.reduce(
-      (sum, day) => sum + day.input + day.output + day.cacheRead + day.cacheWrite,
-      0,
-    );
-    const peak = days.reduce(
-      (max, day) => Math.max(max, day.input + day.output + day.cacheRead + day.cacheWrite),
-      0,
-    );
-    return { days, total, peak };
-  };
-
-  const history = (cwd: string) => {
-    // Only the model under the cursor is charted, so only its series is built.
-    // Building a second series for the model in effect doubled the per-keystroke
-    // cost for data the panel never rendered.
-    const selected = selectedModel();
-    const since = enabledSince(cwd);
+  // Open/action-time settings reads; a render only projects these values.
+  let settings = subagentSettings(ctx);
+  const history = () => {
+    const observation = usageSnapshot(host, runtime);
     return {
-      selectedModel: selected,
-      selected: historyFor(cwd, selected),
-      ...(since !== undefined ? { since } : {}),
+      selectedModel: selectedModel(),
+      selected: selectedModel() ? collectUsageHistory(observation, selectedModel(), HISTORY_DAYS)
+        : { days: [], total: 0, peak: 0 },
+      costSummary: formatNativeCost(observation.cost),
+      ...(observation.since !== undefined ? { since: observation.since } : {}),
     };
   };
 
   const snapshot = (): PanelSnapshot => {
-    const settings = subagentSettings(ctx);
     const modelId = typeof settings.defaultModel === "string" ? settings.defaultModel : "";
     const provider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : "";
     const sessionModel = commandCtx?.model
@@ -798,15 +731,12 @@ function createPort(
         (modelId ? findModel(provider, modelId) : undefined) ??
         findModel(String(commandCtx?.model?.provider ?? ""), String(commandCtx?.model?.id ?? "")) ??
         sessionModel,
-      history: history(
-        typeof commandCtx?.cwd === "string" && commandCtx.cwd ? commandCtx.cwd : ctx.root,
-      ),
+      history: history(),
     };
   };
 
   return {
-    setCursorContext(tab: Tab, model: string) {
-      cursorTab = tab;
+    setCursorContext(_tab: Tab, model: string) {
       cursorModel = model;
     },
     snapshot,
@@ -826,14 +756,17 @@ function createPort(
       if (model === null) {
         writeSubagentSetting(ctx, "defaultModel", null);
         writeSubagentSetting(ctx, "defaultProvider", null);
+        settings = subagentSettings(ctx);
         return "子 agent 模型 → 继承主会话";
       }
       writeSubagentSetting(ctx, "defaultModel", model.id);
       writeSubagentSetting(ctx, "defaultProvider", model.provider);
+      settings = subagentSettings(ctx);
       return `子 agent 模型 → ${model.provider}/${model.id}（本项目）`;
     },
     applySubagentThinking(level: ThinkingLevelName | null): string {
       writeSubagentSetting(ctx, "defaultThinking", level);
+      settings = subagentSettings(ctx);
       return level === null ? "子 agent 思考等级 → 默认" : `子 agent 思考等级 → ${level}（本项目）`;
     },
     close: done,
@@ -843,22 +776,26 @@ function createPort(
 
 /** Register `/Comodels`; idempotent, since a session may activate twice. */
 export function registerModelPanel(host: PiRuntimeHost, runtime: RuntimeContext): void {
-  if (modelPanelRegistered) return;
-  modelPanelRegistered = true;
+  const registered = modelPanelRegistered.get(host);
+  if (registered) { registered.runtime = runtime; return; }
+  const registration = { runtime };
+  modelPanelRegistered.set(host, registration);
 
   const open = async (commandCtx: any): Promise<void> => {
+    const runtime = registration.runtime;
     // The switch may have been flipped a moment ago (`/Coworkflow:start` in this
     // session, or a settings write that re-stamps it), so re-read before refusing.
     runtime.refresh();
     // Registered once the session loads Coworkflow; if the session then runs
     // `/Coworkflow:start off`, the command stays but refuses, so a stopped
     // session is plain Pi again.
-    if (!runtime.enabled) {
+    if (!runtime.enabled || !runtime.control.moduleEnabled("panel")) {
       // `/reload` re-loads extensions but not the session switch, so "not loaded"
       // here is expected rather than a broken install. Say which it is.
       const initialized = readConfig(configRoot(runtime.cwd)) !== null;
       const message = !initialized
         ? "本项目未初始化：先运行 /Coworkflow:init"
+        : !runtime.control.moduleEnabled("panel") ? "本项目 panel 模块已关闭"
         : "本会话未加载 Coworkflow（/reload 之后需要重新加载）：运行 /Coworkflow:start";
       commandCtx?.ui?.notify?.(message, "warning");
       try {
@@ -881,13 +818,16 @@ export function registerModelPanel(host: PiRuntimeHost, runtime: RuntimeContext)
       }
       return;
     }
+    const epoch = runtime.sessionEpoch;
+    await refreshUsage(host, runtime, commandCtx);
+    if (epoch !== runtime.sessionEpoch || registration.runtime !== runtime || !runtime.enabled || !runtime.control.moduleEnabled("panel")) return;
     const cwd = typeof commandCtx?.cwd === "string" && commandCtx.cwd ? commandCtx.cwd : runtime.cwd;
     const context = fileContext(cwd);
     setPanelContext(context.root, sessionIdOf(commandCtx, runtime));
 
     await commandCtx.ui.custom(
       (tui: any, theme: PanelTheme, keybindings: PanelKeybindings, done: (value: unknown) => void) => {
-        const port = createPort(context, host, commandCtx, tui, () => done(undefined));
+        const port = createPort(context, host, commandCtx, runtime, tui, () => done(undefined));
         return new ModelPanel(port, theme, tui, keybindings);
       },
     );
@@ -900,4 +840,4 @@ export function registerModelPanel(host: PiRuntimeHost, runtime: RuntimeContext)
   });
 }
 
-let modelPanelRegistered = false;
+const modelPanelRegistered = new WeakMap<object, { runtime: RuntimeContext }>();
