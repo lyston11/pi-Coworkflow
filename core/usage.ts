@@ -5,7 +5,6 @@ import { isAbsolute } from "node:path";
 import type { PiRuntimeHost, RuntimeContext } from "./module.ts";
 import { attachSubagents, type NativeCost } from "./subagents-client.ts";
 import { sessionEnabledSince } from "./trellis.ts";
-import { configRoot } from "./config.ts";
 
 export interface UsageTotals {
   input: number;
@@ -350,9 +349,13 @@ export async function refreshUsage(host: PiRuntimeHost, runtime: RuntimeContext,
   }
   const current = state;
   const entries = ctx.sessionManager?.getEntries?.();
+  // The shared resolver, not a per-event `git`. An unresolved root attributes no
+  // start time at all: reading the flags file of whatever directory this ran in
+  // would date the window from a project this session is not running.
+  const root = runtime.configRoots.root(runtime.cwd);
   current.snapshot = { ...current.snapshot, parentEntries: Array.isArray(entries) ? [...entries] : null,
     historyIssues: validateParentHistory(Array.isArray(entries) ? entries : null),
-    since: sessionEnabledSince(configRoot(runtime.cwd), runtime.sessionId) };
+    since: root === null ? undefined : sessionEnabledSince(root, runtime.sessionId) };
   current.revision += 1;
   if (current.pending) return current.pending;
   const valid = (): boolean => observations.get(host) === current && current.epoch === runtime.sessionEpoch &&

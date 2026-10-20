@@ -30,6 +30,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { setSessionFlag } from "../core/trellis.ts";
+import { createConfigRootResolver } from "../core/config.ts";
 import { controlSurface } from "../extensions/coworkflow.ts";
 
 const PARENT_SESSION_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -552,6 +553,9 @@ test("subagent-context: activate reuses its listener and reads the live runtime"
     parentSessionId: null,
     sessionEpoch: 1,
     refresh: () => {},
+    // The production resolver: the injector reads its root from the runtime now
+    // instead of spawning its own `git` per run.
+    configRoots: createConfigRootResolver(),
     control: { moduleEnabled: () => true },
   });
 

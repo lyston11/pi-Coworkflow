@@ -15,9 +15,9 @@
  * lane pointers under `.trellis/.runtime/`.
  */
 
+import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { mainCheckout, repoRoot } from "./trellis.ts";
+import { basename, dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 
 export const CONFIG_REL = join(".pi", "Coworkflow.json");
 /** The file name this package used before it was renamed to pi-Coworkflow. */
@@ -40,7 +40,11 @@ export interface WorkflowConfig {
    * project limit, so pi-subagents' own (user-level) setting applies unchanged.
    */
   subagentConcurrency?: number;
-  /** Module id → enabled. An absent id is disabled. */
+  /**
+   * Module id → enabled. An explicit value here always wins; an absent id is a
+   * module added after this map was written, and its own declared
+   * `newSwitchDefault` decides (see `resolveSwitch`).
+   */
   modules: Record<string, boolean>;
 }
 
@@ -52,14 +56,165 @@ export function legacyConfigPath(root: string): string {
   return join(root, LEGACY_CONFIG_REL);
 }
 
+// ── Configuration root, resolved once per session ─────────────────────
+
 /**
- * The checkout whose config governs this session.
+ * What one `git` invocation answered.
  *
- * Resolved through the main checkout so a lane or task worktree — which only
- * carries committed files — still finds the project's config.
+ * Three cases, not two. "This directory is not in a repository" and "git could
+ * not answer" used to be the same `null`, and both fell back to the caller's
+ * cwd: the first is a real answer (the config of a project that lives outside a
+ * repository is right here), the second must never be mistaken for one, or a
+ * transient failure quietly points the config at a worktree and module switches
+ * drift with the working directory.
  */
-export function configRoot(cwd: string): string {
-  return mainCheckout(repoRoot(cwd));
+export type GitAnswer =
+  | { kind: "ok"; out: string }
+  | { kind: "no-repo" }
+  | { kind: "failed"; reason: string };
+
+/** The git seam. Injectable so a test needs no real repository. */
+export type GitRunner = (cwd: string, args: string[]) => GitAnswer;
+
+/** Where the project's `.pi/Coworkflow.json` is read from. */
+export type ConfigRootResolution =
+  | { kind: "resolved"; root: string }
+  | { kind: "no-repo"; root: string }
+  | { kind: "unresolved"; reason: string };
+
+/**
+ * A per-runtime cache for the configuration root.
+ *
+ * Deliberately not process-global: a lane or worktree session has to resolve its
+ * own main checkout, and two sessions in one process must not share an answer.
+ */
+export interface ConfigRootResolver {
+  /** Resolution for `cwd`, reused while `cwd` and the session epoch hold. */
+  resolve(cwd: string): ConfigRootResolution;
+  /** The root to read config from, or `null` when git could not answer. */
+  root(cwd: string): string | null;
+  /** Drop the memoised answer. */
+  invalidate(): void;
+}
+
+const firstLine = (text: string): string => (text.split(/\r?\n/)[0] ?? "").trim();
+
+/**
+ * Real git. Keeps stderr, which is the only way to tell "no repo" from a failure.
+ *
+ * `LC_ALL=C` is forced: the classification below reads git's own message, and a
+ * translated one ("not a git repository" is localized) would turn the ordinary
+ * "this project lives outside a repository" answer into a spurious failure.
+ */
+const probeGit: GitRunner = (cwd, args) => {
+  try {
+    const out = execFileSync("git", ["-C", cwd, ...args], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, LC_ALL: "C" },
+    }).trim();
+    return out ? { kind: "ok", out } : { kind: "failed", reason: `git ${args.join(" ")} 没有输出` };
+  } catch (error) {
+    const failure = error as { stderr?: unknown; message?: unknown };
+    const stderr = typeof failure.stderr === "string" ? failure.stderr : "";
+    if (/not a git repository/i.test(stderr)) return { kind: "no-repo" };
+    const message = typeof failure.message === "string" ? failure.message : "git 执行失败";
+    return { kind: "failed", reason: firstLine(stderr) || firstLine(message) };
+  }
+};
+
+/**
+ * The checkout whose `.pi/Coworkflow.json` governs `cwd`, or the reason there is
+ * none to read.
+ *
+ * Resolved through the main checkout, so a lane or task worktree — which only
+ * carries committed files — still finds the project's config. The common dir is
+ * read from the toplevel, and a failure there is reported instead of being
+ * treated as "this directory is the main checkout": a linked worktree reading its
+ * own committed config would see a different project than its main checkout does.
+ */
+function resolveConfigRootAt(cwd: string, git: GitRunner): ConfigRootResolution {
+  const top = git(cwd, ["rev-parse", "--show-toplevel"]);
+  if (top.kind === "no-repo") return { kind: "no-repo", root: cwd };
+  if (top.kind === "failed") return { kind: "unresolved", reason: top.reason };
+  const dir = top.out;
+  const absoluteCommon = git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  const common = absoluteCommon.kind === "ok" ? absoluteCommon : git(dir, ["rev-parse", "--git-common-dir"]);
+  if (common.kind !== "ok") {
+    return {
+      kind: "unresolved",
+      reason: common.kind === "failed" ? common.reason : "git rev-parse --git-common-dir 报告不在仓库内，但 toplevel 已解析",
+    };
+  }
+  const absolute = isAbsolute(common.out) ? common.out : join(dir, common.out);
+  return { kind: "resolved", root: basename(absolute) === ".git" ? dirname(absolute) : dir };
+}
+
+/**
+ * Create the resolver one runtime owns.
+ *
+ * `epoch` is read live on every call, so the orchestrator's `session_start`
+ * increment (and a cwd switch) invalidates the answer without anything having to
+ * tell the resolver: it is a key comparison, not an event.
+ */
+export function createConfigRootResolver(
+  options: { epoch?: () => number; runGit?: GitRunner } = {},
+): ConfigRootResolver {
+  const epochOf = options.epoch ?? (() => 0);
+  const git = options.runGit ?? probeGit;
+  let memo: { cwd: string; epoch: number; resolution: ConfigRootResolution } | null = null;
+
+  const cached = (cwd: string): ConfigRootResolution => {
+    const key = resolvePath(cwd);
+    const epoch = epochOf();
+    if (memo !== null && memo.cwd === key && memo.epoch === epoch) return memo.resolution;
+    const resolution = resolveConfigRootAt(key, git);
+    memo = { cwd: key, epoch, resolution };
+    return resolution;
+  };
+
+  return {
+    resolve: cached,
+    root(cwd) {
+      const resolution = cached(cwd);
+      return resolution.kind === "unresolved" ? null : resolution.root;
+    },
+    invalidate() {
+      memo = null;
+    },
+  };
+}
+
+/**
+ * One status line for a resolution, or `null` when it is the ordinary case.
+ *
+ * An unresolvable root is reported, never rendered as "the config is here": that
+ * difference is the whole reason the resolver has a third state.
+ */
+export function configRootNote(resolution: ConfigRootResolution, cwd?: string): string | null {
+  switch (resolution.kind) {
+    case "unresolved":
+      return `配置根无法解析：git 读取失败（${resolution.reason}）——本会话不读取任何项目的 .pi/Coworkflow.json，也不把它当成当前目录`;
+    case "no-repo":
+      return `配置根：${resolution.root}（不在 git 仓库内，按当前目录读取）`;
+    case "resolved":
+      return cwd !== undefined && resolvePath(cwd) !== resolution.root
+        ? `配置根：${resolution.root}（主 checkout）`
+        : null;
+  }
+}
+
+/**
+ * The project's config through a resolver, or `null` when there is none to read.
+ *
+ * An unresolvable root reads as "no config" — never as "read the current
+ * directory instead" — so a transient git failure makes this session inert rather
+ * than silently governed by whatever config happens to sit where it was started.
+ * `/Coworkflow:status` reports the unresolved state itself.
+ */
+export function readConfigAt(resolver: ConfigRootResolver, cwd: string): WorkflowConfig | null {
+  const root = resolver.root(cwd);
+  return root === null ? null : readConfig(root);
 }
 
 /** The project's config, or `null` when the project has not opted in. */
@@ -134,19 +289,87 @@ export function writeConfig(root: string, config: WorkflowConfig): void {
 }
 
 /**
- * Whether a module is on.
+ * What a switch key the config does not name means for one module.
  *
- * Only an explicit `false` turns a module off: a key that is absent means the
- * module did not exist when the config was written, so a newly added layer
- * starts on instead of silently staying off in every existing project. Every
- * run rewrites the full switch map, so absence only happens that way.
+ * An absent key means the module was added after this project's config was
+ * written, so nobody here has chosen anything yet. The two answers are not
+ * interchangeable: `"on"` starts a newly added observation or record by itself,
+ * while `"off"` keeps a newly added *gate* out until the project opts in — a
+ * module that can refuse work must never begin policing a project on the
+ * strength of a version upgrade.
  */
-export function isEnabled(config: WorkflowConfig | null, id: string): boolean {
-  return config !== null && config.modules[id] !== false;
+export type SwitchDefault = "on" | "off";
+
+/** What `isEnabled` assumes when a module declares nothing: today's behaviour. */
+export const DEFAULT_NEW_SWITCH: SwitchDefault = "on";
+
+/**
+ * A module's switch declaration, structurally: the fields `isEnabled` and
+ * `describeSwitches` read. A `WorkflowModule` satisfies it, so callers pass the
+ * registry entry and never restate the default. Does not import the module
+ * contract, which imports this file.
+ */
+export interface SwitchDeclaration {
+  id: string;
+  newSwitchDefault?: SwitchDefault;
 }
 
-/** One-line switch summary for reports, for example `trellis=on worktree=off`. */
-export function describeSwitches(config: WorkflowConfig | null, all: string[]): string {
+/** Where one module's effective switch came from. */
+export interface SwitchResolution {
+  on: boolean;
+  /**
+   * `chosen` — the config names this module, so the value is this project's own
+   * decision; `defaulted` — the key is absent and the module's declaration
+   * decided it. A report must not present the second as consent that happened.
+   */
+  source: "chosen" | "defaulted";
+}
+
+/** How one module's switch resolves, and whether it was chosen or defaulted. */
+export function resolveSwitch(
+  config: WorkflowConfig,
+  id: string,
+  declared: SwitchDefault = DEFAULT_NEW_SWITCH,
+): SwitchResolution {
+  const stored = config.modules[id];
+  if (typeof stored === "boolean") return { on: stored, source: "chosen" };
+  return { on: declared === "on", source: "defaulted" };
+}
+
+/**
+ * Whether a module is on.
+ *
+ * An explicit value in the config always wins. A key that is absent is a module
+ * that did not exist when the config was written, and then the module's own
+ * declaration decides — `"on"` unless it says otherwise. Every init run rewrites
+ * the full switch map, so absence only happens for a module added later.
+ */
+export function isEnabled(
+  config: WorkflowConfig | null,
+  id: string,
+  declared: SwitchDefault = DEFAULT_NEW_SWITCH,
+): boolean {
+  return config !== null && resolveSwitch(config, id, declared).on;
+}
+
+/**
+ * One-line switch summary for reports, for example `trellis=on capacity=off（默认）`.
+ *
+ * A defaulted switch is marked, because "on" alone reads as a decision this
+ * project made, and for an absent key nobody made one. Pass the declarations the
+ * caller knows about — the registry — not a map of resolved booleans, which would
+ * erase exactly the difference this line has to keep.
+ */
+export function describeSwitches(
+  config: WorkflowConfig | null,
+  declarations: readonly SwitchDeclaration[],
+): string {
   if (config === null) return "未安装（本项目的扩展不生效）";
-  return all.map((id) => `${id}=${isEnabled(config, id) ? "on" : "off"}`).join(" ");
+  return declarations
+    .map((declaration) => {
+      const state = resolveSwitch(config, declaration.id, declaration.newSwitchDefault);
+      const mark = state.source === "defaulted" ? "（默认）" : "";
+      return `${declaration.id}=${state.on ? "on" : "off"}${mark}`;
+    })
+    .join(" ");
 }

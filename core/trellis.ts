@@ -79,8 +79,12 @@ export function repoRoot(cwd: string): string {
  * read from Trellis state must resolve here rather than against the worktree.
  */
 export function mainCheckout(dir: string): string {
+  // `--path-format=absolute` is the supported spelling. `--absolute-git-common-dir`
+  // looks like an option but is not one: rev-parse echoes unknown `--` arguments
+  // back on stdout with exit 0, so it silently returned its own name and every
+  // caller treated the worktree as the main checkout.
   const common =
-    runGit(dir, ["rev-parse", "--absolute-git-common-dir"]) ??
+    runGit(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]) ??
     runGit(dir, ["rev-parse", "--git-common-dir"]);
   if (!common) return dir;
   const absolute = isAbsolute(common) ? common : join(dir, common);

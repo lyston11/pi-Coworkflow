@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { PiRuntimeHost, RuntimeContext } from "../core/module.ts";
 import { collectUsageHistory, disposeUsage, formatNativeCost, refreshUsage, usageSnapshot } from "../core/usage.ts";
+import { createConfigRootResolver } from "../core/config.ts";
 import { existingSubagentsBridge } from "../core/subagents-client.ts";
 import { registerModelPanel, type ModelPanel } from "../modules/panel/models.ts";
 import coworkflow, { controlSurface } from "../extensions/coworkflow.ts";
@@ -64,7 +65,11 @@ function fixture() {
   const host: PiRuntimeHost = { events };
   let enabled = true;
   const runtime = { cwd: root, enabled: true, isChild: false, sessionEpoch: 1, sessionId: "session", parentSessionId: null, loadState: "auto",
+    // A temp directory is not a repository, which is a real answer: the resolver
+    // reports `no-repo` and the root is the directory itself.
+    configRoots: createConfigRootResolver(),
     control: { moduleEnabled: () => enabled, initialized: () => true, switches: () => ({}), moduleIds: () => [],
+      configRoot: () => root, configRootNote: () => null,
       autoEnable: () => true, prefix: () => "wt-", facts: () => [], setSwitch: () => "", setAutoEnable: () => "",
       setPrefix: () => "", subagentConcurrency: () => null, setSubagentConcurrency: () => "", loadState: () => "auto",
       init: () => "" }, refresh() {} } as RuntimeContext;

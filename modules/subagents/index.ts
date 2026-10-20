@@ -412,7 +412,14 @@ function schedule(state: HostState, runtime: RuntimeContext, explicitSessionId?:
   // cannot load this extension", which only makes sense while the child-side
   // module is on. A set built under the other answer has to be rebuilt.
   const wantsChildren = runtime.control.moduleEnabled("subagent-context");
-  const root = mainCheckout(repoRoot(runtime.cwd));
+  // The runtime's resolver: this runs on every reconciliation, and the uncached
+  // pair spawns `git` three times. A null root means git could not answer, and
+  // registering a workflow against a guessed root is worse than not registering.
+  const root = runtime.configRoots.root(runtime.cwd);
+  if (root === null) {
+    if (state.current !== null) withdraw(state);
+    return Promise.resolve();
+  }
   const plan = planRun(root, null, activeTaskDir(root, sessionId));
   const prepared = plan.ok ? plan : null;
 
@@ -645,7 +652,11 @@ function registerRunCommand(host: PiRuntimeHost, runtime: RuntimeContext): void 
       }
 
       const cwd = typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : runtime.cwd;
-      const root = mainCheckout(repoRoot(cwd));
+      const root = runtime.configRoots.root(cwd);
+      if (root === null) {
+        say("配置根无法解析（git 读取失败）：本命令不派单，避免在主 checkout 不确定的情况下启动子进程。");
+        return;
+      }
       const sessionId = ctx?.sessionManager?.getSessionId?.() ?? runtime.sessionId;
       if (typeof sessionId !== "string" || !sessionId) {
         say("拿不到当前会话 id：pi-subagents 的工作流资源按会话注册，没有 id 无法解析资源。请在交互式会话里运行本命令。");

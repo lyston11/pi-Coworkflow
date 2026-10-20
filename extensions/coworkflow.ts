@@ -46,10 +46,13 @@ import { createContext, renderModule } from "../core/module.ts";
 import type { WorkflowConfig } from "../core/config.ts";
 import {
   configPath,
-  configRoot,
+  configRootNote,
+  createConfigRootResolver,
   describeSwitches,
   isEnabled,
   readConfig,
+  readConfigAt,
+  resolveSwitch,
   writeConfig,
 } from "../core/config.ts";
 import { sessionFlag, sessionKeys, setSessionFlag } from "../core/trellis.ts";
@@ -194,10 +197,13 @@ let runtime: RuntimeContext = {
   sessionId: null,
   parentSessionId: null,
   sessionEpoch: 0,
+  configRoots: createConfigRootResolver(),
   control: {
     initialized: () => false,
     switches: () => ({}),
     moduleIds: () => ALL_IDS,
+    configRoot: () => null,
+    configRootNote: () => null,
     autoEnable: () => false,
     prefix: () => DEFAULT_PREFIX,
     facts: () => [],
@@ -246,7 +252,12 @@ function firstFlag(root: string, keys: string[]): boolean | undefined {
 
 /** Resolve both the switch and the reason for it. */
 function resolveLoadState(cwd: string): { enabled: boolean; state: RuntimeContext["loadState"] } {
-  const root = configRoot(cwd);
+  // One resolution per (cwd, epoch): this runs at the start of every command and
+  // every agent turn, and the uncached form spawns `git`.
+  const root = runtime.configRoots.root(cwd);
+  // An unresolvable root is inert, not "read wherever we started": the difference
+  // between the two is exactly what used to make module switches drift.
+  if (root === null) return { enabled: false, state: "off" };
   const config = readConfig(root);
   if (config === null) return { enabled: false, state: "off" };
   if (runtime.isChild) {
@@ -340,10 +351,10 @@ function notifyRuntimeChange(): void {
  */
 function ensureRuntime(): void {
   if (!runtimeHost) return;
-  const config = readConfig(configRoot(runtime.cwd));
+  const config = readConfigAt(runtime.configRoots, runtime.cwd);
   for (const module of MODULES) {
     if (!module.activate || runtimeActive.includes(module.id)) continue;
-    if (config !== null ? !isEnabled(config, module.id) : !module.alwaysActive) continue;
+    if (config !== null ? !isEnabled(config, module.id, module.newSwitchDefault) : !module.alwaysActive) continue;
     try {
       module.activate(runtimeHost, runtime);
       runtimeActive.push(module.id);
@@ -397,13 +408,34 @@ function runtimeReport(): string | null {
       runtimeErrors.push(`${module.id}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  // The configuration root the gates actually read, and — when git could not
+  // answer — that fact rather than a path. This is the line that makes a
+  // resolution failure visible instead of silently reading the starting cwd.
+  const rootResolution = runtime.configRoots.resolve(runtime.cwd);
+  const rootNote = configRootNote(rootResolution, runtime.cwd);
+  // One read for the whole report: every line below needs the same file to tell
+  // "this project switched it off" from "this module was never chosen here".
+  const reportConfig = readConfigAt(runtime.configRoots, runtime.cwd);
+  const rootLine = rootResolution.kind === "unresolved"
+    ? [`  ! 配置根无法解析（${rootResolution.reason}）：本会话不读取任何项目的 .pi/Coworkflow.json，也不回退到当前目录`]
+    : [
+      `  = 配置根: ${rootResolution.root}${
+        // Only a resolved root can be *the* main checkout. A directory outside any
+        // repository resolves to itself, and claiming it is a main checkout would
+        // assert the opposite of what the resolver just said.
+        rootResolution.kind === "resolved" && rootNote !== null ? "（主 checkout）" : ""
+      }`,
+    ];
   return [
     `[runtime] 本会话（isChild=${runtime.isChild ? "true" : "false"}，Coworkflow ${runtime.enabled ? "已加载" : "未加载"}）`,
+    ...rootLine,
     ...runtimes.map((module) => {
       if (!runtimeActive.includes(module.id)) {
-        const config = readConfig(configRoot(runtime.cwd));
-        return config === null
-          ? `  - ${module.id} 未注册（本项目未初始化）`
+        if (reportConfig === null) return `  - ${module.id} 未注册（本项目未初始化或配置根无法解析）`;
+        // "off" and "never chosen, declared off" are different facts: one is a
+        // decision this project made, the other a gate it never opted into.
+        return resolveSwitch(reportConfig, module.id, module.newSwitchDefault).source === "defaulted"
+          ? `  - ${module.id} 未注册（该模块声明默认关闭，本项目未选择）`
           : `  - ${module.id} 未注册（本项目把该模块关掉了）`;
       }
       if (module.alwaysActive) return `  = ${module.id} 常驻`;
@@ -420,7 +452,7 @@ function runtimeReport(): string | null {
 function activateSession(): void {
   for (const module of MODULES) {
     if (!module.onSessionActivate || sessionActivated.includes(module.id)) continue;
-    if (!isEnabled(readConfig(configRoot(runtime.cwd)), module.id)) continue;
+    if (!isEnabled(readConfigAt(runtime.configRoots, runtime.cwd), module.id, module.newSwitchDefault)) continue;
     try {
       module.onSessionActivate(runtimeHost!, runtime);
       sessionActivated.push(module.id);
@@ -439,21 +471,53 @@ function runSetup(args: string, ctx: CommandContext, forceDry: boolean): string 
   if (parsed.error) return parsed.error;
 
   const cwd = ctx.cwd ?? process.cwd();
-  const root = gitRoot(cwd);
   const dry = forceDry || parsed.dry;
+
+  // The root this report must not lie about: a resolution that failed is a third
+  // state, and every number after this point would otherwise describe a
+  // directory nothing confirmed — presented as if it were the project.
+  const resolution = runtime.configRoots.resolve(cwd);
+  if (resolution.kind === "unresolved") {
+    ctx.ui?.notify?.("配置根无法解析，未改动任何文件", "error");
+    return [
+      `${dry ? "体检（未改动任何文件）" : "初始化本项目"} — 配置根无法解析`,
+      `  x 配置根无法解析：git 读取失败（${resolution.reason}）`,
+      `  - 本会话不读取任何项目的 .pi/Coworkflow.json，也不把当前目录当成配置根`,
+      `  - 因此这里不列出模块开关：它们没有可读的出处`,
+      `  → git 恢复后重试 /${NS}:init（或 /${NS}:status）`,
+    ].join("\n");
+  }
+
+  // The config root, not the worktree: a task worktree only carries committed
+  // files, so writing the config there would put the switches somewhere no gate
+  // reads.
+  const root = resolution.root;
   const existing = readConfig(root);
   const firstInstall = existing === null;
 
-  // Switches: an uninitialized project defaults to everything on, so one init
-  // installs the whole layer; `--enable`/`--disable` then persist. A module
-  // missing from an existing config is one that was added later, so it starts
-  // on as well — `isEnabled` treats only an explicit `false` as off.
+  // Switches: `--enable`/`--disable` persist, an explicit value in an existing
+  // config always wins, and a key it does not name belongs to a module added
+  // after that config was written — so the module's declaration decides ('on'
+  // for a layer that only observes or records, 'off' for one that can refuse
+  // work and must be opted into). A project with no config has named nothing at
+  // all, which is the same case, so there is one rule and no exception.
+  // `chosen` keeps the difference for the report; the map written below is full.
   const switches: Record<string, boolean> = {};
-  for (const id of ALL_IDS) {
-    switches[id] = firstInstall ? true : isEnabled(existing, id);
+  const chosen: Record<string, boolean> = {};
+  const stored: WorkflowConfig = existing ?? { version: 1, modules: {} };
+  for (const module of MODULES) {
+    const resolved = resolveSwitch(stored, module.id, module.newSwitchDefault);
+    switches[module.id] = resolved.on;
+    if (resolved.source === "chosen") chosen[module.id] = resolved.on;
   }
-  for (const id of parsed.enable) switches[id] = true;
-  for (const id of parsed.disable) switches[id] = false;
+  for (const id of parsed.enable) {
+    switches[id] = true;
+    chosen[id] = true;
+  }
+  for (const id of parsed.disable) {
+    switches[id] = false;
+    chosen[id] = false;
+  }
 
   const autoEnable = parsed.autoEnable ?? existing?.autoEnable === true;
   const prefix =
@@ -461,16 +525,29 @@ function runSetup(args: string, ctx: CommandContext, forceDry: boolean): string 
   const enabled = MODULES.filter((module) => switches[module.id] === true);
   // Only a module that was on and is now off has artifacts to take back.
   const switchedOff = MODULES.filter(
-    (module) => switches[module.id] !== true && isEnabled(existing, module.id),
+    (module) => switches[module.id] !== true && isEnabled(existing, module.id, module.newSwitchDefault),
   );
+
+  // The switch line reports what was *chosen*: a key that is absent from the
+  // config, or was left at its declared default this run, is marked `（默认）`
+  // rather than printed as a decision the project never made.
+  const switchLine = describeSwitches({ version: 1, modules: chosen }, MODULES);
 
   const blocks: string[] = [
     `${dry ? "体检（未改动任何文件）" : firstInstall ? "初始化本项目" : "刷新本项目"} — ${root}`,
     `  配置: ${configPath(root)}${firstInstall ? "（不存在）" : ""}`,
-    `  开关: ${describeSwitches({ version: 1, modules: switches }, ALL_IDS)}`,
+    `  开关: ${switchLine}`,
     `  自动加载: ${autoEnable ? "on（新会话直接加载 Coworkflow）" : `off（新会话需 /${NS}:start）`}`,
   ];
   const totals: Partial<Record<Status, number>> = {};
+
+  // A linked worktree is where the user stands and also not where the gates read
+  // the config from, so the report says both. The `no-repo` answer already has its
+  // own warning below (`不是 git 仓库根`), and `unresolved` returned above.
+  if (resolution.kind === "resolved") {
+    const note = configRootNote(resolution, root);
+    if (note) blocks.push(`  = ${note}`);
+  }
 
   const trust = trustLine(ctx);
   if (trust) {
@@ -613,7 +690,11 @@ function runSetup(args: string, ctx: CommandContext, forceDry: boolean): string 
 
 function runStart(args: string, ctx: CommandContext): string {
   const cwd = ctx.cwd ?? process.cwd();
-  const root = configRoot(cwd);
+  const resolved = runtime.configRoots.resolve(cwd);
+  if (resolved.kind === "unresolved") {
+    return `配置根无法解析：git 读取失败（${resolved.reason}）。本次不改会话状态：${NS}:start 需要先确认项目配置所在的 checkout。`;
+  }
+  const root = resolved.root;
   const config = readConfig(root);
   const action = args.trim().toLowerCase() || "on";
 
@@ -699,25 +780,48 @@ function sessionFileOf(ctx: any): string | null {
 
 /** The control surface the panels use; same operations as the slash commands. */
 function createControl(): WorkflowControl {
-  const rootOf = (): string => configRoot(runtime.cwd);
+  // The resolver is the runtime's own, so a panel that reads five values in one
+  // render resolves `git` zero times after the first call, and an unresolvable
+  // root is a state these methods report instead of a directory they invent.
+  const rootOf = (): string | null => runtime.configRoots.root(runtime.cwd);
+  const unresolved = (): string => {
+    const resolved = runtime.configRoots.resolve(runtime.cwd);
+    return `配置根无法解析：git 读取失败（${resolved.kind === "unresolved" ? resolved.reason : "未知原因"}）——本次不改动任何文件`;
+  };
   return {
-    initialized: () => readConfig(rootOf()) !== null,
+    initialized: () => {
+      const root = rootOf();
+      return root !== null && readConfig(root) !== null;
+    },
     switches: () => {
-      const config = readConfig(rootOf());
+      const root = rootOf();
+      const config = root === null ? null : readConfig(root);
       const switches: Record<string, boolean> = {};
-      for (const id of ALL_IDS) switches[id] = isEnabled(config, id);
+      for (const module of MODULES) switches[module.id] = isEnabled(config, module.id, module.newSwitchDefault);
       return switches;
     },
     moduleIds: () => ALL_IDS,
-    autoEnable: () => readConfig(rootOf())?.autoEnable === true,
-    prefix: () => readConfig(rootOf())?.worktreePrefix ?? installedPrefix(rootOf()) ?? DEFAULT_PREFIX,
+    configRoot: () => rootOf(),
+    configRootNote: () => configRootNote(runtime.configRoots.resolve(runtime.cwd), runtime.cwd),
+    autoEnable: () => {
+      const root = rootOf();
+      return root !== null && readConfig(root)?.autoEnable === true;
+    },
+    prefix: () => {
+      const root = rootOf();
+      if (root === null) return DEFAULT_PREFIX;
+      return readConfig(root)?.worktreePrefix ?? installedPrefix(root) ?? DEFAULT_PREFIX;
+    },
     facts: () => {
       const root = rootOf();
-      const config = readConfig(root);
+      const config = root === null ? null : readConfig(root);
       const own = readUserConfig()?.maxActiveAsyncRunsPerSession ?? null;
       const activity = runtimeHost ? existingSubagentsBridge(runtimeHost)?.activity() : undefined;
+      const rootLine = root === null
+        ? `配置: 无法解析配置根（git 读取失败）；本会话不读取任何项目的 .pi/Coworkflow.json`
+        : `配置: ${configPath(root)}${config === null ? "（不存在）" : ""}`;
       return [
-        `配置: ${configPath(root)}${config === null ? "（不存在）" : ""}`,
+        rootLine,
         `初始化于: ${config?.installedAt ?? "-"}`,
         `本会话: ${runtime.enabled ? "已加载" : `未加载（/${NS}:start）`}`,
         `pi-subagents 自身上限: ${own === null ? "不限（用户级配置）" : `${own}（用户级配置）`}`,
@@ -728,6 +832,7 @@ function createControl(): WorkflowControl {
     setSwitch: (id, on) => {
       if (!ALL_IDS.includes(id)) return `未知模块：${id}`;
       const root = rootOf();
+      if (root === null) return unresolved();
       const config = readConfig(root);
       if (config === null) return `本项目未初始化：先 /${NS}:init`;
       const switches = { ...config.modules, [id]: on };
@@ -765,9 +870,16 @@ function createControl(): WorkflowControl {
       return `${id} → ${on ? "on" : "off"}`;
     },
     loadState: () => runtime.loadState,
-    moduleEnabled: (id) => isEnabled(readConfig(rootOf()), id),
+    moduleEnabled: (id) => {
+      const root = rootOf();
+      // The module's own declaration decides an absent key, exactly as it does
+      // for a gate evaluation: a module added by a later version must read the
+      // same state here as the hook that acts on it.
+      return root !== null && isEnabled(readConfig(root), id, findModule(id)?.newSwitchDefault);
+    },
     setAutoEnable: (on) => {
       const root = rootOf();
+      if (root === null) return unresolved();
       const config = readConfig(root);
       if (config === null) return `本项目未初始化：先 /${NS}:init`;
       writeConfig(root, { ...config, ...(on ? { autoEnable: true } : { autoEnable: false }) });
@@ -778,6 +890,7 @@ function createControl(): WorkflowControl {
     setPrefix: (value) => {
       if (!PREFIX_RE.test(value)) return `前缀只允许 [A-Za-z0-9._-]：${value}`;
       const root = rootOf();
+      if (root === null) return unresolved();
       const config = readConfig(root);
       if (config === null) return `本项目未初始化：先 /${NS}:init`;
       // A prefix is one value in the config plus one line in the hook script.
@@ -798,9 +911,13 @@ function createControl(): WorkflowControl {
       }
       return `worktree 前缀 → ${value}（钩子已更新；已在运行的 worktree 不受影响）`;
     },
-    subagentConcurrency: () => readConfig(rootOf())?.subagentConcurrency ?? null,
+    subagentConcurrency: () => {
+      const root = rootOf();
+      return root === null ? null : readConfig(root)?.subagentConcurrency ?? null;
+    },
     setSubagentConcurrency: (value) => {
       const root = rootOf();
+      if (root === null) return unresolved();
       const config = readConfig(root);
       if (config === null) return `本项目未初始化：先 /${NS}:init`;
       const next: WorkflowConfig = { ...config };
@@ -811,7 +928,7 @@ function createControl(): WorkflowControl {
         ? "子 agent 并发上限 → 不限（本项目；不再拦截派单）"
         : `子 agent 并发上限 → ${value}（本项目；由 Coworkflow 在派单时拦截）`;
     },
-    init: (args) => runSetup(args, { cwd: rootOf() }, false),
+    init: (args) => runSetup(args, { cwd: rootOf() ?? runtime.cwd }, false),
   };
 }
 
@@ -834,6 +951,10 @@ export default function coworkflowExtension(pi: PiRuntimeHost): void {
   runtimeErrors.length = 0;
   const isChild =
     process.env.PI_SUBAGENT_CHILD === "1" || process.env.TRELLIS_SUBAGENT_CHILD === "1";
+  // One resolver per extension runtime, never process-global: a lane or worktree
+  // session resolves its own main checkout, and a replacement session starts from
+  // a clean answer because the key includes `sessionEpoch`.
+  const configRoots = createConfigRootResolver({ epoch: () => runtime.sessionEpoch });
   runtime = {
     isChild,
     enabled: false,
@@ -843,6 +964,7 @@ export default function coworkflowExtension(pi: PiRuntimeHost): void {
     sessionId: process.env.PI_SESSION_ID ?? null,
     parentSessionId: process.env.PI_SUBAGENT_PARENT_SESSION ?? null,
     sessionEpoch: 0,
+    configRoots,
     control: createControl(),
   };
 
@@ -899,6 +1021,10 @@ export default function coworkflowExtension(pi: PiRuntimeHost): void {
     runtime.sessionEpoch += 1;
     if (id) runtime.sessionId = id;
     runtime.cwd = cwd;
+    // The session boundary is where a stale root must not survive: the epoch in
+    // the resolver key already forces a re-resolution, and dropping the memo here
+    // makes that explicit rather than incidental.
+    runtime.configRoots.invalidate();
     const resolved = resolveLoadState(cwd);
     runtime.enabled = resolved.enabled;
     runtime.loadState = resolved.state;

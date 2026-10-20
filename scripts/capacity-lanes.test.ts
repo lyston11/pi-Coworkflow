@@ -10,6 +10,7 @@ import { laneWorktreeModule } from "../modules/lane-worktree/index.ts";
 import { existingSubagentsBridge } from "../core/subagents-client.ts";
 import { NATIVE_RUNS_FILE, readTaskLinks } from "../core/subagents-workflow.ts";
 import { contextKeyFor, SESSIONS_DIR } from "../core/trellis.ts";
+import { createConfigRootResolver } from "../core/config.ts";
 
 const taskRef = ".trellis/tasks/demo";
 function harness(voidOn = false) {
@@ -70,6 +71,9 @@ function harness(voidOn = false) {
     },
   };
   const runtime = { cwd: root, sessionId, sessionEpoch: 1, enabled: true, isChild: false, refresh() {},
+    // The temp directory is not a repository: `no-repo` resolves to itself, which
+    // is what the lane ledger's project gate has always read.
+    configRoots: createConfigRootResolver(),
     control: { moduleEnabled: (id: string) => switches.has(id), subagentConcurrency: () => limit } } as RuntimeContext;
   const ctx = () => ({ cwd: root, mode: "tui", sessionManager: { getSessionId: () => runtime.sessionId } });
   capacityModule.activate!(host, runtime);
@@ -311,4 +315,67 @@ test("own RPC command and direct async tools share admission before the spawn re
     await h.commands.get("Coworkflow:run")!.handler("", h.ctx());
     assert.equal(h.requests.filter((request) => request.method === "spawn").length, 1, "own command obeys the same limit");
   } finally { subagentsModule.onSessionEnd!(h.host, h.runtime); h.close(); }
+});
+
+test("lanes: exit state prints cleanup only when the branch is merged and the worktree is clean", async () => {
+  const h = harness(); h.limit(null);
+  const env = { ...process.env, GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@test",
+    GIT_COMMITTER_NAME: "Fixture", GIT_COMMITTER_EMAIL: "fixture@test" };
+  const git = (cwd: string, args: string[], input?: string) => execFileSync("git", ["-C", cwd, ...args],
+    { encoding: "utf8", input, stdio: ["pipe", "pipe", "pipe"], env }).trim();
+  const fingerprint = () => JSON.stringify({
+    refs: git(h.root, ["for-each-ref"]),
+    worktrees: git(h.root, ["worktree", "list", "--porcelain"]),
+    main: git(h.root, ["status", "--porcelain", "--untracked-files=normal"]),
+  });
+  try {
+    git(h.root, ["init", "-b", "main"]);
+    writeFileSync(join(h.root, "base.txt"), "base\n");
+    git(h.root, ["add", "base.txt"]);
+    git(h.root, ["commit", "-m", "base"]);
+    const worktree = join(h.root, "task tree");
+    git(h.root, ["worktree", "add", "-b", "task", worktree]);
+    const taskFile = join(h.root, taskRef, "task.json");
+    writeFileSync(taskFile, JSON.stringify({ worktree_path: worktree, branch: "task", base_branch: "main" }));
+    writeFileSync(join(worktree, "work.txt"), "work\n");
+    git(worktree, ["add", "work.txt"]);
+    git(worktree, ["commit", "-m", "task work"]);
+
+    // Unmerged: a clean worktree is not enough, and the ahead count is reported.
+    const unmerged = await h.lanes();
+    assert.match(unmerged, /尚未合并进 main（还领先 1 个提交）/);
+    assert.match(unmerged, /不提供清理命令: 前提未满足 —— 分支 task 未合并进 main/);
+    assert.doesNotMatch(unmerged, /worktree remove/);
+    assert.doesNotMatch(unmerged, /branch -[dD]/);
+
+    // Merged but dirty: still no command, and the dirty precondition is named.
+    git(h.root, ["merge", "--ff-only", "task"]);
+    writeFileSync(join(worktree, "work.txt"), "uncommitted\n");
+    const dirty = await h.lanes();
+    assert.match(dirty, /已合并进 main（领先 0 个提交）/);
+    assert.match(dirty, /工作树状态: 1 处未提交改动/);
+    assert.match(dirty, /不提供清理命令: 前提未满足 —— 工作树有 1 处未提交改动/);
+    assert.doesNotMatch(dirty, /worktree remove/);
+    assert.doesNotMatch(dirty, /branch -[dD]/);
+
+    // Merged and clean: the exact commands, with no forced variants anywhere.
+    git(worktree, ["checkout", "--", "work.txt"]);
+    const before = fingerprint();
+    const clean = await h.lanes();
+    assert.match(clean, /分支 task: 已合并进 main（领先 0 个提交）/);
+    assert.match(clean, /工作树状态: 干净，没有未提交的改动/);
+    assert.ok(clean.includes(`git -C '${h.root}' worktree remove '${worktree}'`), clean);
+    assert.ok(clean.includes(`git -C '${h.root}' branch -d 'task'`), clean);
+    assert.doesNotMatch(clean, /--force|\s-D\s/, "never suggests a forced removal");
+    assert.equal(fingerprint(), before, "rendering the report mutates no repository state");
+
+    // A recorded worktree that is gone is stated, and prints nothing destructive.
+    writeFileSync(taskFile, JSON.stringify({ worktree_path: join(h.root, "gone tree"), branch: "task", base_branch: "main" }));
+    const missing = await h.lanes();
+    assert.match(missing, /worktree: 未满足前提 —— .*不存在或不是目录/);
+    assert.match(missing, /任务 worktree 前提未满足/);
+    assert.doesNotMatch(missing, /worktree remove/);
+    assert.doesNotMatch(missing, /branch -[dD]/);
+    assert.equal(fingerprint(), before, "a failed precondition leaves the repository untouched");
+  } finally { h.close(); }
 });

@@ -14,6 +14,7 @@
 import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { ConfigRootResolver, SwitchDefault } from "./config.ts";
 
 export type Status = "created" | "updated" | "ok" | "skipped" | "warn" | "error";
 
@@ -51,6 +52,20 @@ export interface WorkflowModule {
   id: string;
   /** One-line description rendered as the module's report header. */
   title: string;
+  /**
+   * What an *absent* switch key means for this module in a project that has
+   * never chosen for it — that is, a project whose config was written before
+   * this module existed. `"on"` (the default) for a module that only observes,
+   * records, or adds a capability: it starts working by itself, the way every
+   * module added so far did.
+   *
+   * A module that can *refuse* work declares `"off"`: a dispatch gate, an
+   * admission limit, a validator. An upgrade must never silently begin policing
+   * a project that never opted in, so the answer is taken from what the code
+   * does, not from the module's name. An explicit value in the project's config
+   * always wins over this declaration in both directions.
+   */
+  newSwitchDefault?: SwitchDefault;
   /**
    * Install-time layer: files and registrations written into the project.
    * Omitted by modules that only contribute runtime behaviour.
@@ -278,6 +293,17 @@ export interface RuntimeContext {
    */
   loadState: "child" | "off" | "auto" | "started";
   /**
+   * The configuration root for this runtime, resolved once and reused.
+   *
+   * Modules must read the project config through this instead of calling
+   * `configRoot(cwd)` themselves: gates run on every `tool_call` and
+   * `before_agent_start`, and the uncached call spawns `git` each time. The
+   * resolver is keyed on cwd and `sessionEpoch`, so a session replacement or a
+   * lane/worktree switch re-resolves by itself, and an answer it cannot
+   * establish is reported as `unresolved` rather than as the current directory.
+   */
+  configRoots: ConfigRootResolver;
+  /**
    * Re-read the session switch from disk.
    *
    * `/reload` and session switches race with cached state: the flag is written by
@@ -303,6 +329,15 @@ export interface WorkflowControl {
   /** Module id → switch, for every module the build knows about. */
   switches(): Record<string, boolean>;
   moduleIds(): string[];
+  /**
+   * The configuration root this runtime resolved, or `null` when it could not.
+   *
+   * Read from the per-runtime resolver, so a panel or a module asking twice in a
+   * turn spawns nothing the second time.
+   */
+  configRoot(): string | null;
+  /** Why the root is what it is, or `null` for the ordinary case. */
+  configRootNote(): string | null;
   autoEnable(): boolean;
   prefix(): string;
   /** Read-only lines describing the project, for the settings panel. */

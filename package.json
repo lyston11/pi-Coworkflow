@@ -40,7 +40,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test scripts/test.ts scripts/upstream-bridge.test.ts scripts/runtime-lifecycle.test.ts scripts/capacity-lanes.test.ts scripts/usage.test.ts",
+    "test": "node --experimental-strip-types --test scripts/test.ts scripts/upstream-bridge.test.ts scripts/runtime-lifecycle.test.ts scripts/capacity-lanes.test.ts scripts/usage.test.ts scripts/config-root.test.ts scripts/switch-default.test.ts",
     "verify": "node --experimental-strip-types scripts/verify.ts"
   },
   "devDependencies": {

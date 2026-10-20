@@ -7,6 +7,16 @@
  *
  * Adding a layer means adding a directory under `modules/` and one line here —
  * nothing else in the package knows about the individual modules.
+ *
+ * A new module also states `newSwitchDefault` when it is a *gate* rather than a
+ * capability: what an absent switch key means in a project whose config was
+ * written before the module existed. The default is `"on"`, which is right for
+ * a module that only observes, records, or adds something — an upgrade may start
+ * those by itself. A module that can refuse work (block a dispatch, enforce a
+ * limit, reject a plan) declares `"off"`, so it never begins policing a project
+ * that did not opt in. Today every module keeps `"on"`: `capacity` is the one
+ * that would declare `"off"` if it were added now, and changing it here would
+ * alter what an existing config means, which this rule must never do.
  */
 
 import type { WorkflowModule } from "../core/module.ts";

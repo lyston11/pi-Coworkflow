@@ -29,7 +29,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { ModuleContext, PiRuntimeHost, RuntimeContext } from "../../core/module.ts";
 import { fileContext } from "../../core/module.ts";
-import { configRoot, readConfig } from "../../core/config.ts";
+import { readConfigAt } from "../../core/config.ts";
 import { setSessionFlag } from "../../core/trellis.ts";
 import {
   collectUsageHistory,
@@ -792,7 +792,9 @@ export function registerModelPanel(host: PiRuntimeHost, runtime: RuntimeContext)
     if (!runtime.enabled || !runtime.control.moduleEnabled("panel")) {
       // `/reload` re-loads extensions but not the session switch, so "not loaded"
       // here is expected rather than a broken install. Say which it is.
-      const initialized = readConfig(configRoot(runtime.cwd)) !== null;
+      // Through the runtime resolver: the panel re-renders often, and this must
+      // not spawn `git` per render.
+      const initialized = readConfigAt(runtime.configRoots, runtime.cwd) !== null;
       const message = !initialized
         ? "本项目未初始化：先运行 /Coworkflow:init"
         : !runtime.control.moduleEnabled("panel") ? "本项目 panel 模块已关闭"

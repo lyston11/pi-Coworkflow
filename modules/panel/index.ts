@@ -44,7 +44,6 @@
  */
 
 import type { PiRuntimeHost, RuntimeContext, WorkflowModule } from "../../core/module.ts";
-import { configRoot, readConfig } from "../../core/config.ts";
 import { registerModelPanel } from "./models.ts";
 import { registerSettingsPanel } from "./settings.ts";
 

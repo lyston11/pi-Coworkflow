@@ -26,6 +26,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 
+import { createConfigRootResolver } from "../core/config.ts";
+
 const here = (rel: string): string => new URL(rel, import.meta.url).pathname;
 
 function tempProject(): string {
@@ -284,6 +286,7 @@ async function childHarness(options: {
     parentSessionId: options.parentSessionId ?? null,
     sessionEpoch: 1,
     refresh: () => {},
+    configRoots: createConfigRootResolver(),
     control: { moduleEnabled: () => moduleOn },
   };
   module.subagentContextModule.activate?.(host as never, runtime as never);

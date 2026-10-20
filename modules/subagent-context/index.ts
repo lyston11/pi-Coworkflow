@@ -57,9 +57,7 @@ import { statSync } from "node:fs";
 import {
   activeTaskDir,
   buildRoleContext,
-  mainCheckout,
   readSubagentGuide,
-  repoRoot,
   resolveTaskDir,
   stripManagedRegion,
   stripManagedRegionFromPrompt,
@@ -310,8 +308,12 @@ function buildPrompt(
   ctx: any,
 ): { systemPrompt?: string } | undefined {
   const cwd = typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : runtime.cwd;
-  // Read from the main checkout: a lane worktree only holds committed state.
-  const root = mainCheckout(repoRoot(cwd));
+  // Read from the main checkout: a lane worktree only holds committed state. The
+  // runtime's resolver answers this from cache, so a per-run `before_agent_start`
+  // does not spawn `git`, and an answer git could not establish is `null` rather
+  // than "whichever directory this run started in".
+  const root = runtime.configRoots.root(cwd);
+  if (root === null) return undefined;
   // Read at call time: a child is renamed after dispatch, so a name captured at
   // load would be stale by the first run.
   const sessionName = host.getSessionName?.();
