@@ -623,3 +623,68 @@ test("panel: the logic half imports without the host UI packages", async () => {
     assert.match(text, /await import\("\.\/(settings|models)-panel\.ts"\)/, `${name} loads its renderer lazily`);
   }
 });
+
+/**
+ * "The files are on disk" must never be reported as "reusable".
+ *
+ * A real session proved the difference: pi-subagents sat in Pi's npm directory, no
+ * settings file declared it, so the session had no `subagent` tool — while this module
+ * reported `复用已安装…未安装任何东西` and wrote nothing. Pi loads a package only when a
+ * settings file declares it, so a downloaded-but-undeclared package is a state that
+ * needs writing a declaration, not a state that needs nothing.
+ */
+test("subagents: downloaded-but-undeclared is not reuse, and it gets declared", async () => {
+  const { subagentsModule } = await import("../modules/subagents/index.ts");
+  const { subagentsPackageDir } = await import("../core/pi-subagents.ts");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cw-subagents-"));
+  const agentDir = path.join(root, "agent");
+  fs.mkdirSync(path.join(root, ".pi"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".pi", "settings.json"), JSON.stringify({ packages: [] }));
+
+  const reports: Array<[string, string]> = [];
+  const ctx: any = {
+    root,
+    dry: false,
+    // Relative paths are project-relative, exactly as the real module context reads
+    // them; reading them against process.cwd() silently picked up this repo's own
+    // settings and made the "declared" branch fire in a temp project.
+    read: (p: string) => {
+      try {
+        return fs.readFileSync(path.isAbsolute(p) ? p : path.join(root, p), "utf-8");
+      } catch {
+        return null;
+      }
+    },
+    write: (p: string, text: string) => fs.writeFileSync(path.isAbsolute(p) ? p : path.join(root, p), text),
+    report: (level: string, message: string) => reports.push([level, message]),
+  };
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    // What is on disk decides which branch runs; either way only a settings file may
+    // produce the "reuse" report.
+    const downloaded = fs.existsSync(path.join(subagentsPackageDir(), "package.json"));
+    subagentsModule.apply?.(ctx);
+    const written = JSON.parse(fs.readFileSync(path.join(root, ".pi", "settings.json"), "utf-8"));
+    const declared = (written.packages ?? []).some((entry: string) => /pi-subagents/.test(String(entry)));
+    const said = reports.map(([, message]) => message).join("\n");
+    // Either the package is not on disk in this environment (then it is declared as a
+    // fresh install) or it is present and undeclared (then the report says so).
+    assert.ok(declared, `a declaration is written: ${said}`);
+    assert.ok(
+      /复用已安装/.test(said) === false || /来自用户级|来自项目级/.test(said),
+      `reuse is claimed only for a declared package: ${said}`,
+    );
+    if (downloaded) {
+      assert.match(said, /没有任何 settings 声明|没有被任何 settings 声明/, "a downloaded-only package is named as such");
+    }
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -104,13 +104,28 @@ function writeObject(ctx: ModuleContext, path: string, value: JsonObject): void 
 }
 
 /** Where `pi-subagents` is already available, if anywhere. */
-function detect(ctx: ModuleContext): string | null {
+/**
+ * Where pi-subagents stands, as three different facts.
+ *
+ * "The files are on disk" is not one of them being usable: Pi loads a package only
+ * when a settings file **declares** it. A real session proved the difference — the
+ * package sat in Pi's npm directory, nothing declared it, so no `subagent` tool
+ * existed, while this module reported `复用已安装…未安装任何东西` and wrote nothing. A
+ * green report over an absent tool is the failure this package keeps having to
+ * remove, so the states are separated here instead of collapsed into "found".
+ */
+type PackageState =
+  | { state: "declared"; where: "用户级 settings.json" | "项目级 .pi/settings.json" }
+  | { state: "downloaded-only" }
+  | { state: "absent" };
+
+function packageState(ctx: ModuleContext): PackageState {
   const userSettings = readObject(ctx, userSettingsPath());
-  if (declaresPackage(userSettings)) return "用户级 settings.json";
+  if (declaresPackage(userSettings)) return { state: "declared", where: "用户级 settings.json" };
   const projectSettings = readObject(ctx, PROJECT_SETTINGS);
-  if (declaresPackage(projectSettings)) return "项目级 .pi/settings.json";
-  if (ctx.read(join(subagentsPackageDir(), "package.json")) !== null) return "Pi 的 npm 目录";
-  return null;
+  if (declaresPackage(projectSettings)) return { state: "declared", where: "项目级 .pi/settings.json" };
+  if (ctx.read(join(subagentsPackageDir(), "package.json")) !== null) return { state: "downloaded-only" };
+  return { state: "absent" };
 }
 
 function declaresPackage(settings: JsonObject | null): boolean {
@@ -257,14 +272,16 @@ export const subagentsModule: WorkflowModule = {
   },
 
   apply(ctx: ModuleContext): void {
-    const found = detect(ctx);
-    if (found) {
-      const version = installedVersion();
-      ctx.report("ok", `复用已安装的 ${PACKAGE}${version ? ` v${version}` : ""}（来自${found}），未安装任何东西`);
+    const found = packageState(ctx);
+    const version = installedVersion();
+    if (found.state === "declared") {
+      ctx.report("ok", `复用已安装的 ${PACKAGE}${version ? ` v${version}` : ""}（来自${found.where}），未安装任何东西`);
     } else if (ctx.dry) {
       ctx.report(
         "created",
-        `把 ${PACKAGE_SPEC} 声明到项目 .pi/settings.json 的 packages（项目级安装；Pi 下次启动时拉取，需要项目信任）`,
+        found.state === "downloaded-only"
+          ? `${PACKAGE} 的文件已在 Pi 的 npm 目录里，但没有任何 settings 声明它 —— 把那一条声明写进项目 .pi/settings.json 的 packages（否则 Pi 不会加载它，subagent 工具也就不存在；需要项目信任 + 重开 Pi）`
+          : `把 ${PACKAGE_SPEC} 声明到项目 .pi/settings.json 的 packages（项目级安装；Pi 下次启动时拉取，需要项目信任）`,
       );
     } else {
       const settings = readObject(ctx, PROJECT_SETTINGS);
@@ -275,7 +292,9 @@ export const subagentsModule: WorkflowModule = {
       writeObject(ctx, PROJECT_SETTINGS, settings);
       ctx.report(
         "created",
-        `${PACKAGE_SPEC} 声明到项目 .pi/settings.json 的 packages（项目级；Pi 下次启动时拉取，需要项目信任才加载）`,
+        found.state === "downloaded-only"
+          ? `${PACKAGE} 的文件已在 Pi 的 npm 目录里，但没有被任何 settings 声明，所以它从未加载过（这正是本会话没有 subagent 工具的原因）。现已把 ${PACKAGE_SPEC} 写进项目 .pi/settings.json 的 packages：重开 Pi 后生效，且需要项目受信任`
+          : `${PACKAGE_SPEC} 声明到项目 .pi/settings.json 的 packages（项目级；Pi 下次启动时拉取，需要项目信任才加载）`,
       );
     }
 
