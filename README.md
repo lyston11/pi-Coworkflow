@@ -431,6 +431,11 @@ Pi 把 `.pi/settings.json`、`.pi/extensions`、`.pi/agents` 等当作**受信�
    ⚠️ `toolActivation` **不在** `settings.json` 的 `subagents` 下。写在那里不会被读取——这一点在这个
    包里曾经写错过，代价是反复重启加一次误诊。本包只**报告**它，不替你写。
 
+   **恢复旧会话这一半由本包自己修**：如果 `subagent` 是「已配置但未激活」（包加载了，只是历史里没有），
+   本会话启动时会重新声明它，`/Coworkflow:status` 会显示
+   `~ subagents: 本会话历史里没有 subagent（恢复旧会话），已重新声明该工具`。
+   只有「根本没配置」才需要你动手——那时状态行会给出声明检查的结果。
+
 3. **必须重开 Pi。** `toolActivation` 在会话启动时读取，`/reload` 不够——`/reload` 也换不掉 Node 已经
    加载过、或已经失败过的扩展模块。改完配置要新起一个 Pi 进程。
 

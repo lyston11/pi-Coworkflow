@@ -933,3 +933,35 @@ test("status: the declaration finding says which file declares it, or that none 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+/**
+ * A resumed session whose history predates pi-subagents restores a tool list without
+ * `subagent`: the tool is configured (so the package is loaded) but inactive, and every
+ * dispatch instruction becomes impossible to follow. Re-declaring it is what enabling
+ * this module already asked for, and it removes the need for a CLI flag on every launch.
+ */
+test("subagents: a configured-but-inactive tool is re-declared; an absent one is not", async () => {
+  const { reactivateSubagentTool } = await import("../modules/subagents/index.ts");
+
+  const calls: string[][] = [];
+  const resumed: any = {
+    getActiveTools: () => ["read", "bash"],
+    getAllTools: () => [{ name: "read" }, { name: "subagent", exposure: "model-only" }],
+    setActiveTools: (names: string[]) => calls.push(names),
+  };
+  assert.match(String(reactivateSubagentTool(resumed)), /重新声明/);
+  assert.deepEqual(calls, [["read", "bash", "subagent"]]);
+
+  // Already active: untouched, and no second declaration.
+  assert.equal(
+    reactivateSubagentTool({ getActiveTools: () => ["read", "subagent"], getAllTools: () => [], setActiveTools: () => { throw new Error("must not run"); } } as never),
+    null,
+  );
+  // Not configured at all: that is a missing install, not this repair.
+  assert.equal(
+    reactivateSubagentTool({ getActiveTools: () => ["read"], getAllTools: () => [{ name: "read" }], setActiveTools: () => { throw new Error("must not run"); } } as never),
+    null,
+  );
+  // Host cannot report: silence rather than a guess.
+  assert.equal(reactivateSubagentTool({} as never), null);
+});

@@ -263,6 +263,17 @@ export interface PiRuntimeHost {
    * rule it could not have followed.
    */
   getActiveTools?(): string[];
+  /** Every configured tool, active or not, with its exposure. */
+  getAllTools?(): Array<{ name?: string; exposure?: string }>;
+  /**
+   * Set the tools declared to the model.
+   *
+   * Used for one narrow repair: a session resumed from history that predates pi-subagents
+   * gets its old tool list back, so a configured `subagent` tool is present but not
+   * active. Declaring it again is what the project already asked for by enabling the
+   * module; without it the only remedy is a CLI flag on every launch.
+   */
+  setActiveTools?(names: string[]): void;
   /** Model and thinking control; all session-scoped. */
   setModel?(model: unknown): Promise<boolean>;
   setThinkingLevel?(level: string): void;

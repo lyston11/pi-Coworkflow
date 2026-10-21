@@ -224,6 +224,27 @@ export function subagentToolAvailable(host: { getActiveTools?(): string[] }): bo
   return tools.includes("subagent");
 }
 
+/**
+ * Re-declare a configured-but-inactive `subagent` tool.
+ *
+ * A session resumed from history that predates pi-subagents restores that history's tool
+ * list, so a tool the project has configured sits present-but-inactive and every dispatch
+ * instruction in the managed region becomes impossible to follow. The remedy used to be
+ * `--tools +subagent,…` on every launch; the host can simply declare it again, which is
+ * what enabling this module already asked for.
+ *
+ * Deliberately narrow: only when the tool is *configured* (so the package is loaded) and
+ * *not active*. A tool that is not configured at all is a missing install, not this.
+ */
+export function reactivateSubagentTool(host: PiRuntimeHost): string | null {
+  const active = host.getActiveTools?.();
+  if (!Array.isArray(active) || active.includes("subagent")) return null;
+  const configured = host.getAllTools?.()?.some((tool) => tool?.name === "subagent");
+  if (configured !== true || typeof host.setActiveTools !== "function") return null;
+  host.setActiveTools([...active, "subagent"]);
+  return "  ~ subagents: 本会话历史里没有 subagent（恢复旧会话），已重新声明该工具";
+}
+
 export const subagentsModule: WorkflowModule = {
   id: "subagents",
   title: "subagent 层（复用已安装的 pi-subagents，缺失时项目级安装）",
@@ -232,6 +253,9 @@ export const subagentsModule: WorkflowModule = {
     if (runtime.isChild) return;
     const state = hostState(host);
     state.runtime = runtime;
+    // Remembered so `/status` can say the tool was re-declared rather than silently
+    // having changed the session's tool list.
+    state.revivedTool = reactivateSubagentTool(host) !== null;
     attachObservers(host, state, runtime);
     void syncSubagentsRuntime(host, runtime);
   },
@@ -302,6 +326,9 @@ export const subagentsModule: WorkflowModule = {
       ...missing,
       `  ${set?.workflow ? "=" : "-"} subagents: 工作流资源 ${WORKFLOW_NAME}、${FANOUT_NAME} ${set?.workflow ? `已注册${session}` : "未注册"}`,
       `  ${set?.children ? "=" : "-"} subagents: 子会话必需扩展 ${set?.children ? "已登记" : "未登记（subagent-context 关闭或本会话未加载 Coworkflow 时不登记）"}`,
+      ...(state.revivedTool
+        ? ["  ~ subagents: 本会话历史里没有 subagent（恢复旧会话），已重新声明该工具"]
+        : []),
       ...(set?.failure === undefined ? [] : [`  x subagents: ${set.failure}`]),
       ...overlapLine(state),
     ];
@@ -421,6 +448,8 @@ export const subagentsModule: WorkflowModule = {
 interface HostState {
   /** Bumped whenever the registrations we want are withdrawn or the session ends. */
   generation: number;
+  /** True when this session's restored tool list lacked `subagent` and it was re-declared. */
+  revivedTool?: boolean;
   /** The set we currently want, and the promise that builds it. */
   current: RegistrationSet | null;
   /** Hooks this module attached for this host, released on session end. */
