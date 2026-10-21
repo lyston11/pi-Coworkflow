@@ -71,6 +71,18 @@ export interface SettingsPanelIo {
  * and — because the narrow label column cannot hold a sentence — truncates exactly
  * the part that explains what went wrong.
  */
+/**
+ * The body is padded to a stable height.
+ *
+ * Pages have very different amounts of content — the 会话 page has two rows, the
+ * 模块 page nine — and without padding the panel changes size every time the tab bar
+ * is used, which makes the whole box jump under the reader's hands. Padded to the
+ * tallest page (bounded, so a long 状态 page cannot push it off screen) the frame
+ * stays put and only the contents change.
+ */
+const MIN_BODY_ROWS = 10;
+const MAX_BODY_ROWS = 16;
+
 export class SettingsPanel extends Container {
   private readonly io: SettingsPanelIo;
   private readonly theme: PanelTheme;
@@ -240,6 +252,26 @@ export class SettingsPanel extends Container {
     return new Text(line, 0, 0);
   }
 
+  /** Row count a page is padded to, so the frame does not resize on a page change. */
+  private targetRows(): number {
+    const tallest = Math.max(
+      MIN_BODY_ROWS,
+      ...this.tabNames().map((name) => this.all.filter((row) => (row.section ?? "") === name).length),
+    );
+    return Math.min(MAX_BODY_ROWS, tallest);
+  }
+
+  /** The visible slice of the active page, windowed around the cursor when it is long. */
+  private window(): { rows: SettingRow[]; start: number } {
+    const limit = this.targetRows();
+    if (this.rows.length <= limit) return { rows: this.rows, start: 0 };
+    const start = Math.min(
+      Math.max(0, this.cursor - Math.floor(limit / 2)),
+      Math.max(0, this.rows.length - limit),
+    );
+    return { rows: this.rows.slice(start, start + limit), start };
+  }
+
   private updateBody(): void {
     const theme = this.theme;
     const width = this.width ?? 100;
@@ -269,8 +301,12 @@ export class SettingsPanel extends Container {
         new Text(theme.fg("muted", this.query ? `  （没有匹配 “${this.query}” 的设置项）` : "  （本节没有内容）"), 0, 0),
       );
     }
-    for (let i = 0; i < this.rows.length; i += 1) {
-      const row = this.rows[i]!;
+    const view = this.window();
+    let painted = 0;
+    for (let offset = 0; offset < view.rows.length; offset += 1) {
+      const row = view.rows[offset]!;
+      const i = view.start + offset;
+      painted += 1;
       if (row.prose) {
         // Full width, wrapped by the terminal rather than truncated: the reason a kind
         // failed to register is the whole point of the line.
@@ -293,6 +329,14 @@ export class SettingsPanel extends Container {
         const detail = this.cell(row.detail ?? "", widths.detail);
         this.body.addChild(new Text(`${pointer}${labelCell}${sep}${valueCell}${sep}${this.paint(detail, "dim")}`, 0, 0));
       }
+    }
+    // Pad to the page's stable height: the frame must not resize when the tab bar is
+    // used, and an empty line is cheaper than a panel that jumps.
+    // `Text("")` and `Text(" ")` both render zero lines (pi-tui trims), so the pad has
+    // to be a Spacer: an "empty" Text silently kept the body short and the frame went
+    // on resizing between pages.
+    for (let pad = painted; pad < this.targetRows(); pad += 1) {
+      this.body.addChild(new Spacer(1));
     }
     this.statusText.setText(this.status ? theme.fg("success", this.status) : "");
   }

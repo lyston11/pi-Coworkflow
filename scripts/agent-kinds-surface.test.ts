@@ -272,6 +272,8 @@ interface PanelHarness {
   viewState(): { tab: string; focus: "item" | "value"; tabs: string[] };
   /** Labels the active tab is showing. */
   visible(): string[];
+  /** Rendered height at a given terminal width. */
+  height(width: number): number;
   /** Rows the active tab is showing, including prose rows. */
   rows(): Array<{ label: string; value: string; prose?: boolean; readOnly?: boolean }>;
   statuses: string[];
@@ -327,6 +329,7 @@ function panelFor(control: Parameters<typeof buildSettingRows>[0]): PanelHarness
       await settle();
     },
     viewState: () => panel.viewState(),
+    height: (width: number) => panel.render(width).length,
   /** Rows the active tab is showing, for the table's own navigation. */
   visible: () => panel.currentRows().map((row) => row.label),
     statuses,
@@ -820,3 +823,34 @@ test("panel: settings is one page per concern, with column switching and a filte
   }
 });
 
+
+/**
+ * The frame must not resize when the tab bar is used.
+ *
+ * Pages differ wildly in content — two rows on 会话, nine on 模块 — and without padding
+ * the whole box jumped under the reader's hands on every Tab. Padding with an "empty"
+ * Text does not work either: pi-tui trims it to zero lines, which is how the first
+ * attempt at this fix shipped looking like it did nothing.
+ */
+test("panel: every page renders the same number of lines", { skip }, async () => {
+  const { pi } = fakePi();
+  const root = tempProject({ auditor: { enabled: false } });
+  const loaded = await loadExtension(root, pi.events);
+  try {
+    await loaded.settled();
+    const panel = panelFor(loaded.control);
+    const heights: number[] = [];
+    const pages: string[] = [];
+    const tabs = panel.viewState().tabs.length;
+    for (let page = 0; page < tabs; page += 1) {
+      pages.push(panel.viewState().tab);
+      heights.push(panel.height(96));
+      await panel.press("\t");
+    }
+    assert.equal(new Set(heights).size, 1, `${pages.map((name, index) => `${name}=${heights[index]}`).join(" ")}`);
+    assert.ok((heights[0] ?? 0) >= 10, "the panel is not collapsed to its shortest page");
+  } finally {
+    loaded.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
