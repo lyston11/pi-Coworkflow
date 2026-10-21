@@ -896,6 +896,7 @@ test("status: a missing subagent tool states the declaration finding, not a chec
   assert.match(line, /packages/, "it names the key that decides whether a package loads");
   assert.match(line, /subagents_enable/, "dynamic activation exposes only the loader");
   assert.match(line, /exclude-tools/, "and the launch flag that sidesteps it");
+  assert.match(line, /--tools \+subagent/, "and the flag that adds the tool back to the restored list");
   assert.match(line, /toolActivation/, "and names the eager escape hatch");
   assert.match(line, /extensions\/subagent\/config\.json/, "at the path that is actually read, not settings.json");
   assert.match(line, /\/reload/, "it says a reload does not fix the restored tool list");

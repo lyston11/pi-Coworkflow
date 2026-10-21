@@ -404,26 +404,32 @@ Pi 把 `.pi/settings.json`、`.pi/extensions`、`.pi/agents` 等当作**受信�
 1. **被 settings 声明。** 文件躺在 `~/.pi/agent/npm/node_modules/pi-subagents/` 里不等于会加载——Pi 只加载
    `packages` 里声明过的包。`/Coworkflow:init` 会把 `npm:pi-subagents` 写进项目 `.pi/settings.json`；
    项目还必须受信任（见上一节）。
-2. **动态工具激活要满足。** pi-subagents 默认 `toolActivation: "auto"`：新会话只注册
-   `subagents_enable` 这个加载器，调用它之后 `subagent` 才出现。而**恢复旧会话时会沿用当时保存的
-   工具声明**——历史里没声明过 loader 就不会补上，`/reload` 也改不回来（同一个原因下 `/Coworkflow:start`
-   能成功，但模型仍看不到派单工具）。
+2. **工具在两处被恢复，两处都要满足。** 这是让一台机器反复重启仍无效的原因：
 
-   两条路，任选：
+   - **Pi 先按本会话历史恢复工具列表。** 一个历史里从未声明过 `subagent` 的会话，恢复后依然没有它。
+     `--exclude-tools` 只是让扩展跳过延迟激活，**不会把缺失的工具补回来**。
+   - **pi-subagents 默认 `toolActivation: "auto"`**，新会话只注册 `subagents_enable` 加载器，
+     调用它之后 `subagent` 才出现；而恢复旧会话时它会沿用历史里保存的选择，`/reload` 改不动。
 
    ```bash
-   # 即时：启动时排除「延迟启用入口」，入口被排除后 subagent 直接保持可用（上游文档给的方式）
-   pi --session <id> --exclude-tools subagents_enable
+   # 完整的一条：跳过延迟入口 + 显式把派单工具加回来（+ 表示在默认工具之外追加）
+   pi --session <id> --exclude-tools subagents_enable \
+     --tools +subagent,+bg_wait,+contact_supervisor,+subagent_supervisor
    ```
 
+   长期写法任选其一（`--tools` 的 `+name` 与纯名字不能混用，这条是 Pi 的规则）：
+
    ```jsonc
-   // 长期：写进 pi-subagents 自己的配置，不是 settings.json
+   // settings.json：每次启动都生效，不必带参数
+   { "defaultTools": ["+subagent", "+bg_wait", "+contact_supervisor", "+subagent_supervisor"] }
+
+   // 或者让扩展不做延迟激活（注意：这个键在 pi-subagents 自己的配置里）
    // ~/.pi/agent/extensions/subagent/config.json
    { "toolActivation": "eager" }
    ```
 
-   ⚠️ 这个键**不在** `settings.json` 的 `subagents` 下。写在那里不会被读取，改了也不生效——这一点
-   在这个包里曾经写错过，代价是反复重启加一次误诊。本包只**报告**它，不替你写。
+   ⚠️ `toolActivation` **不在** `settings.json` 的 `subagents` 下。写在那里不会被读取——这一点在这个
+   包里曾经写错过，代价是反复重启加一次误诊。本包只**报告**它，不替你写。
 
 3. **必须重开 Pi。** `toolActivation` 在会话启动时读取，`/reload` 不够——`/reload` 也换不掉 Node 已经
    加载过、或已经失败过的扩展模块。改完配置要新起一个 Pi 进程。

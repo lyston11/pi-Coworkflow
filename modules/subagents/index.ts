@@ -283,9 +283,15 @@ export const subagentsModule: WorkflowModule = {
     // every dispatch instruction in the managed region impossible to follow.
     const missing = subagentToolAvailable(host) === false
       ? [
-          `  ! subagents: 本会话没有 subagent 工具：派单不可用，子 agent 的上下文注入也不会发生。声明检查：${
-            declarationFinding(HOSTS.get(host)?.runtime?.cwd ?? process.cwd())
-          }。其余两项：它默认动态工具激活——新会话只给 subagents_enable，而恢复旧会话时会沿用当时保存的工具声明（历史里没有 loader 就不会补上，/reload 无效）；启动时加 --exclude-tools subagents_enable 可让 subagent 直接可用，长期方案是在 ${userSubagentConfigPath()} 写 {"toolActivation": "eager"}——这个键不在 settings.json 的 subagents 里`,
+          [
+            "  ! subagents: 本会话没有 subagent 工具：派单不可用，子 agent 的上下文注入也不会发生。",
+            `声明检查：${declarationFinding(HOSTS.get(host)?.runtime?.cwd ?? process.cwd())}。`,
+            "工具在两处被恢复，两处都要处理：① Pi 先按本会话历史恢复工具列表——历史里没有 subagent，恢复后就没有，--exclude-tools 不会把它补回来；",
+            "② pi-subagents 默认 auto，只给 subagents_enable 加载器，恢复旧会话时还沿用历史里保存的选择（/reload 改不动它）。",
+            "完整启动参数：--exclude-tools subagents_enable --tools +subagent,+bg_wait,+contact_supervisor,+subagent_supervisor；",
+            "长期等价写法：settings.json 的 defaultTools 里加这几项，或把 ",
+            `${userSubagentConfigPath()} 的 toolActivation 设为 eager（这个键不在 settings.json 的 subagents 下）`,
+          ].join(""),
         ]
       : [];
     const state = HOSTS.get(host);
