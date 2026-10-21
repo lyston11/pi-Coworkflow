@@ -168,19 +168,23 @@ function overlapLine(state: HostState): string[] {
   }
 }
 
+/**
+ * Whether the `subagent` tool is actually declared to the model.
+ *
+ * The module's value is reuse: pi-subagents does the running, this layer points it at
+ * Trellis. When the host does not declare the tool, everything below the guidance is
+ * missing, so the honest report is the missing tool — not a green "已注册".
+ */
+export function subagentToolAvailable(host: { getActiveTools?(): string[] }): boolean | null {
+  const tools = host.getActiveTools?.();
+  if (!Array.isArray(tools)) return null; // host cannot say; do not guess either way
+  return tools.includes("subagent");
+}
+
 export const subagentsModule: WorkflowModule = {
   id: "subagents",
   title: "subagent 层（复用已安装的 pi-subagents，缺失时项目级安装）",
 
-  /**
-   * Attach this host's runtime state and observers.
-   *
-   * Nothing session-scoped is registered here: the workflow resource and the
-   * child requirement are scoped to a *session id* upstream, and at extension
-   * load there is none yet. What this does is install the per-host state and the
-   * observation listeners once, then ask that state to match the live gates —
-   * which it repeats on every `onRuntimeChange` and `session_start`.
-   */
   activate(host: PiRuntimeHost, runtime: RuntimeContext): void {
     if (runtime.isChild) return;
     const state = hostState(host);
@@ -232,11 +236,19 @@ export const subagentsModule: WorkflowModule = {
 
 /** Stored state, read on demand: a passive status never becomes a message. */
   runtimeStatus(host: PiRuntimeHost): string[] | null {
+    // The tool check comes first and stands on its own: it is the one fact that makes
+    // every dispatch instruction in the managed region impossible to follow.
+    const missing = subagentToolAvailable(host) === false
+      ? [
+          "  ! subagents: 本会话没有 subagent 工具（pi-subagents 未加载）：派单不可用，子 agent 的上下文注入也不会发生。/Coworkflow:init 后重开 Pi；项目未受信任时 .pi/settings.json 不生效",
+        ]
+      : [];
     const state = HOSTS.get(host);
-    if (!state) return null;
+    if (!state) return missing.length > 0 ? missing : null;
     const set = state.current;
     const session = set ? `（session ${set.sessionId.slice(0, 8)}）` : "";
     return [
+      ...missing,
       `  ${set?.workflow ? "=" : "-"} subagents: 工作流资源 ${WORKFLOW_NAME}、${FANOUT_NAME} ${set?.workflow ? `已注册${session}` : "未注册"}`,
       `  ${set?.children ? "=" : "-"} subagents: 子会话必需扩展 ${set?.children ? "已登记" : "未登记（subagent-context 关闭或本会话未加载 Coworkflow 时不登记）"}`,
       ...(set?.failure === undefined ? [] : [`  x subagents: ${set.failure}`]),

@@ -7,7 +7,8 @@ import type { PiRuntimeHost, RuntimeContext } from "../core/module.ts";
 import { collectUsageHistory, disposeUsage, formatNativeCost, refreshUsage, usageSnapshot } from "../core/usage.ts";
 import { createConfigRootResolver } from "../core/config.ts";
 import { existingSubagentsBridge } from "../core/subagents-client.ts";
-import { registerModelPanel, type ModelPanel } from "../modules/panel/models.ts";
+import { registerModelPanel } from "../modules/panel/models.ts";
+import type { ModelPanel } from "../modules/panel/models-panel.ts";
 import coworkflow, { controlSurface } from "../extensions/coworkflow.ts";
 
 const totals = (input = 0) => ({ input, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: input ? 1 : 0 });

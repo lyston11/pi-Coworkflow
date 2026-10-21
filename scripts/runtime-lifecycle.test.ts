@@ -595,3 +595,31 @@ test("fixture: the temp project's config is what the modules read", () => {
   assert.equal(config.autoEnable, true);
   assert.equal(config.modules?.subagents, true);
 });
+
+/**
+ * A host without the UI packages must still get the non-UI half of this package.
+ *
+ * `models.ts` and `settings.ts` register commands and hold all the logic; only the
+ * renderers need `@earendil-works/pi-tui` / `pi-coding-agent`, and Pi resolves those
+ * through loader aliases. When the panel components were imported at the top of those
+ * files, one unaliased host package made `extensions/coworkflow.ts` fail to import —
+ * no commands, no injection, no gates, and nothing printed to explain it.
+ *
+ * This is asserted structurally (the import graph) rather than by faking a missing
+ * package, because the failure it prevents happens before any handler can run.
+ */
+test("panel: the logic half imports without the host UI packages", async () => {
+  const source = (await import("node:fs")).readFileSync(
+    new URL("../modules/panel/settings.ts", import.meta.url),
+    "utf-8",
+  );
+  const modelSource = (await import("node:fs")).readFileSync(
+    new URL("../modules/panel/models.ts", import.meta.url),
+    "utf-8",
+  );
+  for (const [name, text] of [["settings.ts", source], ["models.ts", modelSource]] as const) {
+    const topLevel = text.split("\n").filter((line) => /^import .*@earendil-works/.test(line));
+    assert.deepEqual(topLevel, [], `${name} must not import the host UI packages at the top level`);
+    assert.match(text, /await import\("\.\/(settings|models)-panel\.ts"\)/, `${name} loads its renderer lazily`);
+  }
+});

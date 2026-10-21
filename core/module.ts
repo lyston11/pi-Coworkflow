@@ -252,6 +252,17 @@ export interface PiRuntimeHost {
   sendUserMessage?(message: { content: string }): void;
   /** The session's display name; a child's is `<agent>: <task excerpt>`. */
   getSessionName?(): string | undefined;
+  /**
+   * The tools declared to the model right now, by name.
+   *
+   * Declared because this package must not tell a session to dispatch when the
+   * `subagent` tool is not there to dispatch with: pi-subagents missing, not yet
+   * loaded, or a project Pi will not trust all produce a session where the managed
+   * region says "执行全部交出去" and the model has nothing to hand work to. That is
+   * worse than saying nothing — it produced a session that apologised for breaking a
+   * rule it could not have followed.
+   */
+  getActiveTools?(): string[];
   /** Model and thinking control; all session-scoped. */
   setModel?(model: unknown): Promise<boolean>;
   setThinkingLevel?(level: string): void;

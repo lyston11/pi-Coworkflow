@@ -43,10 +43,6 @@
  * supported path, not a dependency on a sibling install.
  */
 
-import type { PiRuntimeHost, RuntimeContext, WorkflowModule } from "../../core/module.ts";
-import { registerModelPanel } from "./models.ts";
-import { registerSettingsPanel } from "./settings.ts";
-
 export { THINKING_LEVELS, supportedThinkingLevels, modelRows, thinkingRows } from "./shared.ts";
 export type {
   PanelModel,
@@ -57,8 +53,10 @@ export type {
   Tab,
   ThinkingLevelName,
 } from "./shared.ts";
-export { ModelPanel, panelModels, writeSubagentSetting, setPanelContext } from "./models.ts";
-export { SettingsPanel, buildSettingRows } from "./settings.ts";
+
+import type { PiRuntimeHost, RuntimeContext, WorkflowModule } from "../../core/module.ts";
+import { registerModelPanel } from "./models.ts";
+import { registerSettingsPanel } from "./settings.ts";
 
 export const panelModule: WorkflowModule = {
   id: "panel",
@@ -68,7 +66,6 @@ export const panelModule: WorkflowModule = {
   activate(host: PiRuntimeHost, runtime: RuntimeContext): void {
     // Children have no interactive UI and must never open a panel.
     if (runtime.isChild || !host.registerCommand) return;
-
     registerSettingsPanel(host, runtime);
     registerModelPanel(host, runtime);
   },
@@ -84,4 +81,5 @@ export const panelModule: WorkflowModule = {
     if (runtime.isChild || !host.registerCommand) return;
     registerModelPanel(host, runtime);
   },
+
 };

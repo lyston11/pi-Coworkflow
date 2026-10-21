@@ -48,7 +48,9 @@ import { agentKindsModule, kindWorkflowAgents, syncAgentKinds } from "../modules
 import { disposeKindRegistrations } from "../modules/agent-kinds/registration.ts";
 import { BUILTIN_KINDS, kindRole, resolveKinds } from "../modules/agent-kinds/defaults.ts";
 import { detectRole } from "../modules/subagent-context/index.ts";
-import { buildSettingRows, SettingsPanel, type SettingRow } from "../modules/panel/settings.ts";
+import { subagentsModule } from "../modules/subagents/index.ts";
+import { buildSettingRows, type SettingRow } from "../modules/panel/settings.ts";
+import { SettingsPanel } from "../modules/panel/settings-panel.ts";
 import { laneWorktreeModule } from "../modules/lane-worktree/index.ts";
 
 const here = (rel: string): string => new URL(rel, import.meta.url).pathname;
@@ -853,4 +855,26 @@ test("panel: every page renders the same number of lines", { skip }, async () =>
     loaded.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+/**
+ * A session whose host declares no `subagent` tool must be told so.
+ *
+ * This is the failure a real WSL session showed: the managed region says "执行全部
+ * 交出去", pi-subagents was not loaded there, and the model spent a turn searching for
+ * a tool that did not exist and then apologised for breaking a rule it could not have
+ * followed. Saying nothing is not neutral — it produces that.
+ */
+test("status: a missing subagent tool is reported, and no tools means no claim", async () => {
+  const lines = subagentsModule.runtimeStatus?.({ getActiveTools: () => ["read", "write"] } as never) ?? [];
+  assert.ok(
+    lines.some((line) => /没有 subagent 工具/.test(line) && /派单不可用/.test(line)),
+    lines.join("\n"),
+  );
+  // A host that cannot answer says nothing rather than guessing in either direction.
+  const unknown = subagentsModule.runtimeStatus?.({} as never) ?? [];
+  assert.ok(!unknown.some((line) => /没有 subagent 工具/.test(line)), unknown.join("\n"));
+  // And a host that does declare the tool makes no such claim.
+  const ok = subagentsModule.runtimeStatus?.({ getActiveTools: () => ["read", "subagent"] } as never) ?? [];
+  assert.ok(!ok.some((line) => /没有 subagent 工具/.test(line)), ok.join("\n"));
 });
