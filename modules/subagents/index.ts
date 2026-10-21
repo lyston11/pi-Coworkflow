@@ -255,7 +255,7 @@ export const subagentsModule: WorkflowModule = {
     // every dispatch instruction in the managed region impossible to follow.
     const missing = subagentToolAvailable(host) === false
       ? [
-          "  ! subagents: 本会话没有 subagent 工具（pi-subagents 未加载）：派单不可用，子 agent 的上下文注入也不会发生。/Coworkflow:init 后重开 Pi；项目未受信任时 .pi/settings.json 不生效",
+          "  ! subagents: 本会话没有 subagent 工具：派单不可用，子 agent 的上下文注入也不会发生。逐项核对：① pi-subagents 被 settings 声明（packages）且项目受信任；② 它默认是动态工具激活——新会话只给 subagents_enable，要调用它才放出 subagent；想让它从第一次请求就可用，把 subagents.toolActivation 设为 \"eager\" 再重开 Pi；③ 改完必须重开 Pi，/reload 不能替换已加载（或已失败）的扩展模块",
         ]
       : [];
     const state = HOSTS.get(host);
@@ -304,6 +304,21 @@ export const subagentsModule: WorkflowModule = {
       settings.subagents !== null && typeof settings.subagents === "object" && !Array.isArray(settings.subagents)
         ? { ...(settings.subagents as JsonObject) }
         : {};
+    // Dynamic tool activation is the default upstream and it is invisible: a session
+    // starts with only the `subagents_enable` loader, so `subagent` does not exist until
+    // something calls it — and a resumed session can carry a recorded selection that
+    // keeps it off even after a reload. Reported, never written: changing how a project
+    // exposes tools is a policy the project owns.
+    const activation = subagents.toolActivation;
+    if (activation === "eager") {
+      ctx.report("ok", `subagents.toolActivation = eager（subagent 工具从第一次请求就可用）`);
+    } else if (activation === undefined || activation === "auto" || activation === "dynamic") {
+      ctx.report(
+        "warn",
+        `subagents.toolActivation 未设为 "eager"（当前 ${activation === undefined ? "未设置（上游默认 auto）" : activation}）：pi-subagents 只注册 subagents_enable 加载器，要调用它才放出 subagent 工具。依赖派单的项目建议在 .pi/settings.json 的 subagents.toolActivation 设为 "eager" 并重开 Pi；/reload 不会重新加载扩展模块`,
+      );
+    }
+
     if (subagents[ROOT_RESOLUTION_KEY] === ROOT_RESOLUTION_VALUE) {
       ctx.report("ok", `.pi/settings.json: subagents.${ROOT_RESOLUTION_KEY} = ${ROOT_RESOLUTION_VALUE}`);
     } else {

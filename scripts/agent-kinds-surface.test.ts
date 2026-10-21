@@ -878,3 +878,20 @@ test("status: a missing subagent tool is reported, and no tools means no claim",
   const ok = subagentsModule.runtimeStatus?.({ getActiveTools: () => ["read", "subagent"] } as never) ?? [];
   assert.ok(!ok.some((line) => /没有 subagent 工具/.test(line)), ok.join("\n"));
 });
+
+/**
+ * The status line must name the remedies, not just the symptom.
+ *
+ * The observed failure had three stacked causes (package not declared; peer deps
+ * missing; dynamic tool activation leaving only the `subagents_enable` loader). A line
+ * that says "no subagent tool" and stops costs the reader the same investigation that
+ * produced it, so each cause is named with what to do about it.
+ */
+test("status: a missing subagent tool names the three things to check", async () => {
+  const lines = subagentsModule.runtimeStatus?.({ getActiveTools: () => ["read"] } as never) ?? [];
+  const line = lines.find((entry) => /没有 subagent 工具/.test(entry)) ?? "";
+  assert.match(line, /packages/, "1: the package must be declared");
+  assert.match(line, /subagents_enable/, "2: dynamic activation exposes only the loader");
+  assert.match(line, /toolActivation/, "2: and names the eager escape hatch");
+  assert.match(line, /重开 Pi/, "3: a reload is not enough");
+});

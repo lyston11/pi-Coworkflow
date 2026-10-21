@@ -395,6 +395,31 @@ Pi 把 `.pi/settings.json`、`.pi/extensions`、`.pi/agents` 等当作**受信�
 
 `AGENTS.md` 这类上下文文件不受信任门控，所以受管区文本无论如何都会读到。
 
+### 派单需要 `subagent` 工具，它有三个前置条件
+
+派单靠 pi-subagents 提供的 `subagent` 工具。三个条件里任何一个没满足，本会话就**没有**这个工具——
+而本包的受管区仍然写着「执行全部交出去」。所以本包不为这种情况保持沉默：`/Coworkflow:status` 会打一行
+`! subagents: 本会话没有 subagent 工具`，并列出该查哪一项。
+
+1. **被 settings 声明。** 文件躺在 `~/.pi/agent/npm/node_modules/pi-subagents/` 里不等于会加载——Pi 只加载
+   `packages` 里声明过的包。`/Coworkflow:init` 会把 `npm:pi-subagents` 写进项目 `.pi/settings.json`；
+   项目还必须受信任（见上一节）。
+2. **动态工具激活要满足。** pi-subagents 默认 `toolActivation: "auto"`：新会话只注册 `subagents_enable`
+   这个加载器，调用它之后 `subagent` 才出现。依赖派单的项目应把它设成 `"eager"`（不注册加载器，
+   `subagent` 从第一次请求就可用）：
+
+   ```jsonc
+   // .pi/settings.json（项目级）或 ~/.pi/agent/settings.json（所有项目）
+   { "subagents": { "toolActivation": "eager" } }
+   ```
+
+   本包只**报告**这一项，不替你写：怎么暴露工具是项目自己的策略。`/Coworkflow:init` 在这项不是
+   `eager` 时会给一条 warn。
+3. **必须重开 Pi。** `toolActivation` 在会话启动时读取，`/reload` 不够——`/reload` 也换不掉 Node 已经
+   加载过、或已经失败过的扩展模块。改完配置要新起一个 Pi 进程。
+
+三条都满足后，`/Coworkflow:status` 里不会再出现那一行，`subagent({ agent: "cw-executor", … })` 才可用。
+
 ### 交互面板需要 TUI 会话
 
 `/Comodels` 与 `/Coworkflow:settings` 用 `ctx.ui.custom()`，只有交互式 TUI 才有。在 `pi -p`、
