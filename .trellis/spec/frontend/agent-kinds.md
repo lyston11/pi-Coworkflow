@@ -1,0 +1,117 @@
+# 类型化子 agent（kind）设计
+
+本文档记录本项目的**设计意图与取舍**，不是实现说明书。实现分布见文末「落点」；两者冲突时以实现为准，并回来修本文档。
+
+## 问题
+
+派单原本是一个扁平动作：主会话对每个子 agent 单独写提示词、单独决定派谁，项目层唯一的控制是全局限一个并发数。于是「这个项目用哪几类子 agent、每类能同时跑几个、哪类现在不参与」这些信息只存在于散文里，模型可能遵守也可能不遵守，而且没有任何东西执行它。
+
+## 设计
+
+### 类型是注册 + 门禁，不是新的执行路径
+
+一个 kind = 一份 agent 定义 + 两条项目策略（是否启用、同时上限）。
+
+- 注册后，`cw-executor` 这类名字**真的出现在主会话的 agent 列表里**，派单就是普通的一次 `subagent({ agent: "cw-executor" })`。
+- 本包不因此获得调度权：不 spawn、不排队、不重试、不维护每类的运行账本。
+- 类型数量、进程、超时、产物仍归 pi-subagents。
+
+### 一类一种角色，覆盖 Trellis 的三个角色
+
+| kind | agent | Trellis 角色 | 默认 | 默认上限 |
+|---|---|---|---|---|
+| 执行者 | `cw-executor` | implement | 开 | 3 |
+| 审计者 | `cw-auditor` | check | 关 | 1 |
+| 调研者 | `cw-researcher` | research | 关 | 2 |
+
+**这是「覆盖」而非「并列」**：kind 与 Trellis 角色一一对应，`cw-*` 走的是同一份角色上下文注入（prd、design、implement、对应 jsonl 或 spec 树），但额外经过本项目的开关与数量上限。`trellis-implement` / `trellis-check` / `trellis-research` 在采用本模块后**不再是本项目推荐的派单目标**——它们绕开这两道闸。
+
+默认值的选择是有理由的：执行者默认开，因为它替代的正是项目本来手工在做的事；审计者与调研者默认关，因为它们能拒绝自己的工作或无限期花时间，**必须由项目主动选择，而不是凭空出现**。这条也适用于将来新增的 kind：新增能力默认开，新增「能拒绝工作」的默认关。
+
+Trellis 自己拥有的 `.pi/agents/trellis-*.md` 不删除、不改写（那是 `trellis update` 的地盘），只是不再作为本项目的推荐派单目标。
+
+### 三种约束，强度不同，不能混为一谈
+
+| 想要的 | 机制 | 强度 |
+|---|---|---|
+| 关掉的类派不了 | `tool_call` 拒绝，理由列出当前可用的 kind | **强制** |
+| 某类超上限派不了 | `tool_call` 拒绝，理由给出上限与当前占用 | **强制** |
+| 「只能派给开着的类」 | 提示词与面板告知 | 引导，非强制 |
+
+第三条必须说清楚它不是强制：`cw-*` 之外的名字（内置 agent、别的扩展的、`trellis-*`）不受本模块管理，本模块不会替主会话改派任务。把「拒绝」说成「枚举」是过度承诺。
+
+### 占用计数来自上游公开投影
+
+某一类当前跑了几个，来自 pi-subagents 公开 fleet 投影的 `entries[].agent`，不建本地镜像。
+
+- 缺 `fleetStatus` 能力、投影无法解析、有界窗口发生溢出（`omitted` 非零）、回复落在会话换代之后 —— **一律拒绝派单**，不当成 0。
+- 理由：一个数不准的上限比没有上限更糟，它会让项目以为被保护着。
+
+### 并行是一等公民，串行是可测量的行为
+
+独立的多件工作用命名工作流 `coworkflow.fanout` 一次并发派出（内部对每个子任务 `Promise.all`），而不是让每次派单的脚本写法决定是否并行。派单参数按 **kind** 指定，`kind → cw-<kind>` 唯一映射，被关闭的 kind 用与 `tool_call` gate 相同的措辞拒绝。
+
+同时记录「这次派单是否与别的派单重叠」，并在 `/Coworkflow:status` 作为**事实**报告：`派单重叠: 3 次并行、5 次串行`。时间戳缺失记为 unknown，**不计入串行**。
+
+判断哪些工作彼此独立仍然是主会话的判断，机制不替它做；机制只负责让并行变便宜、让串行变可见。
+
+### 可以随时打断，但「接受」不等于「结束」
+
+- `stop` / `steer` / `interrupt` 是上游**公开可选**的控制方法：使用前探能力，未通告就明确拒绝，不发出去碰运气。
+- `stop` 的成功回复意为**停止请求已被接受**（`state: "stopping"`），**不是** run 已终止。终止须由 `status` 与进程终止证据确认。因此输出必须把「已接受」与「已停止」分成两句，禁止打印「已停止」。
+- `/Coworkflow:lanes stop <runId>` 只接受本任务记录过的 runId，不接受任意 id。
+- 失败的 stop 不自动重试，也不报告成「可能已死」的超时。
+
+### 决定是否打断所需的可见性
+
+主会话要先看到才决定停不停。可归因、可显示的内容：
+
+- 每个 run 的 `state` / `agent` / `model` / `startedAt` 推算的已运行时长；
+- `goal`（**仅**来自我们自己的派单记录，不冒充 runner 上报）；
+- 按 run 的 token 走 `cost` 渠道（自带有校验的求和与 `runId` 归属），`unresolvedAsyncChildren > 0` 时聚合是**下界**，显示为 `≥` 并标注「不完整」；
+- 按类型计数走 fleet 渠道。
+
+明确**拿不到**：它此刻在读哪个文件、调哪个工具。那需要跨进程事件流，而上游的进程内事件总线不跨子进程。这条限制写进文档，不美化成「完整可观测」。
+
+### fleet 的 key 不是 run id
+
+fleet 投影的 `key` 是不透明显示键，上游明确禁止当作 run 或 async id。因此 fleet 数据只能**丰富显示**，任何 `fleet.key ↔ runId` 的关联都是错的——那个关联不存在，硬拼会静默错配。
+
+### 不给对话注入消息
+
+任何 `sendMessage` 的自定义消息在 Pi 里都会作为 **user 轮次**进入模型上下文（`display: true` 只影响显示）。所以「用一条消息提醒模型该怎么派单」会改写它正在做的事，代价大于收益。
+
+本设计因此只通过三个渠道传达状态：`/Coworkflow:status` 与 `/Coworkflow:lanes` 的输出、面板、以及工具结果。**没有任何自动注入**。曾经有过按工具调用次数计数的提醒，已删除；这条约束有测试守着（工作流自身从不调用 `sendMessage`）。
+
+## 不做的事
+
+- 不做「自动把任务分给某个类」的调度器——那是判断，不是机制。
+- 不改 pi-subagents 的任何文件，不加载第二份运行器。
+- 不改写 Trellis 拥有的 `.pi/agents/`、`.trellis/` CLI 资产。
+- 不自动重试、不自动合并、不自动清理。
+
+## 失败模式与对应要求
+
+| 失败模式 | 要求 |
+|---|---|
+| 契约不可用却报告已注册 | 不注册、面板与状态说明原因、派单被拒 |
+| 名字撞内置 agent 或项目已有 agent | 只有该类失败，其它类不受影响；**不得让整个会话的派单失效** |
+| 计数不可读 | 拒绝派单，不当 0 |
+| 窗口截断（`omitted > 0`） | 按 unknown 处理，不把部分和当总数 |
+| stop 被接受 | 只说「已接受」，并做一次状态复核，不用轮询 |
+| 开关改了但没生效 | 每次派单从磁盘重读策略；不重启生效 |
+| 面板显示与实际不一致 | 面板只复述模块自己的事实，不推断 |
+
+最后一条尤其重要：这个包已经出现过两次「自称在拦、实际没拦」——那是比没有功能更坏的状态。
+
+## 落点
+
+- 类型表与默认值：`modules/agent-kinds/defaults.ts`、`modules/agent-kinds/assets/*.md`
+- 注册（上游公开 `./agents` 导出 + `pi-subagents:runtime-agent-register:v1` 事件）：`modules/agent-kinds/registration.ts`
+- 门禁与状态：`modules/agent-kinds/index.ts`
+- 配置形状与开关解析：`core/config.ts`
+- 角色映射：`modules/subagent-context/index.ts`（映射表在 `kindRole()`，`BUILTIN_KINDS[].role`）
+- 面板行：`modules/panel/settings.ts`
+- 派单记录与 lane 展示：`modules/lane-worktree/index.ts`、`core/subagents-workflow.ts`
+- 中断控制：`core/subagents-client.ts`、`modules/subagents/run-control.ts`
+- 集成契约（所有权与公开能力下限）：`.trellis/spec/frontend/subagents-integration.md`
