@@ -77,6 +77,49 @@ export const BUILTIN_KINDS: readonly BuiltinKind[] = [
   },
 ];
 
+/**
+ * One kind, resolved into the data a *workflow script* needs.
+ *
+ * Plain data on purpose: a workflow resolver is synchronous and I/O-free, so it
+ * cannot read the project config or the owner's registry. The host resolves the
+ * policy once (in memory, at gate time) and hands the result to the resolver, which
+ * only formats it into script text. Nothing here is a second policy: `agent` comes
+ * from `agentNameFor`, `dispatchable` from the project's own switches plus the
+ * owner's accepted registrations.
+ */
+export interface FanoutKindPolicy {
+  /** The project-facing kind name, e.g. `executor`. */
+  kind: string;
+  /** The registered agent name, from `agentNameFor`. */
+  agent: string;
+  /** Whether a child of this kind may start in this session right now. */
+  dispatchable: boolean;
+  /** Why it may not, in the gate's own words. Absent when it may. */
+  refusal?: string;
+}
+
+/**
+ * The refusal a dispatch of a disabled kind gets, in one place.
+ *
+ * The `tool_call` gate and the fanout script both refuse a disabled kind, and a
+ * second vocabulary for the same decision would let the two disagree about what
+ * "disabled" means. `available` is what the caller may dispatch instead — agent
+ * names, because that is what a dispatch names.
+ */
+export function disabledKindMessage(kind: string, agent: string, available: readonly string[]): string {
+  return [
+    `本项目在 /Coworkflow:settings 的「子 agent 类型」里关闭了 kind ${kind}（${agent}）。`,
+    available.length > 0
+      ? `当前可用的 kind：${available.join("、")}；其他 agent 的派单不受影响。`
+      : "当前没有可用的 kind；其他 agent 的派单不受影响。",
+  ].join("");
+}
+
+/** The refusal a dispatch of an enabled-but-unregistered kind gets. */
+export function unregisteredKindMessage(kind: string, agent: string, reason: string): string {
+  return `本项目启用了 kind ${kind}（${agent}），但它没有被注册到 pi-subagents：${reason}。`;
+}
+
 /** The registered agent name for a kind, prefixed so it cannot collide with a builtin. */
 export function agentNameFor(kind: string): string {
   return kind.startsWith(KIND_PREFIX) ? kind : `${KIND_PREFIX}${kind}`;

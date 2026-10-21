@@ -34,6 +34,7 @@ import {
   resolveFanout,
 } from "../core/subagents-workflow.ts";
 import { formatOverlapLine, summarizeOverlap } from "../core/dispatch-timing.ts";
+import { BUILTIN_KINDS, agentNameFor, disabledKindMessage, unregisteredKindMessage } from "../modules/agent-kinds/defaults.ts";
 
 const here = (rel: string): string => new URL(rel, import.meta.url).pathname;
 
@@ -61,13 +62,18 @@ const runnerSkip = runner === null ? "pi-subagents is not installed in this envi
 
 const TWD = "/tmp/fanout-worktree";
 
-function expand(tasks: unknown, extra: Record<string, unknown> = {}): string | { error: string } {
-  const expanded = resolveFanout({ tasks, ...extra }, { taskRef: ".trellis/tasks/10-20-demo", worktree: TWD, mainCheckout: "/tmp/main" });
+/** Every kind this package ships, dispatchable: the policy a listed project resolves to. */
+function allKindsDispatchable() {
+  return { kinds: BUILTIN_KINDS.map((entry) => ({ kind: entry.kind, agent: agentNameFor(entry.kind), dispatchable: true })) };
+}
+
+function expand(tasks: unknown, extra: Record<string, unknown> = {}, policy: unknown = allKindsDispatchable()): string | { error: string } {
+  const expanded = resolveFanout({ tasks, ...extra }, { taskRef: ".trellis/tasks/10-20-demo", worktree: TWD, mainCheckout: "/tmp/main" }, policy as any);
   return "script" in expanded ? expanded.script : expanded;
 }
 
-function scriptOf(tasks: unknown, extra: Record<string, unknown> = {}): string {
-  const expanded = expand(tasks, extra);
+function scriptOf(tasks: unknown, extra: Record<string, unknown> = {}, policy: unknown = allKindsDispatchable()): string {
+  const expanded = expand(tasks, extra, policy);
   assert.equal(typeof expanded, "string", typeof expanded === "string" ? "" : expanded.error);
   return expanded as string;
 }
@@ -77,25 +83,25 @@ function scriptOf(tasks: unknown, extra: Record<string, unknown> = {}): string {
 test("fanout: args are validated as strictly as the implement/review resource", () => {
   // Count is bounded on both ends: zero tasks is not a fanout, and a large one is
   // not independent work the parent can audit.
-  for (const tasks of [[], undefined, null, "nope", {}, [...Array(9)].map((_, index) => ({ agent: "worker", task: `t${index}` }))]) {
+  for (const tasks of [[], undefined, null, "nope", {}, [...Array(9)].map((_, index) => ({ kind: "executor", task: `t${index}` }))]) {
     const expanded = expand(tasks);
     assert.equal(typeof expanded, "object", `must reject ${JSON.stringify(tasks)?.slice(0, 40)}`);
   }
   // One task is fine: a fanout of one is a named script, not an error.
-  assert.equal(typeof expand([{ agent: "worker", task: "do it" }]), "string");
+  assert.equal(typeof expand([{ kind: "executor", task: "do it" }]), "string");
 
   const rejections: [unknown, RegExp][] = [
-    [[{ agent: "", task: "x" }], /tasks\[0\]\.agent/],
-    [[{ agent: "   ", task: "x" }], /tasks\[0\]\.agent/],
-    [[{ agent: "worker", task: "" }], /tasks\[0\]\.task/],
-    [[{ agent: "worker", task: "   " }], /tasks\[0\]\.task/],
-    [[{ agent: "worker", task: 7 }], /tasks\[0\]\.task/],
-    [[{ agent: "work er", task: "x" }], /tasks\[0\]\.agent/],
-    [[{ agent: "worker", task: "x", model: "m" }], /tasks\[0\] contains unsupported fields: model/],
-    [[{ task: "x" }], /tasks\[0\]\.agent/],
-    [["worker"], /tasks\[0\] must be a \{ agent, task \} object/],
-    [[{ agent: "worker", task: "x" }, null], /tasks\[1\] must be a \{ agent, task \} object/],
-    [[{ agent: "worker", task: "x".repeat(8001) }], /tasks\[0\]\.task/],
+    [[{ kind: "", task: "x" }], /tasks\[0\]\.kind/],
+    [[{ kind: "   ", task: "x" }], /tasks\[0\]\.kind/],
+    [[{ kind: "executor", task: "" }], /tasks\[0\]\.task/],
+    [[{ kind: "executor", task: "   " }], /tasks\[0\]\.task/],
+    [[{ kind: "executor", task: 7 }], /tasks\[0\]\.task/],
+    [[{ kind: "exec utor", task: "x" }], /tasks\[0\]\.kind/],
+    [[{ kind: "executor", task: "x", agent: "worker" }], /tasks\[0\] contains unsupported fields: agent/],
+    [[{ task: "x" }], /tasks\[0\]\.kind/],
+    [["executor"], /tasks\[0\] must be a \{ kind, task \} object/],
+    [[{ kind: "executor", task: "x" }, null], /tasks\[1\] must be a \{ kind, task \} object/],
+    [[{ kind: "executor", task: "x".repeat(8001) }], /tasks\[0\]\.task/],
   ];
   for (const [tasks, expected] of rejections) {
     const expanded = expand(tasks);
@@ -106,10 +112,10 @@ test("fanout: args are validated as strictly as the implement/review resource", 
   // Unknown top-level fields are rejected, including the ones a caller might hope
   // would override the host's own verification.
   for (const [args, expected] of [
-    [{ tasks: [{ agent: "worker", task: "x" }], worktree: "/elsewhere" }, /unsupported fields: worktree/],
-    [{ tasks: [{ agent: "worker", task: "x" }], script: "return 1" }, /unsupported fields: script/],
-    [{ tasks: [{ agent: "worker", task: "x" }], focus: "" }, /args\.focus/],
-    [{ tasks: [{ agent: "worker", task: "x" }], focus: "y".repeat(2001) }, /args\.focus/],
+    [{ tasks: [{ kind: "executor", task: "x" }], worktree: "/elsewhere" }, /unsupported fields: worktree/],
+    [{ tasks: [{ kind: "executor", task: "x" }], script: "return 1" }, /unsupported fields: script/],
+    [{ tasks: [{ kind: "executor", task: "x" }], focus: "" }, /args\.focus/],
+    [{ tasks: [{ kind: "executor", task: "x" }], focus: "y".repeat(2001) }, /args\.focus/],
     [{}, /args\.tasks/],
   ] as [Record<string, unknown>, RegExp][]) {
     const expanded = resolveFanout(args, { taskRef: ".trellis/tasks/10-20-demo", worktree: TWD, mainCheckout: "/tmp/main" });
@@ -118,8 +124,79 @@ test("fanout: args are validated as strictly as the implement/review resource", 
   }
 });
 
+test("fanout: a kind this package does not ship is rejected, naming the kinds that exist", () => {
+  for (const kind of ["worker", "trellis-implement", "cw-executor", "reviewer"]) {
+    const expanded = expand([{ kind, task: "x" }]);
+    assert.equal(typeof expanded, "object", kind);
+    if (typeof expanded === "object") {
+      assert.match(expanded.error, /is not a kind this package ships/);
+      // Actionable: the error lists what the caller *may* name.
+      for (const shipped of BUILTIN_KINDS) assert.ok(expanded.error.includes(shipped.kind), `${kind} -> ${expanded.error}`);
+    }
+  }
+});
+
+test("fanout: a disabled kind is refused per task in the gate's own words, and siblings still run", { skip: runnerSkip }, async () => {
+  // The project's policy, as the host resolves it: `executor` on, `auditor` off.
+  const policy = {
+    kinds: BUILTIN_KINDS.map((entry) => ({
+      kind: entry.kind, agent: agentNameFor(entry.kind),
+      dispatchable: entry.kind === "executor",
+      ...(entry.kind === "executor" ? {} : { refusal: disabledKindMessage(entry.kind, agentNameFor(entry.kind), ["cw-executor"]) }),
+    })),
+  };
+  const script = scriptOf([{ kind: "executor", task: "a" }, { kind: "auditor", task: "b" }], {}, policy);
+  const started: string[] = [];
+  const result = await runner!({
+    script,
+    args: {},
+    launch: async (key: string) => {
+      started.push(key);
+      return { key, ok: true, output: "done", runId: `run-${key}`, artifactPaths: [],
+        structuredOutput: { status: "completed", summary: "done", handoff: "h" } };
+    },
+    status: async (key: string) => ({ key, ok: false, output: "", error: "not used", artifactPaths: [] }),
+  });
+
+  assert.deepEqual(started, ["task-1"], "a disabled kind is never started");
+  const value = result.value as Record<string, any>;
+  assert.equal(value.status, "partial");
+  const refused = value.results[1];
+  assert.equal(refused.ok, false);
+  assert.equal(refused.kind, "auditor");
+  assert.equal(refused.agent, "cw-auditor");
+  assert.equal(refused.status, "failed");
+  // The same vocabulary the `tool_call` gate uses, not a second one.
+  assert.match(String(refused.error), /关闭了 kind auditor（cw-auditor）/);
+  assert.match(String(refused.error), /当前可用的 kind：cw-executor/);
+  // The enabled sibling is unaffected.
+  assert.equal(value.results[0].ok, true);
+});
+
+test("fanout: an unreadable kind policy refuses the task instead of assuming it is fine", { skip: runnerSkip }, async () => {
+  const policy = {
+    unavailable: "本会话的「子 agent 类型」（agent-kinds）模块已关闭，无法确认任何 kind 是否可以派单",
+    kinds: BUILTIN_KINDS.map((entry) => ({ kind: entry.kind, agent: agentNameFor(entry.kind), dispatchable: false,
+      refusal: unregisteredKindMessage(entry.kind, agentNameFor(entry.kind), "kind 模块已关闭") })),
+  };
+  const script = scriptOf([{ kind: "executor", task: "a" }], {}, policy);
+  let started = 0;
+  let thrown: unknown;
+  try {
+    await runner!({
+      script, args: {},
+      launch: async (key: string) => { started += 1; return { key, ok: true, output: "done", artifactPaths: [] }; },
+      status: async (key: string) => ({ key, ok: false, output: "", error: "not used", artifactPaths: [] }),
+    });
+  } catch (error) { thrown = error; }
+  assert.equal(started, 0, "nothing launched on an unknown policy");
+  assert.ok(thrown instanceof Error);
+  assert.match((thrown as Error).message, /all 1 task\(s\) failed/);
+  assert.match((thrown as Error).message, /kind 模块已关闭/);
+});
+
 test("fanout: keys come from position, so two identical tasks are two children", () => {
-  const script = scriptOf([{ agent: "worker", task: "same" }, { agent: "worker", task: "same" }]);
+  const script = scriptOf([{ kind: "executor", task: "same" }, { kind: "executor", task: "same" }]);
   assert.match(script, /"key":"task-1"/);
   assert.match(script, /"key":"task-2"/);
   // The task text is interpolated as JSON data, never as code.
@@ -129,7 +206,7 @@ test("fanout: keys come from position, so two identical tasks are two children",
 // ── Concurrency ──────────────────────────────────────────────────────
 
 test("fanout: three tasks start together — the third starts before the first finishes", { skip: runnerSkip }, async () => {
-  const script = scriptOf([{ agent: "worker", task: "a" }, { agent: "worker", task: "b" }, { agent: "coworkflow-auditor", task: "c" }]);
+  const script = scriptOf([{ kind: "executor", task: "a" }, { kind: "executor", task: "b" }, { kind: "auditor", task: "c" }]);
   const starts: { key: string; at: number }[] = [];
   const firstResolvedAt: number[] = [];
   const params: Record<string, Record<string, unknown>> = {};
@@ -165,7 +242,10 @@ test("fanout: three tasks start together — the third starts before the first f
     assert.equal((call.outputSchema as Record<string, unknown>).type, "object");
     assert.equal(call.async, undefined);
   }
-  assert.equal(params["task-3"]!.agent, "coworkflow-auditor");
+  // The kind, not an arbitrary agent name, is what the caller names; the resolver
+  // turns it into the agent the owner registered (`agentNameFor`, one mapping).
+  assert.equal(params["task-1"]!.agent, "cw-executor");
+  assert.equal(params["task-3"]!.agent, "cw-auditor");
 
   const value = result.value as Record<string, any>;
   assert.equal(value.status, "completed");
@@ -173,12 +253,14 @@ test("fanout: three tasks start together — the third starts before the first f
   assert.match(String(value.note), /不代表验收通过/);
   assert.equal(value.concurrency, "parallel");
   assert.deepEqual(value.results.map((entry: any) => entry.key), ["task-1", "task-2", "task-3"]);
+  assert.deepEqual(value.results.map((entry: any) => entry.kind), ["executor", "executor", "auditor"]);
+  assert.deepEqual(value.results.map((entry: any) => entry.agent), ["cw-executor", "cw-executor", "cw-auditor"]);
   assert.deepEqual(value.results.map((entry: any) => entry.ok), [true, true, true]);
   assert.equal(value.results[0].handoff, "handoff task-1");
 });
 
 test("fanout: a failing child does not cancel its siblings and is reported as that task's failure", { skip: runnerSkip }, async () => {
-  const script = scriptOf([{ agent: "worker", task: "a" }, { agent: "worker", task: "b" }, { agent: "worker", task: "c" }]);
+  const script = scriptOf([{ kind: "executor", task: "a" }, { kind: "executor", task: "b" }, { kind: "executor", task: "c" }]);
   const starts: number[] = [];
   const finishes: number[] = [];
   const result = await runner!({
@@ -208,14 +290,15 @@ test("fanout: a failing child does not cancel its siblings and is reported as th
   assert.equal(second.status, "failed");
   assert.match(String(second.error), /child exploded/);
   assert.equal(second.key, "task-2", "the failure is attributed to its own task");
-  assert.equal(second.agent, "worker");
+  assert.equal(second.agent, "cw-executor");
+  assert.equal(second.kind, "executor");
   assert.equal(second.runId, null, "a rejected child has no identity the sandbox can read: absent, not borrowed from a sibling");
   assert.equal(third.ok, true, "a sibling keeps working after another child failed");
   assert.equal(third.runId, "run-task-3", "the sibling keeps its own run identity");
 });
 
 test("fanout: a child that reports no usable verdict is a failed task, not a silent pass", { skip: runnerSkip }, async () => {
-  const script = scriptOf([{ agent: "worker", task: "a" }, { agent: "worker", task: "b" }]);
+  const script = scriptOf([{ kind: "executor", task: "a" }, { kind: "executor", task: "b" }]);
   const result = await runner!({
     script,
     args: {},
@@ -231,7 +314,7 @@ test("fanout: a child that reports no usable verdict is a failed task, not a sil
 });
 
 test("fanout: all children failing is fail-closed", { skip: runnerSkip }, async () => {
-  const script = scriptOf([{ agent: "worker", task: "a" }, { agent: "worker", task: "b" }]);
+  const script = scriptOf([{ kind: "executor", task: "a" }, { kind: "executor", task: "b" }]);
   let thrown: unknown;
   try {
     await runner!({
@@ -249,7 +332,7 @@ test("fanout: all children failing is fail-closed", { skip: runnerSkip }, async 
 });
 
 test("fanout: no workflow path writes a message into the conversation", { skip: runnerSkip }, async () => {
-  const script = scriptOf([{ agent: "worker", task: "a" }]);
+  const script = scriptOf([{ kind: "executor", task: "a" }]);
   // The workflow sandbox only exposes `runs`, `emit`, `console` and `state`; a
   // message into the conversation is not among them, and the script must not reach
   // for one. A custom message arrives as a user turn and rewrites the work it
@@ -379,7 +462,7 @@ test("registration: both workflow names land and dispose together", { skip: runn
   assert.equal(outcome.ok, true, outcome.ok ? "" : outcome.message);
   if (!outcome.ok) return;
   try {
-    const fanout = resources.resolveWorkflowResource(FANOUT_NAME, { tasks: [{ agent: "worker", task: "x" }] }, sessionId);
+    const fanout = resources.resolveWorkflowResource(FANOUT_NAME, { tasks: [{ kind: "executor", task: "x" }] }, sessionId);
     assert.equal(fanout.ok, true, fanout.ok ? "" : fanout.error);
     assert.equal(fanout.resource.provenance.name, FANOUT_NAME);
     assert.equal(fanout.resource.provenance.version, 1);
@@ -392,7 +475,7 @@ test("registration: both workflow names land and dispose together", { skip: runn
   }
 
   // Disposal releases both names, so a replacement session can register again.
-  assert.equal(resources.resolveWorkflowResource(FANOUT_NAME, { tasks: [{ agent: "worker", task: "x" }] }, sessionId).ok, false);
+  assert.equal(resources.resolveWorkflowResource(FANOUT_NAME, { tasks: [{ kind: "executor", task: "x" }] }, sessionId).ok, false);
   assert.equal(resources.resolveWorkflowResource(WORKFLOW_NAME, { taskRef: ".trellis/tasks/10-20-demo" }, sessionId).ok, false);
   const again = await registerImplementReviewWorkflow(sessionId);
   assert.equal(again.ok, true, again.ok ? "" : again.message);
@@ -505,7 +588,7 @@ test("gate: a fanout dispatch is admitted without a task, while implement-review
     assert.ok(pair, "the pair is refused without a verified worktree");
     assert.match(pair.reason, /活跃任务工作树/);
 
-    assert.equal(await call({ workflow: FANOUT_NAME, args: { tasks: [{ agent: "worker", task: "x" }] } }), null,
+    assert.equal(await call({ workflow: FANOUT_NAME, args: { tasks: [{ kind: "executor", task: "x" }] } }), null,
       "a fanout is general-purpose: no task worktree is required");
 
     // Every other dispatch is untouched — a raw script, another extension's

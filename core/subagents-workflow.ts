@@ -35,9 +35,29 @@ import { dirname, join, resolve, relative, isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { subagentsPackageDir } from "./pi-subagents.ts";
+import { summarizeOverlap, type DispatchInterval, type OverlapSummary } from "./dispatch-timing.ts";
+import {
+  BUILTIN_KINDS,
+  agentNameFor,
+  builtinKind,
+  disabledKindMessage,
+  unregisteredKindMessage,
+  type FanoutKindPolicy,
+} from "../modules/agent-kinds/defaults.ts";
 
 export const WORKFLOW_NAME = "coworkflow.implement-review";
 export const WORKFLOW_VERSION = 1;
+/**
+ * The independent-children workflow.
+ *
+ * "Run these N things" is the common case and the one this layer kept getting
+ * wrong: a hand-written script that awaits `runs.run` in a loop is serial, gives
+ * no signal that it was serial, and costs the sum of its children's runtimes. As a
+ * registered resource, the concurrency is a property of *this package's code*
+ * rather than a property of whoever wrote the script that day.
+ */
+export const FANOUT_NAME = "coworkflow.fanout";
+export const FANOUT_VERSION = 1;
 /** The two stable child keys; a rerun reuses nothing, they are identity for the mission ledger. */
 export const IMPLEMENT_KEY = "implement";
 export const REVIEW_KEY = "review";
@@ -48,6 +68,10 @@ const MAX_TASK_REF = 200;
 const MAX_FOCUS = 2000;
 const MAX_TITLE = 300;
 const MAX_AGENT = 96;
+/** A fanout stays small enough that its children are genuinely independent work. */
+const MAX_FANOUT_TASKS = 8;
+const MAX_FANOUT_TASK = 8000;
+const FANOUT_ENTRY_FIELDS = ["kind", "task"] as const;
 /** How much child output a later step may embed before it becomes a pointer only. */
 const EMBED_LIMIT = 60_000;
 
@@ -82,6 +106,108 @@ function str(value: unknown): string | undefined {
 
 export function validTaskRef(value: string): boolean {
   return value.length <= MAX_TASK_REF && TASK_REF_RE.test(value) && ![".", ".."].includes(value.split("/").pop()!);
+}
+
+/** One independent child of `coworkflow.fanout`, already validated and keyed. */
+export interface FanoutChild {
+  key: string;
+  /** The project-facing kind, e.g. `executor`. */
+  kind: string;
+  /** The agent that kind resolves to, e.g. `cw-executor`. */
+  agent: string;
+  task: string;
+}
+
+/**
+ * How a fanout task may be dispatched: the kind policies the host resolved in
+ * memory, plus the refusals those policies produce.
+ *
+ * The resolver stays pure. It cannot read the project config (I/O) or the owner's
+ * registry (also I/O), so the host resolves the project's kind policy at gate time
+ * and hands the answer over. A task whose kind is absent from `kinds` is a kind
+ * this package does not ship, which is a different error from a disabled one.
+ */
+export interface FanoutPolicy {
+  kinds: readonly FanoutKindPolicy[];
+  /** The exact reason the kind policy could not be read, when it could not. */
+  unavailable?: string;
+}
+
+/**
+ * Validate and expand `coworkflow.fanout`.
+ *
+ * Same contract as `resolveImplementReview`: synchronous, bounded, no I/O, and the
+ * caller cannot supply filesystem authority. The only host-owned input is the
+ * verified worktree, used as the children's `cwd`; without it the children inherit
+ * the workflow's own cwd, which the host also chose.
+ *
+ * A task names a **kind**, never an agent: one vocabulary, and the kind→agent
+ * mapping stays where it already lives (`agentNameFor`), so a fanout child is the
+ * same agent a direct kind dispatch would run.
+ */
+export function resolveFanout(
+  args: Readonly<Record<string, unknown>>,
+  prepared?: PreparedWorkflowContext | null,
+  policy?: FanoutPolicy | null,
+): Expansion {
+  const allowed = new Set(["tasks", "focus"]);
+  const unsupported = Object.keys(args).filter((key) => !allowed.has(key));
+  if (unsupported.length) return { error: `workflow '${FANOUT_NAME}' args contain unsupported fields: ${unsupported.join(", ")}.` };
+  const focus = args.focus === undefined ? undefined : str(args.focus);
+  if (args.focus !== undefined && (!focus || focus.length > MAX_FOCUS)) return { error: `args.focus must contain 1–${MAX_FOCUS} characters.` };
+  if (!Array.isArray(args.tasks)) return { error: `args.tasks must be an array of 1–${MAX_FANOUT_TASKS} { kind, task } objects.` };
+  if (args.tasks.length < 1 || args.tasks.length > MAX_FANOUT_TASKS) {
+    return { error: `args.tasks must contain 1–${MAX_FANOUT_TASKS} tasks (received ${args.tasks.length}).` };
+  }
+  const children: PlannedChild[] = [];
+  for (let index = 0; index < args.tasks.length; index += 1) {
+    const raw: unknown = args.tasks[index];
+    const where = `args.tasks[${index}]`;
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return { error: `${where} must be a { kind, task } object.` };
+    const entry = raw as Record<string, unknown>;
+    const extra = Object.keys(entry).filter((key) => !(FANOUT_ENTRY_FIELDS as readonly string[]).includes(key));
+    if (extra.length) return { error: `${where} contains unsupported fields: ${extra.join(", ")}.` };
+    const kind = str(entry.kind);
+    if (!kind || kind.length > MAX_AGENT || !AGENT_RE.test(kind)) return { error: `${where}.kind must be a kind name this package ships.` };
+    const task = typeof entry.task === "string" ? entry.task.trim() : "";
+    if (!task || task.length > MAX_FANOUT_TASK) return { error: `${where}.task must contain 1–${MAX_FANOUT_TASK} characters.` };
+    const shipped = fanoutKindOf(policy, kind);
+    if (shipped === null) {
+      return { error: `${where}.kind '${kind}' is not a kind this package ships; available kinds: ${shippedKinds(policy)}.` };
+    }
+    // The key comes from the position, never from caller text: two children may
+    // legitimately be the same kind asking about different work, and upstream
+    // rejects a duplicate key outright.
+    children.push({
+      key: `task-${index + 1}`, kind, agent: shipped.agent, task,
+      refusal: shipped.dispatchable ? null : (shipped.refusal ?? defaultRefusal(policy, shipped)),
+    });
+  }
+  return { script: buildFanoutScript({ children,
+    ...(focus ? { focus } : {}), ...(prepared?.worktree ? { cwd: prepared.worktree } : {}) }) };
+}
+
+/** The policy entry for a kind this package ships, or `null` for any other name. */
+function fanoutKindOf(policy: FanoutPolicy | null | undefined, kind: string): FanoutKindPolicy | null {
+  // A declared kind the host did not resolve is still a kind this package ships;
+  // whether it may dispatch is then answered by the host's own reason, never by a
+  // guess made here.
+  if (!policy) return builtinKind(kind) === null ? null : { kind, agent: agentNameFor(kind), dispatchable: true };
+  return policy.kinds.find((entry) => entry.kind === kind) ?? null;
+}
+
+/** The kind policy could not be read: refuse, because "probably fine" is the old bug. */
+function defaultRefusal(policy: FanoutPolicy | null | undefined, shipped: FanoutKindPolicy): string {
+  return [
+    `无法确认 kind ${shipped.kind}（${shipped.agent}）现在是否可以派单：${policy?.unavailable ?? "本包没有给出该 kind 的策略"}。`,
+    "为避免把已关闭的 kind 当成可用，这个任务被拒绝；其他任务不受影响。",
+  ].join("");
+}
+
+/** The kinds a caller may name, for an error that is actionable. */
+function shippedKinds(policy: FanoutPolicy | null | undefined): string {
+  const kinds = policy ? policy.kinds.map((entry) => entry.kind) : BUILTIN_KINDS.map((entry) => entry.kind);
+  return kinds.length > 0 ? kinds.join("、") : "（无）";
 }
 
 /** Pure expansion of host-verified context. Public args cannot supply filesystem authority. */
@@ -141,6 +267,154 @@ const REVIEW_SCHEMA = {
   required: ["verdict", "summary", "findings"],
   additionalProperties: false,
 };
+
+/**
+ * Every fanout child answers in the same shape, on purpose.
+ *
+ * One child's structured output is what the parent reads to tell which task
+ * succeeded, so the shape is the same for all of them and a child that returns
+ * nothing usable is a *failed* task rather than a silent pass.
+ */
+const FANOUT_SCHEMA = {
+  type: "object",
+  properties: {
+    status: { type: "string", enum: ["completed", "blocked", "failed"] },
+    summary: { type: "string", minLength: 1, maxLength: 4000 },
+    handoff: { type: "string", minLength: 1, maxLength: 2000 },
+  },
+  required: ["status", "summary", "handoff"],
+  additionalProperties: false,
+};
+
+/** One child plus the refusal that stops it, decided before any child starts. */
+type PlannedChild = FanoutChild & { refusal: string | null };
+
+interface FanoutScriptInput {
+  children: PlannedChild[];
+  focus?: string;
+  cwd?: string;
+}
+
+/**
+ * Build the fanout script text.
+ *
+ * The concurrency is the whole point and it is written to be unmistakable: the
+ * `map` *starts* every child, and only afterwards is anything awaited, so a later
+ * child can never queue behind an earlier one. Each child's rejection becomes that
+ * child's own outcome, so one failure cannot cancel its siblings.
+ */
+function buildFanoutScript(input: FanoutScriptInput): string {
+  const focus = input.focus ? `\n本次扇出的共同要求（来自主会话）：${input.focus}\n` : "";
+  return `
+const tasks = ${JSON.stringify(input.children)};
+const cwd = ${JSON.stringify(input.cwd ?? null)};
+const FANOUT_SCHEMA = ${JSON.stringify(FANOUT_SCHEMA)};
+const MAX_SUMMARY = 4000;
+
+function textOf(value) {
+  return typeof value === "string" ? value : "";
+}
+
+function bounded(value, limit) {
+  const text = textOf(value).trim();
+  return text.length > limit ? text.slice(0, limit) : text;
+}
+
+function structuredOf(result) {
+  const structured = result && result.structuredOutput;
+  return structured && typeof structured === "object" && !Array.isArray(structured) ? structured : null;
+}
+
+// One outcome per task: a child that failed is reported as that task's failure,
+// with its own run identity when the runner produced one.
+function outcome(task, result, error) {
+  const structured = result ? structuredOf(result) : null;
+  const verdict = structured && typeof structured.status === "string" ? structured.status : null;
+  const ok = !error && result !== null && result !== undefined && result.ok === true && verdict === "completed";
+  const summary = structured && textOf(structured.summary).trim()
+    ? bounded(structured.summary, MAX_SUMMARY)
+    : bounded(result && result.output, MAX_SUMMARY) || bounded(error && error.message, MAX_SUMMARY) || "(no summary)";
+  return {
+    key: task.key,
+    kind: task.kind,
+    agent: task.agent,
+    ok: ok,
+    status: verdict === null ? (ok ? "completed" : "failed") : verdict,
+    summary: summary,
+    handoff: structured && textOf(structured.handoff).trim()
+      ? bounded(structured.handoff, 2000)
+      : (result && textOf(result.outputReference)) || null,
+    runId: result && typeof result.runId === "string" ? result.runId : null,
+    outputReference: result && typeof result.outputReference === "string" ? result.outputReference : null,
+    error: error ? bounded(error.message, MAX_SUMMARY) : (result && textOf(result.error) ? bounded(result.error, MAX_SUMMARY) : null)
+  };
+}
+
+function paramsFor(task) {
+  const params = {
+    label: task.key + " " + task.agent,
+    agent: task.agent,
+    task: task.task + ${JSON.stringify(focus)},
+    worktree: false,
+    context: "fresh",
+    acceptance: {
+      level: "checked",
+      report: "on",
+      criteria: ["Complete exactly this task and report the evidence it needs"],
+      evidence: ["changed-files", "commands-run", "residual-risks", "no-staged-files"]
+    },
+    outputSchema: FANOUT_SCHEMA
+  };
+  if (cwd !== null) params.cwd = cwd;
+  return params;
+}
+
+// A task whose kind the project disabled (or never registered) is its own failure,
+// decided before any child starts: the fanout refuses that task instead of starting
+// a kind the panel says is off, and the other tasks still run.
+function refused(task) {
+  return {
+    key: task.key, kind: task.kind, agent: task.agent, ok: false, status: "failed",
+    summary: task.refusal, handoff: null, runId: null, outputReference: null, error: task.refusal
+  };
+}
+
+// Start every child first; nothing is awaited inside this map.
+const launched = tasks.map(function (task) {
+  if (task.refusal !== null) return Promise.resolve(refused(task));
+  return runs.run(task.key, paramsFor(task)).then(
+    function (result) { return outcome(task, result, null); },
+    function (error) { return outcome(task, null, error); }
+  );
+});
+
+// Every child is already running; this only waits for them to settle.
+const results = await Promise.all(launched);
+
+const okCount = results.filter(function (entry) { return entry.ok === true; }).length;
+const failedCount = results.length - okCount;
+
+// Fail-closed only when nothing succeeded: a partial fanout is a real outcome the
+// parent must see, not a workflow error that hides the children that did finish.
+if (okCount === 0) {
+  const reasons = results.map(function (entry) { return entry.key + ": " + entry.summary; }).join("; ");
+  throw new Error("coworkflow.fanout: all " + results.length + " task(s) failed (" + reasons + ")");
+}
+
+return {
+  status: failedCount === 0 ? "completed" : "partial",
+  // A green fanout is a completed execution, not an accepted change: the parent
+  // still audits, decides about merge, and owns cleanup.
+  acceptance: "parent-owned",
+  note: "扇出正常结束只代表执行完成，不代表验收通过；每个子任务的结论都要由主会话自己核对，合并、清理与最终结论仍由主会话决定。",
+  concurrency: "parallel",
+  total: results.length,
+  completed: okCount,
+  failed: failedCount,
+  results: results
+};
+`;
+}
 
 /**
  * Build the script text.
@@ -402,6 +676,21 @@ export interface NativeRunLink {
   workflowReceiptPath?: string;
   sessionId?: string;
   recordedAt: string;
+  /**
+   * When the dispatch was launched, kept stable across later updates of this link.
+   *
+   * `recordedAt` is rewritten every time the link is adopted again (a handoff path
+   * arriving after completion moves it to that moment), so it cannot answer "when
+   * did this start" — the one fact the overlap measurement needs.
+   */
+  startedAt?: string;
+  /**
+   * When the run was observed to finish.
+   *
+   * Absent means unknown — still running, or the completion was never observed —
+   * and an unknown interval is never counted as serial work.
+   */
+  settledAt?: string;
 }
 
 function readLinks(root: string): NativeRunLink[] {
@@ -433,8 +722,20 @@ function readLinks(root: string): NativeRunLink[] {
  * later session to work that belongs to somebody else.
  */
 export function recordLaunchLink(root: string, link: Omit<NativeRunLink, "recordedAt">): void {
-  const links = readLinks(root).filter((entry) => entry.runId !== link.runId);
-  links.push({ ...link, recordedAt: new Date().toISOString() });
+  const existing = readLinks(root);
+  const previous = existing.find((entry) => entry.runId === link.runId);
+  const now = new Date().toISOString();
+  const links = existing.filter((entry) => entry.runId !== link.runId);
+  const startedAt = link.startedAt ?? previous?.startedAt ?? now;
+  const settledAt = link.settledAt ?? previous?.settledAt;
+  links.push({
+    ...link,
+    recordedAt: now,
+    // A later update of the same link (an adopted handoff path) must not move the
+    // launch time: only the first record of a run knows when it started.
+    startedAt,
+    ...(settledAt === undefined ? {} : { settledAt }),
+  });
   const kept = links.slice(-MAX_LINKS);
   const path = join(root, NATIVE_RUNS_FILE);
   try {
@@ -453,6 +754,52 @@ export function readRunLink(root: string, runId: string): NativeRunLink | undefi
 /** Links recorded for one task, newest last. */
 export function readTaskLinks(root: string, taskRef: string): NativeRunLink[] {
   return readLinks(root).filter((entry) => entry.taskRef === taskRef);
+}
+
+/** Links recorded in one session, oldest first. */
+export function readSessionLinks(root: string, sessionId: string): NativeRunLink[] {
+  return readLinks(root).filter((entry) => entry.sessionId === sessionId);
+}
+
+/**
+ * Record that a linked run finished, so its dispatch interval is closed.
+ *
+ * Called from an observed structured completion only: a link with no settle time
+ * stays *unknown*, and unknown is never counted as serial work. Re-settling an
+ * already-closed run keeps the first answer, because the completion that mattered
+ * was the one the runtime reported.
+ */
+export function recordRunSettled(root: string, runId: string, at: string = new Date().toISOString()): void {
+  const link = readLinks(root).find((entry) => entry.runId === runId);
+  if (!link || link.settledAt !== undefined) return;
+  recordLaunchLink(root, { ...link, settledAt: at });
+}
+
+function epochMs(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * How many of this session's dispatches actually overlapped.
+ *
+ * Read from the recorded links, so it is a fact about what happened rather than a
+ * count of what the model said it did. A link whose timestamps are missing stays
+ * unresolved: the measurement never turns "I could not tell" into "serial".
+ */
+export function dispatchOverlap(root: string, sessionId: string | null, now: number = Date.now()): OverlapSummary {
+  if (sessionId === null) return summarizeOverlap([], now);
+  const intervals: DispatchInterval[] = readSessionLinks(root, sessionId).map((link) => {
+    const startedAt = epochMs(link.startedAt);
+    const settledAt = epochMs(link.settledAt);
+    return {
+      id: link.runId,
+      ...(startedAt === undefined ? {} : { startedAt }),
+      ...(settledAt === undefined ? {} : { settledAt }),
+    };
+  });
+  return summarizeOverlap(intervals, now);
 }
 
 // ── Registration against the installed package ────────────────────────
@@ -540,15 +887,27 @@ export type RegistrationOutcome =
   | { ok: false; message: string };
 
 /**
- * Register this session's workflow resource.
+ * Register this session's workflow resources.
+ *
+ * Both names are registered here, in one pass, because they answer the same
+ * question — "can this session dispatch extension-owned work at all?" — and a
+ * session that silently had one without the other would be a layer that half
+ * works. The returned handle disposes both; a partial failure disposes whatever
+ * landed before it and reports the reason, so a session either has the pair or
+ * knows why it has neither.
  *
  * Replacing an existing registration is the caller's job (`dispose` first): the
- * owner refuses a duplicate name in the same session, and silently swallowing
- * that error would leave the session with no resource at all.
+ * owner refuses a duplicate name in the same session, and silently swallowing that
+ * error would leave the session with no resource at all.
  */
 export async function registerImplementReviewWorkflow(
   sessionId: string,
-  options: { projectRoot?: string; context?: () => PreparedWorkflowContext | null } = {},
+  options: {
+    projectRoot?: string;
+    context?: () => PreparedWorkflowContext | null;
+    /** The project's kind policy, resolved in memory by the caller; see `resolveFanout`. */
+    fanoutPolicy?: () => FanoutPolicy;
+  } = {},
 ): Promise<RegistrationOutcome> {
   const loaded = await loadSubagentsExport<WorkflowResourcesModule>("./workflow-resources", options.projectRoot);
   if (!loaded.ok) return { ok: false, message: loaded.message };
@@ -559,22 +918,32 @@ export async function registerImplementReviewWorkflow(
       message: "已安装的 pi-subagents 的 ./workflow-resources 没有导出 registerWorkflowResource；请升级 pi-subagents。",
     };
   }
-  try {
-    const registration = api.registerWorkflowResource({
-      sessionId,
-      definition: {
-        name: WORKFLOW_NAME,
-        version: WORKFLOW_VERSION,
-        resolve: (args) => resolveImplementReview(args, options.context?.()),
-      },
-    });
-    return { ok: true, registration };
-  } catch (error) {
-    return {
-      ok: false,
-      message: `注册工作流资源 ${WORKFLOW_NAME} 失败：${error instanceof Error ? error.message : String(error)}。`,
-    };
+  const definitions = [
+    { name: WORKFLOW_NAME, version: WORKFLOW_VERSION, resolve: (args: Readonly<Record<string, unknown>>) => resolveImplementReview(args, options.context?.()) },
+    { name: FANOUT_NAME, version: FANOUT_VERSION,
+      resolve: (args: Readonly<Record<string, unknown>>) => resolveFanout(args, options.context?.(), options.fanoutPolicy?.()) },
+  ];
+  const registered: Disposable[] = [];
+  for (const definition of definitions) {
+    try {
+      registered.push(api.registerWorkflowResource({ sessionId, definition }));
+    } catch (error) {
+      for (const handle of registered) { try { handle.dispose(); } catch { /* idempotent upstream */ } }
+      return {
+        ok: false,
+        message: `注册工作流资源 ${definition.name} 失败：${error instanceof Error ? error.message : String(error)}。`,
+      };
+    }
   }
+  return {
+    ok: true,
+    registration: {
+      dispose() {
+        for (const handle of registered) handle.dispose();
+        registered.length = 0;
+      },
+    },
+  };
 }
 
 /**

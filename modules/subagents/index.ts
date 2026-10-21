@@ -51,7 +51,7 @@ import { readConfig } from "../../core/config.ts";
 import { installedVersion, readUserConfig, subagentsPackageDir, decodeNativeCompletions } from "../../core/pi-subagents.ts";
 import { mainCheckout, repoRoot, activeTaskDir, resolveTaskDir, taskRefForDisplay } from "../../core/trellis.ts";
 import { attachSubagents, existingSubagentsBridge, type SubagentsBridge } from "../../core/subagents-client.ts";
-import { kindWorkflowAgents, syncAgentKinds } from "../agent-kinds/index.ts";
+import { fanoutPolicyFor, kindWorkflowAgents, syncAgentKinds } from "../agent-kinds/index.ts";
 import { requestSteer, requestStop } from "./run-control.ts";
 import { resolveKinds } from "../agent-kinds/defaults.ts";
 import {
@@ -528,6 +528,10 @@ function schedule(state: HostState, runtime: RuntimeContext, host: PiRuntimeHost
       // settings, so schedule()/tool_call must evaluate those gates beforehand.
       context: () => live() && runtime.enabled && (!wantsChildren || token.children !== null) &&
         token.failure === undefined ? token.prepared : null,
+      // The fanout's kind policy is resolved the same way and at the same moment:
+      // in memory, from the project's config plus the owner's accepted kind
+      // registrations, never by the resolver reading either.
+      fanoutPolicy: () => fanoutPolicyFor(host, runtime),
     });
     if (!live()) { if (workflow.ok) disposeQuietly(workflow.registration); return; }
     if (workflow.ok) token.workflow = workflow.registration;

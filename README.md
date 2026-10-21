@@ -292,6 +292,77 @@ kind 与 Trellis 角色的对应写在 kind 表里（`executor → implement`、
 一行一个 kind 在 `/Coworkflow:settings` 的「子 agent 类型」里改，**当场生效、无需重启**；改两次等于没改：
 不会留下重复注册、不会撞上游重名，也不会多出第二个 `tool_call` 钩子。
 
+## 并行扇出：`coworkflow.fanout`
+
+独立的工作要一次派完。写脚本时最容易犯的错就是这条：
+
+```js
+// 串行：第二个 child 要等第一个跑完才启动，总耗时是两者之和
+const a = await runs.run("a", { agent: "worker", task: "A" });
+const b = await runs.run("b", { agent: "worker", task: "B" });
+
+// 并行：两个 child 同时启动
+const [a, b] = await Promise.all([
+  runs.run("a", { agent: "worker", task: "A" }),
+  runs.run("b", { agent: "worker", task: "B" }),
+]);
+```
+
+同一种能力，差别只在脚本怎么写，而串行版本**不报错、不慢到可疑、也没有任何信号**。所以
+「一次跑 N 个独立 child」不是一个应该由模型每次现场手写的脚本，而是本包注册的第二个原生工作流资源：
+
+```js
+subagent({ workflow: "coworkflow.fanout", args: { tasks: [
+  { kind: "executor", task: "实现 A" },
+  { kind: "executor", task: "实现 B" },
+  { kind: "auditor",  task: "只读审计 C" },
+] } })
+```
+
+**每个 task 写的是 kind，不是 agent 名。** `executor` / `auditor` / `researcher` 就是
+`/Coworkflow:settings` 里「子 agent 类型」管的那几个 kind，解析成 agent 名（`cw-executor`、
+`cw-auditor`）走的是同一张表（`agentNameFor`），所以扇出里的 child 和直接派单的 child 是同一个 agent。
+写别的名字（`worker`、`trellis-implement`、`cw-executor`）都会被拒，错误里列出本包提供的 kind。
+
+- `tasks` 必须是 1–8 项，每项只有 `kind` 与 `task`，其他字段（包括 `agent`、`worktree`）一律拒绝；
+  额外可选项只有 `focus`（一句共同要求）。校验风格与 `coworkflow.implement-review` 一致。
+- **按 kind 的开关照样生效**：某个 task 的 kind 在设置里被关掉、或该 kind 在本会话没注册成功，
+  这一个 task 直接判失败（用的是 `tool_call` 门那套原话：「本项目…关闭了 kind auditor（cw-auditor）…当前可用的
+  kind：cw-executor」），**不会启动它**，其他 task 照常跑。读不到 kind 策略时同样拒绝，不假设可用。
+- 每个 child 都是 `context: "fresh"`、`worktree: false`、带自己的 `acceptance` 与 `outputSchema`，
+  所以一个 child 的结论不可能替另一个签字。child key 由位置决定（`task-1`…`task-8`），
+  两个 child 可以是同一个 kind 做不同的事。
+- 这些 child **由 `Promise.all` 同时启动**，不是 `for` 里的 `await`。这是这个资源存在的全部理由，
+  代码里也写成这样：先 `map` 全部启动，再 await。
+- 一个 child 失败不影响兄弟：返回 `{ status, results: [{ key, kind, agent, ok, status, summary, handoff, runId, error }] }`，
+  `status` 是 `completed` 或 `partial`。全部失败才 fail-closed（抛错）。
+- 返回里带 `acceptance: "parent-owned"` 与说明：**扇出绿了只代表执行完成，不代表验收通过**，
+  主会话仍要自己核对每个 child 的结论，合并与清理仍然是主会话的事。
+
+两个工作流在同一个注册流程里注册（`registerImplementReviewWorkflow`），一个会话要么两个名字都在，
+要么报告为什么都不在；dispose 与替换语义和以前一样。
+
+### 串行派单是被测量的缺陷，不是被提醒的缺陷
+
+同一会话里的派单间隔现在会被记录：每次关联 run 时记下开始时间，观察到结构化完成时记下结束时间，
+`/Coworkflow:status` 因此能给出**一行事实**：
+
+```
+派单重叠: 3 次并行、5 次串行（本次会话）
+```
+
+判定是保守的：
+
+- 两条区间相交 = **并行**；
+- 有完整区间且不与任何兄弟相交 = **串行**；
+- 时间戳缺失、仍在运行、或时钟倒退 = **未知**，单独计数并标注「不计入串行」。
+  缺一个区间就当作串行，会让这行数字本身变成假的。
+
+这一行是渲染 `/Coworkflow:status` 时从 `.trellis/.runtime/native-runs.json` 读出来的**存储状态**，
+既不是消息也不是提醒。这里曾经有一段「工具调用次数提醒」被注入对话，后来删掉了：
+**自定义消息会以 user turn 的形式回到模型，打断并重写它正在描述的那次工作**。
+所以这里改成测量事实，让主会话自己读到；`/Coworkflow:lanes` 之后可以复用同一个测量。
+
 ## 中断一个 run：`stop` / `steer`
 
 主会话必须能随时打断自己派出去的 run，所以三个命令都走 pi-subagents 的公开 RPC

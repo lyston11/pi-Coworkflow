@@ -53,7 +53,20 @@
 import type { PiRuntimeHost, RuntimeContext, Unsubscribe, WorkflowModule } from "../../core/module.ts";
 import { readConfig, type ResolvedAgentKind, type WorkflowConfig } from "../../core/config.ts";
 import { attachSubagents, existingSubagentsBridge } from "../../core/subagents-client.ts";
-import { agentNameFor, builtinKind, kindOf, kindRole, resolveKinds, kindSystemPrompt, unshippedKinds } from "./defaults.ts";
+import {
+  BUILTIN_KINDS,
+  agentNameFor,
+  builtinKind,
+  disabledKindMessage,
+  kindOf,
+  kindRole,
+  resolveKinds,
+  kindSystemPrompt,
+  unregisteredKindMessage,
+  unshippedKinds,
+  type FanoutKindPolicy,
+} from "./defaults.ts";
+import type { FanoutPolicy } from "../../core/subagents-workflow.ts";
 import {
   kindRegistryFor,
   loadRuntimeAgentContract,
@@ -206,11 +219,11 @@ function availableKinds(kinds: readonly ResolvedAgentKind[], snapshot: Snapshot 
 }
 
 function disabledRefusal(dispatch: KindDispatch, available: readonly string[]): Refusal {
+  // The wording lives in `disabledKindMessage` because `coworkflow.fanout` refuses
+  // a disabled kind per task too: one vocabulary, or the two paths disagree about
+  // what the user's switch means.
   return refusal([
-    `本项目在 /Coworkflow:settings 的「子 agent 类型」里关闭了 ${kindLabel(dispatch.agent, dispatch.kind)}。`,
-    available.length > 0
-      ? `当前可用的 kind：${available.join("、")}；其他 agent 的派单不受影响。`
-      : "当前没有可用的 kind；其他 agent 的派单不受影响。",
+    disabledKindMessage(dispatch.kind, dispatch.agent, available),
     `要恢复：在 /Coworkflow:settings 里打开 ${dispatch.kind}，无需重启。`,
   ], dispatch);
 }
@@ -426,6 +439,61 @@ async function gate(
   // `>=`: at the limit there is no room for one more, which is what the limit means.
   if (observed.count >= limit) return overLimitRefusal(dispatch, limit, observed.count);
   return;
+}
+
+/**
+ * The kind policy a `coworkflow.fanout` resolver needs, resolved in memory.
+ *
+ * A workflow resolver is synchronous and I/O-free by contract, so it cannot read
+ * the project config or the owner's registry. This is where that reading happens:
+ * at gate time, from the same `resolveKinds` the panel and the `tool_call` gate use,
+ * so a fanout cannot disagree with a direct dispatch about what "disabled" means.
+ *
+ * `dispatchable` is the gate's own answer: enabled *and* accepted by the owner in
+ * this session. A kind that is enabled but unregistered is refused with the
+ * registration reason rather than started, because such a launch fails at the
+ * runner as "unknown agent" — the dishonest half-degradation this module exists to
+ * remove. When the policy itself cannot be read, every kind is refused for that
+ * reason; "probably fine" is the bug, not the fallback.
+ */
+export function fanoutPolicyFor(host: object, runtime: RuntimeContext): FanoutPolicy {
+  if (!runtime.enabled || !runtime.control.moduleEnabled("agent-kinds")) {
+    return { kinds: shippedKindPolicies(), unavailable: "本会话的「子 agent 类型」（agent-kinds）模块已关闭，无法确认任何 kind 是否可以派单" };
+  }
+  // A root git could not resolve reads as "no config", which is the same answer
+  // the panel gives: absent policy means the built-in defaults, not a guess.
+  const root = runtime.configRoots.root(runtime.cwd);
+  const kinds = resolveKinds(root === null ? null : readConfig(root));
+  const snapshot = STATES.get(host as PiRuntimeHost)?.snapshot ?? null;
+  const live = snapshot === null || snapshot.contractFailure !== undefined
+    ? null
+    : new Set(snapshot.registered.map((entry) => entry.kind));
+  const available = availableKinds(kinds, snapshot);
+  return {
+    kinds: kinds.map((entry) => {
+      if (!entry.enabled) {
+        return { kind: entry.kind, agent: entry.agent, dispatchable: false,
+          refusal: disabledKindMessage(entry.kind, entry.agent, available) };
+      }
+      if (live === null || !live.has(entry.kind)) {
+        return { kind: entry.kind, agent: entry.agent, dispatchable: false,
+          refusal: unregisteredKindMessage(entry.kind, entry.agent, registrationReason(snapshot, entry.kind)) };
+      }
+      return { kind: entry.kind, agent: entry.agent, dispatchable: true };
+    }),
+  };
+}
+
+/** Every kind this package ships, marked dispatchable: the no-policy fallback. */
+function shippedKindPolicies(): FanoutKindPolicy[] {
+  return BUILTIN_KINDS.map((entry) => ({ kind: entry.kind, agent: agentNameFor(entry.kind), dispatchable: true }));
+}
+
+/** Why an enabled kind is not in the owner's agent list, in the gate's words. */
+function registrationReason(snapshot: Snapshot | null, kind: string): string {
+  if (snapshot === null) return "本会话的 agent kind 注册尚未完成，无法确认它真的在 agent 列表里";
+  return snapshot.contractFailure ?? snapshot.failures.find((entry) => entry.kind === kind)?.reason ??
+    "该 kind 未注册（可能缺少系统提示资产或被上游拒绝）";
 }
 
 /**
