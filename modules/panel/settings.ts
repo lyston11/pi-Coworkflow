@@ -12,7 +12,7 @@
  */
 
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
-import { Container, Key, Spacer, Text, matchesKey } from "@earendil-works/pi-tui";
+import { Container, Input, Key, Spacer, Text, fuzzyFilter, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { PiRuntimeHost, RuntimeContext, WorkflowControl } from "../../core/module.ts";
 import { refreshUsage } from "../../core/usage.ts";
 import { existingSubagentsBridge } from "../../core/subagents-client.ts";
@@ -21,10 +21,10 @@ import { FALLBACK_KEYS, type PanelKeybindings, type PanelTheme } from "./shared.
 /**
  * A settings row: a label, its current value, and what Enter does.
  *
- * `toggle` and `adjust` are the two extra gestures a value that is more than a
- * switch needs (a kind is on/off *and* has a limit): Space toggles, ←→ steps the
- * number, Enter does what the row's own label says it does. Rows that declare
- * neither keep exactly the old behaviour — Enter only.
+ * `toggle` adds the one gesture a switch needs (Space, without leaving the row).
+ * There is deliberately no ←→ stepping: in this panel ←→ moves the cursor between
+ * the 设置项 and 当前值 columns, exactly as it does in `/Comodels`, so a value that
+ * needs editing opens its own editor on Enter.
  */
 export interface SettingRow {
   label: string;
@@ -37,8 +37,6 @@ export interface SettingRow {
   act?: () => string | Promise<string>;
   /** Space: flip a boolean without leaving the row. */
   toggle?: () => string | Promise<string>;
-  /** ←→: step a bounded number by `delta`. */
-  adjust?: (delta: number) => string | Promise<string>;
 }
 
 /**
@@ -53,22 +51,36 @@ export interface SettingsPanelIo {
 }
 
 /**
- * The project settings panel. Rows come from the control surface, so the panel
- * shows the same state the slash commands report and writes through the same
- * code path.
+ * The project settings panel.
+ *
+ * Rows come from the control surface, so the panel shows the same state the slash
+ * commands report and writes through the same code path.
+ *
+ * Laid out and driven like `/Comodels`: a tab bar, a three-column table with a rule
+ * under the header, ←→ to move between the two live columns, ↑↓ to move within a
+ * column, Enter to apply, Esc to close, and typing to filter. Two tabs split what is
+ * *writable* (the project's configuration) from what is only *reported* (the modules'
+ * own status lines), because mixing read-only prose into an editable list made every
+ * row look like something you could change.
  */
 export class SettingsPanel extends Container {
   private readonly io: SettingsPanelIo;
   private readonly theme: PanelTheme;
   private readonly tui: { requestRender?(): void };
   private readonly keybindings: PanelKeybindings | undefined;
+  private all: SettingRow[] = [];
   private rows: SettingRow[] = [];
+  private tab: SettingsTab = "project";
+  private focus: SettingsFocus = "item";
   private cursor = 0;
+  private query = "";
   /** One row action at a time; see `run()` for why a second gesture is dropped. */
   private inflight = false;
   private status = "";
-  private readonly listContainer = new Container();
+  private width: number | undefined;
+  private readonly body = new Container();
   private readonly statusText = new Text("", 0, 0);
+  private readonly searchInput = new Input();
 
   constructor(
     io: SettingsPanelIo,
@@ -85,24 +97,27 @@ export class SettingsPanel extends Container {
     const border = () => new DynamicBorder((str: string) => theme.fg("border", str));
     this.addChild(border());
     this.addChild(new Spacer(1));
-    this.addChild(
-      new Text(theme.fg("accent", theme.bold ? theme.bold("Coworkflow 设置") : "Coworkflow 设置"), 0, 0),
-    );
+    this.addChild(new Text(theme.fg("accent", theme.bold ? theme.bold("Coworkflow 设置") : "Coworkflow 设置"), 0, 0));
     this.addChild(new Spacer(1));
-    this.addChild(this.listContainer);
+    this.addChild(this.body);
     this.addChild(new Spacer(1));
     this.addChild(this.statusText);
-    this.addChild(new Text(theme.fg("muted", "↑↓ 移动 · Enter 修改 · Space 开关 · ←→ 调上限 · Esc 关闭"), 0, 0));
+    this.addChild(
+      new Text(
+        theme.fg("muted", "↑↓ 移动 · ←→ 切换 设置项/当前值 列 · Tab 切换 项目/状态 · Enter 修改 · Space 开关 · Esc 关闭 · 直接输入可筛选"),
+        0,
+        0,
+      ),
+    );
     this.addChild(new Spacer(1));
     this.addChild(border());
 
-    this.rows = io.rows();
-    const first = this.rows.findIndex((row) => !row.header);
-    this.cursor = first >= 0 ? first : 0;
-    this.updateList();
+    this.searchInput.focused = true;
+    this.searchInput.onSubmit = () => this.applyRow();
+    this.adopt(io.rows());
   }
 
-  /** Rows currently shown, for tests. */
+  /** Rows currently shown in the active tab, for tests. */
   currentRows(): SettingRow[] {
     return this.rows;
   }
@@ -110,6 +125,11 @@ export class SettingsPanel extends Container {
   /** The row the cursor is on, for tests: a key gesture has to land on a row. */
   selectedRow(): SettingRow | undefined {
     return this.rows[this.cursor];
+  }
+
+  /** Which tab and column currently own the cursor, for tests. */
+  viewState(): { tab: SettingsTab; focus: SettingsFocus } {
+    return { tab: this.tab, focus: this.focus };
   }
 
   private matches(data: string, action: "up" | "down" | "confirm" | "cancel"): boolean {
@@ -124,35 +144,157 @@ export class SettingsPanel extends Container {
     return fallback[action]?.test(data) ?? false;
   }
 
-  private updateList(): void {
+  /**
+   * Split the owner's rows into the two tabs and put the cursor on something real.
+   *
+   * The owner emits one list with section headers; the `状态` header marks where the
+   * read-only report begins. Splitting there rather than by `readOnly` keeps the
+   * intent in one place: everything after that header was never editable.
+   */
+  private adopt(rows: SettingRow[]): void {
+    this.all = rows;
+    const statusAt = rows.findIndex((row) => row.header === true && row.label.trim() === "状态");
+    const project = statusAt < 0 ? rows : rows.slice(0, statusAt);
+    const reported = statusAt < 0 ? [] : rows.slice(statusAt);
+    this.projectRows = project;
+    this.statusRows = reported;
+    this.rebuild();
+  }
+
+  private projectRows: SettingRow[] = [];
+  private statusRows: SettingRow[] = [];
+
+  private source(): SettingRow[] {
+    return this.tab === "project" ? this.projectRows : this.statusRows;
+  }
+
+  /** Apply the filter and keep the cursor on a selectable row. */
+  private rebuild(): void {
+    const source = this.source();
+    if (this.tab === "project" && this.query.trim() !== "") {
+      const hits = new Set(
+        fuzzyFilter(source.filter((row) => !row.header).map((row, index) => ({ row, index })),
+          this.query.trim(),
+          (entry) => entry.row.label).map((entry) => entry.index),
+      );
+      this.rows = source.filter((row, index) => !row.header && hits.has(index));
+    } else {
+      this.rows = source;
+    }
+    const selectable = this.selectable();
+    if (!selectable.includes(this.cursor)) this.cursor = selectable[0] ?? 0;
+    this.updateBody();
+  }
+
+  private selectable(): number[] {
+    return this.rows.map((row, index) => (row.header ? -1 : index)).filter((index) => index >= 0);
+  }
+
+  // ── table geometry, the same discipline as the model panel ──────────
+
+  /** A cell padded/truncated to an exact display width, before it is coloured. */
+  private cell(text: string, width: number): string {
+    return truncateToWidth(text, width, "…", true);
+  }
+
+  private paint(text: string, color: string | null): string {
+    return color ? this.theme.fg(color, text) : text;
+  }
+
+  private columnWidths(width: number): { item: number; value: number; detail: number } {
+    const SEP = 3; // " │ "
+    const total = Math.max(60, width - 2 - SEP * 2);
+    const value = Math.min(26, Math.max(14, Math.floor(total * 0.22)));
+    const item = Math.min(34, Math.max(18, Math.floor(total * 0.28)));
+    return { item, value, detail: Math.max(10, total - item - value) };
+  }
+
+  private tableRule(widths: { item: number; value: number; detail: number }): Text {
+    const bar = (w: number) => "─".repeat(w);
+    return new Text(
+      this.theme.fg("dim", `  ${bar(widths.item)}─┼─${bar(widths.value)}─┼─${bar(widths.detail)}`),
+      0,
+      0,
+    );
+  }
+
+  private tabBar(): Text {
     const theme = this.theme;
-    this.listContainer.clear();
+    const cell = (label: string, id: SettingsTab) =>
+      this.tab === id
+        ? theme.fg("accent", theme.bold ? theme.bold(`[${label}]`) : `[${label}]`)
+        : theme.fg("muted", ` ${label} `);
+    return new Text(`${cell("项目", "project")}  ${cell("状态", "status")}`, 0, 0);
+  }
+
+  private updateBody(): void {
+    const theme = this.theme;
+    const width = this.width ?? 100;
+    const widths = this.columnWidths(width);
+    const sep = theme.fg("dim", " │ ");
+    this.body.clear();
+    this.body.addChild(this.tabBar());
+    const itemHeader = this.paint(this.cell("设置项", widths.item), this.focus === "item" ? "accent" : "muted");
+    const valueHeader = this.paint(this.cell("当前值", widths.value), this.focus === "value" ? "accent" : "muted");
+    this.body.addChild(new Text(`  ${itemHeader}${sep}${valueHeader}${sep}${this.paint(this.cell("说明", widths.detail), "muted")}`, 0, 0));
+    this.body.addChild(this.tableRule(widths));
+
+    if (this.rows.length === 0) {
+      this.body.addChild(new Text(theme.fg("muted", this.query ? `  （没有匹配 “${this.query}” 的设置项）` : "  （本节没有内容）"), 0, 0));
+    }
     for (let i = 0; i < this.rows.length; i += 1) {
       const row = this.rows[i]!;
       if (row.header) {
-        this.listContainer.addChild(new Text(theme.fg("accent", `── ${row.label} `), 0, 0));
+        // A section separator spans the table instead of becoming a cell, so the
+        // grouping survives the table layout without a fourth column.
+        // Measured in display columns, not characters: a CJK section name is two
+        // columns per character, and using `.length` made the rule overflow onto a
+        // second line.
+        const lead = `  ── ${row.label} `;
+        const tail = Math.max(0, widths.item + widths.value + widths.detail + 8 - visibleWidth(lead));
+        this.body.addChild(new Text(theme.fg("accent", `  ── ${row.label} ${"─".repeat(tail)}`), 0, 0));
         continue;
       }
       const selected = i === this.cursor;
-      const cursor = selected ? theme.fg("accent", "→ ") : "  ";
-      const label = selected ? theme.fg("accent", row.label) : row.label;
-      const value = row.readOnly ? theme.fg("muted", row.value) : theme.fg("success", row.value);
-      const detail = row.detail ? ` ${theme.fg("dim", row.detail)}` : "";
-      this.listContainer.addChild(new Text(`${cursor}${label}  ${value}${detail}`, 0, 0));
+      const pointer = selected ? theme.fg("accent", "→ ") : "  ";
+      const label = this.cell(row.label, widths.item);
+      const value = this.cell(row.value, widths.value);
+      const detail = this.cell(row.detail ?? "", widths.detail);
+      // The cursor colour follows the column that owns it, the way the model panel's
+      // header does: which column a keystroke will act on is visible, not implied.
+      const labelCell = this.paint(label, selected && this.focus === "item" ? "accent" : selected ? "text" : null);
+      const valueCell = this.paint(value, row.readOnly ? "muted" : selected && this.focus === "value" ? "accent" : "success");
+      this.body.addChild(new Text(`${pointer}${labelCell}${sep}${valueCell}${sep}${this.paint(detail, "dim")}`, 0, 0));
     }
     this.statusText.setText(this.status ? theme.fg("success", this.status) : "");
   }
 
+  render(width: number): string[] {
+    this.width = width;
+    this.updateBody();
+    return super.render(width);
+  }
+
   private move(delta: number): void {
-    const selectable = this.rows
-      .map((row, index) => (row.header ? -1 : index))
-      .filter((index) => index >= 0);
+    const selectable = this.selectable();
     if (selectable.length === 0) return;
     const position = selectable.indexOf(this.cursor);
-    const next = selectable[(position + delta + selectable.length) % selectable.length]!;
-    this.cursor = next;
-    this.updateList();
+    this.cursor = selectable[(position + delta + selectable.length) % selectable.length]!;
+    this.updateBody();
     this.tui?.requestRender?.();
+  }
+
+  private refresh(): void {
+    this.updateBody();
+    this.tui?.requestRender?.();
+  }
+
+  /** Enter: do what this row's label says, whatever column the cursor is in. */
+  private applyRow(): void {
+    const row = this.rows[this.cursor];
+    if (!row || row.readOnly) return;
+    const action = row.act ?? row.toggle;
+    if (action) this.run(action);
   }
 
   handleInput(data: string): void {
@@ -160,20 +302,40 @@ export class SettingsPanel extends Container {
       this.io.close();
       return;
     }
+    // Tab switches the scope tab (项目 / 状态), from either column.
+    if (matchesKey(data, Key.tab)) {
+      this.tab = this.tab === "project" ? "status" : "project";
+      this.query = "";
+      this.searchInput.setValue("");
+      this.cursor = 0;
+      this.rebuild();
+      this.refresh();
+      return;
+    }
+    // ←→ switch which column owns the cursor: 设置项 / 当前值. Matched before the
+    // search field sees them, because `Input` treats cursorLeft/Right as its own.
+    if (matchesKey(data, Key.right) || matchesKey(data, Key.left)) {
+      this.focus = this.focus === "item" ? "value" : "item";
+      this.searchInput.focused = this.focus === "item";
+      this.refresh();
+      return;
+    }
     if (this.matches(data, "up")) return this.move(-1);
     if (this.matches(data, "down")) return this.move(1);
-    const row = this.rows[this.cursor];
-    if (row && !row.header && !row.readOnly) {
-      // Matched the way the model panel matches its own column switch, because
-      // these keys are per-row gestures rather than list navigation.
-      if (row.toggle && matchesKey(data, Key.space)) return this.run(row.toggle);
-      if (row.adjust && matchesKey(data, Key.left)) return this.run(() => row.adjust!(-1));
-      if (row.adjust && matchesKey(data, Key.right)) return this.run(() => row.adjust!(1));
-    }
     if (this.matches(data, "confirm")) {
-      if (!row?.act || row.readOnly) return;
-      this.run(row.act);
+      this.applyRow();
+      return;
     }
+    const row = this.rows[this.cursor];
+    if (row && !row.readOnly && row.toggle && matchesKey(data, Key.space)) {
+      return this.run(row.toggle);
+    }
+    // Typing filters, on the same column the model panel filters from.
+    if (this.tab !== "project" || this.focus !== "item") return;
+    this.searchInput.handleInput(data);
+    this.query = this.searchInput.getValue();
+    this.rebuild();
+    this.refresh();
   }
 
   /**
@@ -185,7 +347,7 @@ export class SettingsPanel extends Container {
    *
    * One action at a time. A row gesture is built from the snapshot that rendered
    * the row, so two gestures delivered inside one tick — a held Space, two quick
-   * Right presses — both started from the same stale value and the second silently
+   * Enters — both started from the same stale value and the second silently
    * overwrote the first: Right,Right on a limit of 3 produced 4, and Space,Space on
    * a disabled kind left it enabled. A policy editor that appears to work while
    * doing less is the exact failure this module exists to remove, so an action
@@ -210,18 +372,15 @@ export class SettingsPanel extends Container {
 
   /** Re-read the rows from the owner, keeping the cursor on a selectable row. */
   reload(status: string): void {
-    this.rows = this.io.rows();
     this.status = status;
-    if (this.rows[this.cursor]?.header) {
-      const next = this.rows.findIndex((row, index) => index > this.cursor && !row.header);
-      const fallback = this.rows.findIndex((row) => !row.header);
-      this.cursor = next >= 0 ? next : fallback >= 0 ? fallback : 0;
-    }
-    this.updateList();
-    this.tui?.requestRender?.();
+    this.adopt(this.io.rows());
+    this.refresh();
   }
-
 }
+
+type SettingsTab = "project" | "status";
+type SettingsFocus = "item" | "value";
+
 /**
  * Register `/Coworkflow:settings`. Always available: it is how a project gets
  * configured, and it offers to initialize a project that has not been adopted
@@ -355,18 +514,17 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
               ? "注册失败（原因见下方状态行）"
               : "已启用；注册状态见下方状态行",
       toggle: () => control.setAgentKind(entry.kind, { enabled: !entry.enabled }),
-      adjust: (delta) =>
-        control.setAgentKind(entry.kind, { maxConcurrent: Math.max(1, entry.maxConcurrent + delta) }),
       act: () => editKindLimit(control, commandCtx, entry.kind, entry.maxConcurrent),
     });
   }
   if (kinds.length === 0) {
     rows.push({ label: "（本构建没有内置 kind）", value: "", readOnly: true });
   }
-  // The module's own lines, verbatim: a kind that did not register must never be
-  // shown as available, and the reason is the only actionable thing here. The
-  // leading status glyph is kept in the label rather than rendered as a value,
-  // because these are sentences, not settings.
+  // The module's own lines, verbatim, on the read-only tab: a kind that did not
+  // register must never be shown as available, and the reason is the only
+  // actionable thing here. The leading status glyph is kept in the label rather
+  // than rendered as a value, because these are sentences, not settings.
+  rows.push({ label: "状态", value: "", header: true });
   for (const line of status) {
     rows.push({ label: line.trim(), value: "", readOnly: true });
   }

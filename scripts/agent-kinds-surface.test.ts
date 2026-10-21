@@ -268,6 +268,10 @@ interface PanelHarness {
   press(key: string): Promise<void>;
   /** Send several keys inside one tick, the way a held key or two fast presses do. */
   pressBurst(...keys: string[]): Promise<void>;
+  /** Which tab and column own the cursor. */
+  viewState(): { tab: "project" | "status"; focus: "item" | "value" };
+  /** Labels the active tab is showing. */
+  visible(): string[];
   statuses: string[];
 }
 
@@ -315,11 +319,14 @@ function panelFor(control: Parameters<typeof buildSettingRows>[0]): PanelHarness
       for (const key of keys) panel.handleInput(key);
       await settle();
     },
+    viewState: () => panel.viewState(),
+  /** Rows the active tab is showing, for the table's own navigation. */
+  visible: () => panel.currentRows().map((row) => row.label),
     statuses,
   };
 }
 
-test("panel: Space toggles a kind, ←→ steps its limit, and neither needs a restart", { skip }, async () => {
+test("panel: Space toggles a kind and Enter edits its limit, with no restart", { skip }, async () => {
   const { pi, listener } = fakePi();
   const root = tempProject();
   const loaded = await loadExtension(root, pi.events);
@@ -344,13 +351,15 @@ test("panel: Space toggles a kind, ←→ steps its limit, and neither needs a r
     assert.match(panel.selected()?.value ?? "", /\[x\] 开/, "the row reflects the new state");
     assert.match(panel.statuses.at(-1) ?? "", /本会话已生效/, panel.statuses.join("\n"));
 
-    // ←→: the limit steps by one, persisted and re-read by the same control surface.
+    // ←→ is the column switch now, exactly as in /Comodels: it must not change a
+    // value on its own. Editing goes through Enter, which opens the row's editor.
+    const limitBefore = loaded.control.agentKinds().find((entry) => entry.kind === "auditor")?.maxConcurrent;
     await panel.press("\x1b[C");
-    assert.equal(loaded.control.agentKinds().find((entry) => entry.kind === "auditor")?.maxConcurrent, 2);
-    await panel.press("\x1b[D");
-    await panel.press("\x1b[D");
-    assert.equal(loaded.control.agentKinds().find((entry) => entry.kind === "auditor")?.maxConcurrent, 1);
-    assert.match(panel.selected()?.value ?? "", /上限 1/);
+    assert.deepEqual(panel.viewState().focus, "value", "←→ moves the cursor to the 当前值 column");
+    assert.equal(loaded.control.agentKinds().find((entry) => entry.kind === "auditor")?.maxConcurrent, limitBefore,
+      "switching columns does not silently edit the number");
+    await panel.press("\x1b[C");
+    assert.deepEqual(panel.viewState().focus, "item", "←→ toggles back to the 设置项 column");
 
     // Toggling twice lands exactly where it started: one registration, no
     // collision error, and no duplicate `tool_call` hook.
@@ -724,17 +733,60 @@ test("panel: a key burst is not a lost update", { skip }, async () => {
   try {
     await loaded.settled();
     const panel = panelFor(loaded.control);
-    panel.focusOn("cw-executor");
-    const before = Number(/上限 (\d+)/.exec(panel.selected()?.value ?? "")?.[1]);
-    await panel.pressBurst("\x1b[C", "\x1b[C");
-    const after = Number(/上限 (\d+)/.exec(panel.selected()?.value ?? "")?.[1]);
-    assert.equal(after, before + 1, "exactly one step was applied, not a silent overwrite of the first");
-
+    // A toggle row is where a burst used to lose an update: both presses were built
+    // from the same rendered snapshot, so Space,Space left the kind enabled instead
+    // of returning it to off. Only the first may apply.
     panel.focusOn("cw-auditor");
+    const before = loaded.control.agentKinds().find((entry) => entry.kind === "auditor")?.enabled;
     await panel.pressBurst(" ", " ");
-    const enabled = (panel.selected()?.value ?? "").startsWith("[x]");
+    const after = loaded.control.agentKinds().find((entry) => entry.kind === "auditor")?.enabled;
     const disk = readConfig(root)?.agentKinds?.auditor?.enabled;
-    assert.equal(enabled, Boolean(disk), "the row and the written policy agree");
+    assert.equal(after, !before, "exactly one toggle applied, not two built from the same stale value");
+    assert.equal(Boolean(disk), Boolean(after), "the row and the written policy agree");
+    assert.equal((panel.selected()?.value ?? "").startsWith("[x]"), Boolean(after), "the row reflects what was written");
+  } finally {
+    loaded.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The settings panel is a table driven like /Comodels: Tab switches tab, ←→ switches
+ * column, ↑↓ moves, Enter applies, typing filters.
+ *
+ * The two tabs are not decoration — they separate what is writable from what is only
+ * reported. Mixing the modules' own status sentences into the editable list made every
+ * row look like something you could change.
+ */
+test("panel: settings is a table with two tabs, column switching and a filter", { skip }, async () => {
+  const { pi } = fakePi();
+  const root = tempProject({ auditor: { enabled: false } });
+  const loaded = await loadExtension(root, pi.events);
+  try {
+    await loaded.settled();
+    const panel = panelFor(loaded.control);
+    const projectRows = panel.visible();
+
+    // The writable tab must not carry the modules' read-only sentences.
+    assert.ok(projectRows.some((label) => label.includes("cw-executor")));
+    assert.ok(!projectRows.some((label) => label.trim().startsWith("=")), "status sentences live on the other tab");
+
+    // Tab reaches the reported tab, which is where those sentences are, and comes back.
+    await panel.press("\t");
+    assert.equal(panel.viewState().tab, "status");
+    assert.ok(panel.visible().some((label) => label.trim().startsWith("=")), panel.visible().join(" | "));
+    const onStatus = panel.selected();
+    await panel.press("\r");
+    assert.equal(panel.selected()?.label, onStatus?.label, "Enter on a read-only row does nothing");
+
+    await panel.press("\t");
+    assert.equal(panel.viewState().tab, "project");
+
+    // Typing filters the writable tab down to matching rows, and Esc still closes.
+    await panel.press("a");
+    await panel.press("u");
+    assert.ok(panel.visible().every((label) => /au|审计/i.test(label)), panel.visible().join(" | "));
+    assert.ok(!panel.visible().includes("trellis"), "an unrelated module row is filtered out");
   } finally {
     loaded.close();
     rmSync(root, { recursive: true, force: true });
