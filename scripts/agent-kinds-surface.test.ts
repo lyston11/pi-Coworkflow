@@ -887,11 +887,46 @@ test("status: a missing subagent tool is reported, and no tools means no claim",
  * that says "no subagent tool" and stops costs the reader the same investigation that
  * produced it, so each cause is named with what to do about it.
  */
-test("status: a missing subagent tool names the three things to check", async () => {
+test("status: a missing subagent tool states the declaration finding, not a checklist", async () => {
   const lines = subagentsModule.runtimeStatus?.({ getActiveTools: () => ["read"] } as never) ?? [];
   const line = lines.find((entry) => /没有 subagent 工具/.test(entry)) ?? "";
-  assert.match(line, /packages/, "1: the package must be declared");
-  assert.match(line, /subagents_enable/, "2: dynamic activation exposes only the loader");
-  assert.match(line, /toolActivation/, "2: and names the eager escape hatch");
-  assert.match(line, /重开 Pi/, "3: a reload is not enough");
+  // The two settings files are readable, so the line reports what it found there
+  // rather than asking the reader to go and check.
+  assert.match(line, /声明检查：/, line);
+  assert.match(line, /packages/, "it names the key that decides whether a package loads");
+  assert.match(line, /subagents_enable/, "dynamic activation exposes only the loader");
+  assert.match(line, /toolActivation/, "and names the eager escape hatch");
+  assert.match(line, /重开 Pi/, "a reload is not enough");
+});
+
+test("status: the declaration finding says which file declares it, or that none does", async () => {
+  const { declarationFinding } = await import("../modules/subagents/index.ts");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cw-declare-"));
+  const agentDir = path.join(root, "agent");
+  fs.mkdirSync(agentDir, { recursive: true });
+  fs.mkdirSync(path.join(root, ".pi"), { recursive: true });
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    // Nothing declares it: the line must say so, and name the fix and the check command.
+    const undeclared = declarationFinding(root);
+    assert.match(undeclared, /都没有 pi-subagents/, undeclared);
+    assert.match(undeclared, /npm:pi-subagents/, "it names the exact spec to add");
+    assert.match(undeclared, /pi list/, "it names the command that shows configured packages");
+
+    // Declared in the project: the line reports the file, not a to-do list.
+    fs.writeFileSync(
+      path.join(root, ".pi", "settings.json"),
+      JSON.stringify({ packages: ["npm:pi-subagents"] }),
+    );
+    const declared = declarationFinding(root);
+    assert.match(declared, /已声明（项目 \.pi\/settings\.json）/, declared);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

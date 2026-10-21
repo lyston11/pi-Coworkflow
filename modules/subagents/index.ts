@@ -40,7 +40,7 @@
  * Nothing here reads pi-subagents' run directory or starts its own runner.
  */
 
-import { statSync, realpathSync } from "node:fs";
+import { readFileSync, statSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -184,6 +184,34 @@ function overlapLine(state: HostState): string[] {
 }
 
 /**
+ * Which settings files declare pi-subagents, read at status time.
+ *
+ * A checklist ("check the declaration") costs the reader the investigation; the two
+ * settings files are right there, so the status line states the finding instead. This
+ * is what separates "no tool" from "no tool because nothing ever declared the package".
+ */
+export function declarationFinding(cwd: string): string {
+  const read = (path: string): JsonObject | null => {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(path, "utf-8"));
+      return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as JsonObject) : null;
+    } catch {
+      return null;
+    }
+  };
+  const user = read(userSettingsPath());
+  const project = read(join(cwd, PROJECT_SETTINGS));
+  const where: string[] = [];
+  if (declaresPackage(user)) where.push("用户级 settings.json");
+  if (declaresPackage(project)) where.push("项目 .pi/settings.json");
+  if (where.length > 0) return `packages 里已声明（${where.join("、")}）`;
+  return (
+    "但两份 settings 的 packages 里都没有 pi-subagents —— 这是它没加载的直接原因：" +
+    '把 "npm:pi-subagents" 加进 packages（用户级=所有项目，项目级=仅此项目）后重开 Pi；`pi list` 可核对'
+  );
+}
+
+/**
  * Whether the `subagent` tool is actually declared to the model.
  *
  * The module's value is reuse: pi-subagents does the running, this layer points it at
@@ -255,7 +283,9 @@ export const subagentsModule: WorkflowModule = {
     // every dispatch instruction in the managed region impossible to follow.
     const missing = subagentToolAvailable(host) === false
       ? [
-          "  ! subagents: 本会话没有 subagent 工具：派单不可用，子 agent 的上下文注入也不会发生。逐项核对：① pi-subagents 被 settings 声明（packages）且项目受信任；② 它默认是动态工具激活——新会话只给 subagents_enable，要调用它才放出 subagent；想让它从第一次请求就可用，把 subagents.toolActivation 设为 \"eager\" 再重开 Pi；③ 改完必须重开 Pi，/reload 不能替换已加载（或已失败）的扩展模块",
+          `  ! subagents: 本会话没有 subagent 工具：派单不可用，子 agent 的上下文注入也不会发生。声明检查：${
+            declarationFinding(HOSTS.get(host)?.runtime?.cwd ?? process.cwd())
+          }。其余两项：它默认动态工具激活（新会话只给 subagents_enable，想从第一次请求就可用就把 subagents.toolActivation 设为 "eager"）；改动后必须重开 Pi，/reload 换不掉已加载或已失败的扩展模块`,
         ]
       : [];
     const state = HOSTS.get(host);
