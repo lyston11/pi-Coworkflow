@@ -226,6 +226,7 @@ test("kinds config: unknown kinds and unreadable fields are preserved as the pro
       [
         ["executor", "cw-executor", false, 5],
         ["auditor", "cw-auditor", false, 1],
+        ["researcher", "cw-researcher", false, 2],
       ],
       "the built-in defaults fill what the project did not say",
     );
@@ -235,8 +236,10 @@ test("kinds config: unknown kinds and unreadable fields are preserved as the pro
 });
 
 test("kinds table: names are cw- prefixed, map to Trellis roles, and prompts are assets not strings", () => {
-  assert.deepEqual(builtinAgentNames(), ["cw-executor", "cw-auditor"]);
-  assert.deepEqual(BUILTIN_KINDS.map((entry) => entry.role), ["implement", "check"]);
+  // One kind per Trellis role: adopting kinds means the `trellis-*` role agents are
+  // no longer needed for any of the three.
+  assert.deepEqual(builtinAgentNames(), ["cw-executor", "cw-auditor", "cw-researcher"]);
+  assert.deepEqual(BUILTIN_KINDS.map((entry) => entry.role), ["implement", "check", "research"]);
   assert.equal(kindOf("cw-executor"), "executor");
   assert.equal(kindOf("trellis-implement"), null, "a non-kind dispatch is not ours");
   assert.equal(kindOf("cw-unknown"), null, "only a shipped kind is ours");
@@ -247,7 +250,7 @@ test("kinds table: names are cw- prefixed, map to Trellis roles, and prompts are
   // A project that declares nothing gets the built-in defaults.
   assert.deepEqual(
     resolveKinds(null).map((entry) => [entry.kind, entry.enabled, entry.maxConcurrent]),
-    [["executor", true, 3], ["auditor", false, 1]],
+    [["executor", true, 3], ["auditor", false, 1], ["researcher", false, 2]],
   );
 });
 

@@ -65,7 +65,7 @@ import {
   taskRefForDisplay,
   type SubagentRole,
 } from "../../core/trellis.ts";
-import { kindRole } from "../agent-kinds/defaults.ts";
+import { BUILTIN_KINDS, kindRole } from "../agent-kinds/defaults.ts";
 
 const ROLES: SubagentRole[] = ["implement", "check", "research"];
 /**
@@ -74,12 +74,20 @@ const ROLES: SubagentRole[] = ["implement", "check", "research"];
  */
 const AGENT_RE = /(?:^|[^A-Za-z0-9])trellis-(implement|check|research)(?![A-Za-z0-9])/;
 /**
- * A kind's registered agent name (`cw-executor`, `cw-auditor`), matched the same
- * way. It resolves through the *same* role table as `trellis-*`: a kind is how a
- * project names a dispatcher, not a second injection path, so whichever name the
- * child was launched under it receives the role context it corresponds to.
+ * A kind's registered agent name (`cw-executor`, `cw-auditor`, `cw-researcher`),
+ * matched the same way. It resolves through the *same* role table as `trellis-*`:
+ * a kind is how a project names a dispatcher, not a second injection path, so
+ * whichever name the child was launched under it receives the role context it
+ * corresponds to.
+ *
+ * The alternation is generated from the shipped kind table rather than written out,
+ * so a new kind needs no second edit here — but it must be an alternation and not
+ * an open `[a-z-]+` pattern: a session name like `subagent-cw-executor-run-1-0`
+ * would otherwise capture `executor-run-1-0` and resolve to no role at all.
  */
-const KIND_AGENT_RE = /(?:^|[^A-Za-z0-9])cw-(executor|auditor)(?![A-Za-z0-9])/;
+const KIND_AGENT_RE = new RegExp(
+  `(?:^|[^A-Za-z0-9])cw-(${BUILTIN_KINDS.map((entry) => entry.kind).join("|")})(?![A-Za-z0-9])`,
+);
 const MARKER_RE = /<!--\s*trellis-agent:\s*(implement|check|research)\s*-->/;
 /**
  * The task path after `Active task:`, anywhere in the text. It must not be

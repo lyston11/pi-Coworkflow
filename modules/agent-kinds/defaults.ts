@@ -42,11 +42,13 @@ export interface BuiltinKind {
 }
 
 /**
- * The two kinds this package ships.
+ * The kinds this package ships — one per Trellis role, so a project that adopts
+ * kinds no longer needs the `trellis-*` role agents at all.
  *
  * `executor` is on by default because it is the one that replaces what a project
- * already does by hand; `auditor` is off because it is the kind that can *refuse*
- * its own work, and a project must opt into a reviewer rather than discover one.
+ * already does by hand; `auditor` and `researcher` are off because they are the
+ * kinds that can *refuse* their own scope or spend unbounded time, and a project
+ * must opt into them rather than discover one.
  */
 export const BUILTIN_KINDS: readonly BuiltinKind[] = [
   {
@@ -64,6 +66,14 @@ export const BUILTIN_KINDS: readonly BuiltinKind[] = [
     description: "Coworkflow 审计者：只读复核一处改动，给出可复现的阻断项",
     asset: "./assets/auditor.md",
     defaults: { enabled: false, maxConcurrent: 1 },
+  },
+  {
+    kind: "researcher",
+    label: "调研者",
+    role: "research",
+    description: "Coworkflow 调研者：查清一个问题并给出有出处、可复现的答案",
+    asset: "./assets/researcher.md",
+    defaults: { enabled: false, maxConcurrent: 2 },
   },
 ];
 
