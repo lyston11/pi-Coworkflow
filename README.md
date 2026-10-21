@@ -404,17 +404,27 @@ Pi 把 `.pi/settings.json`、`.pi/extensions`、`.pi/agents` 等当作**受信�
 1. **被 settings 声明。** 文件躺在 `~/.pi/agent/npm/node_modules/pi-subagents/` 里不等于会加载——Pi 只加载
    `packages` 里声明过的包。`/Coworkflow:init` 会把 `npm:pi-subagents` 写进项目 `.pi/settings.json`；
    项目还必须受信任（见上一节）。
-2. **动态工具激活要满足。** pi-subagents 默认 `toolActivation: "auto"`：新会话只注册 `subagents_enable`
-   这个加载器，调用它之后 `subagent` 才出现。依赖派单的项目应把它设成 `"eager"`（不注册加载器，
-   `subagent` 从第一次请求就可用）：
+2. **动态工具激活要满足。** pi-subagents 默认 `toolActivation: "auto"`：新会话只注册
+   `subagents_enable` 这个加载器，调用它之后 `subagent` 才出现。而**恢复旧会话时会沿用当时保存的
+   工具声明**——历史里没声明过 loader 就不会补上，`/reload` 也改不回来（同一个原因下 `/Coworkflow:start`
+   能成功，但模型仍看不到派单工具）。
 
-   ```jsonc
-   // .pi/settings.json（项目级）或 ~/.pi/agent/settings.json（所有项目）
-   { "subagents": { "toolActivation": "eager" } }
+   两条路，任选：
+
+   ```bash
+   # 即时：启动时排除「延迟启用入口」，入口被排除后 subagent 直接保持可用（上游文档给的方式）
+   pi --session <id> --exclude-tools subagents_enable
    ```
 
-   本包只**报告**这一项，不替你写：怎么暴露工具是项目自己的策略。`/Coworkflow:init` 在这项不是
-   `eager` 时会给一条 warn。
+   ```jsonc
+   // 长期：写进 pi-subagents 自己的配置，不是 settings.json
+   // ~/.pi/agent/extensions/subagent/config.json
+   { "toolActivation": "eager" }
+   ```
+
+   ⚠️ 这个键**不在** `settings.json` 的 `subagents` 下。写在那里不会被读取，改了也不生效——这一点
+   在这个包里曾经写错过，代价是反复重启加一次误诊。本包只**报告**它，不替你写。
+
 3. **必须重开 Pi。** `toolActivation` 在会话启动时读取，`/reload` 不够——`/reload` 也换不掉 Node 已经
    加载过、或已经失败过的扩展模块。改完配置要新起一个 Pi 进程。
 

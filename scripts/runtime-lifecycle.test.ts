@@ -688,3 +688,47 @@ test("subagents: downloaded-but-undeclared is not reuse, and it gets declared", 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+/**
+ * `toolActivation` is read from pi-subagents' own config file, not from settings.json.
+ *
+ * Writing it under `subagents` in settings.json looks right and does nothing — a real
+ * machine restarted several times against a config nothing reads. The init pass must
+ * therefore judge the file that the extension itself reads.
+ */
+test("subagents: toolActivation is read from the extension config, not settings.json", async () => {
+  const { subagentsModule } = await import("../modules/subagents/index.ts");
+  const { userSubagentConfigPath } = await import("../core/agentdir.ts");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+
+  assert.match(userSubagentConfigPath(), /extensions[\\/]subagent[\\/]config\.json$/);
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cw-activation-"));
+  fs.mkdirSync(path.join(root, ".pi"), { recursive: true });
+  // The wrong place: settings.json declaring eager must not be mistaken for the real one.
+  fs.writeFileSync(
+    path.join(root, ".pi", "settings.json"),
+    JSON.stringify({ subagents: { toolActivation: "eager" } }),
+  );
+  const reports: string[] = [];
+  const ctx: any = {
+    root,
+    dry: false,
+    read: (p: string) => {
+      try {
+        return fs.readFileSync(path.isAbsolute(p) ? p : path.join(root, p), "utf-8");
+      } catch {
+        return null;
+      }
+    },
+    write: (p: string, text: string) => fs.writeFileSync(path.isAbsolute(p) ? p : path.join(root, p), text),
+    report: (_level: string, message: string) => reports.push(message),
+  };
+  subagentsModule.apply?.(ctx);
+  const said = reports.join("\n");
+  assert.match(said, /不在\*\*settings\.json|settings\.json 的 subagents 里/, `it warns when the real file is unset: ${said}`);
+  assert.match(said, /exclude-tools subagents_enable/, "and gives the launch flag that works immediately");
+  fs.rmSync(root, { recursive: true, force: true });
+});

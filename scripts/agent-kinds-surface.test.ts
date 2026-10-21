@@ -895,8 +895,10 @@ test("status: a missing subagent tool states the declaration finding, not a chec
   assert.match(line, /声明检查：/, line);
   assert.match(line, /packages/, "it names the key that decides whether a package loads");
   assert.match(line, /subagents_enable/, "dynamic activation exposes only the loader");
+  assert.match(line, /exclude-tools/, "and the launch flag that sidesteps it");
   assert.match(line, /toolActivation/, "and names the eager escape hatch");
-  assert.match(line, /重开 Pi/, "a reload is not enough");
+  assert.match(line, /extensions\/subagent\/config\.json/, "at the path that is actually read, not settings.json");
+  assert.match(line, /\/reload/, "it says a reload does not fix the restored tool list");
 });
 
 test("status: the declaration finding says which file declares it, or that none does", async () => {

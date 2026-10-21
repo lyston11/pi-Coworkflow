@@ -285,7 +285,7 @@ export const subagentsModule: WorkflowModule = {
       ? [
           `  ! subagents: 本会话没有 subagent 工具：派单不可用，子 agent 的上下文注入也不会发生。声明检查：${
             declarationFinding(HOSTS.get(host)?.runtime?.cwd ?? process.cwd())
-          }。其余两项：它默认动态工具激活（新会话只给 subagents_enable，想从第一次请求就可用就把 subagents.toolActivation 设为 "eager"）；改动后必须重开 Pi，/reload 换不掉已加载或已失败的扩展模块`,
+          }。其余两项：它默认动态工具激活——新会话只给 subagents_enable，而恢复旧会话时会沿用当时保存的工具声明（历史里没有 loader 就不会补上，/reload 无效）；启动时加 --exclude-tools subagents_enable 可让 subagent 直接可用，长期方案是在 ${userSubagentConfigPath()} 写 {"toolActivation": "eager"}——这个键不在 settings.json 的 subagents 里`,
         ]
       : [];
     const state = HOSTS.get(host);
@@ -334,18 +334,18 @@ export const subagentsModule: WorkflowModule = {
       settings.subagents !== null && typeof settings.subagents === "object" && !Array.isArray(settings.subagents)
         ? { ...(settings.subagents as JsonObject) }
         : {};
-    // Dynamic tool activation is the default upstream and it is invisible: a session
-    // starts with only the `subagents_enable` loader, so `subagent` does not exist until
-    // something calls it — and a resumed session can carry a recorded selection that
-    // keeps it off even after a reload. Reported, never written: changing how a project
-    // exposes tools is a policy the project owns.
-    const activation = subagents.toolActivation;
+    // Dynamic tool activation lives in pi-subagents' own config file, NOT in
+    // `settings.subagents` — a real diagnosis went wrong by writing it to settings.json,
+    // where nothing reads it, and then reloading repeatedly with no effect. The path is
+    // the extension's own: <agent dir>/extensions/subagent/config.json, top-level key.
+    const activationConfig = readUserConfig();
+    const activation = activationConfig?.toolActivation;
     if (activation === "eager") {
-      ctx.report("ok", `subagents.toolActivation = eager（subagent 工具从第一次请求就可用）`);
-    } else if (activation === undefined || activation === "auto" || activation === "dynamic") {
+      ctx.report("ok", `${userSubagentConfigPath()}: toolActivation = eager（subagent 从第一次请求就可用）`);
+    } else {
       ctx.report(
         "warn",
-        `subagents.toolActivation 未设为 "eager"（当前 ${activation === undefined ? "未设置（上游默认 auto）" : activation}）：pi-subagents 只注册 subagents_enable 加载器，要调用它才放出 subagent 工具。依赖派单的项目建议在 .pi/settings.json 的 subagents.toolActivation 设为 "eager" 并重开 Pi；/reload 不会重新加载扩展模块`,
+        `toolActivation 不是 "eager"（当前 ${activation === undefined ? "未设置（上游默认 auto）" : String(activation)}，读自 ${userSubagentConfigPath()}）。auto 模式下新会话只给 subagents_enable 加载器，且**恢复旧会话时会沿用当时保存的工具声明**——历史里没有 loader 就不会补上，/reload 也救不回来。两条路：① 启动时加 --exclude-tools subagents_enable（入口被排除，subagent 直接可用）；② 在 ${userSubagentConfigPath()} 写 {"toolActivation": "eager"} 后重开 Pi。注意这个键**不在** settings.json 的 subagents 里，写在那里不会被读取`,
       );
     }
 

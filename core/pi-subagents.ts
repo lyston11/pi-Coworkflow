@@ -23,6 +23,14 @@ export interface SubagentsUserConfig {
   maxActiveAsyncRunsPerSession?: number;
   /** `fork` would hand a Trellis child the parent's prompt instead of its role context. */
   defaultSubagentContext?: string;
+  /**
+   * How the `subagent` tool is exposed: `auto` (default), `dynamic`, or `eager`.
+   *
+   * Read from this file's top level — **not** from `subagents.toolActivation` in
+   * settings.json, where nothing reads it. Getting that wrong once cost a machine
+   * several restarts and a wrong diagnosis.
+   */
+  toolActivation?: string;
 }
 
 export function readUserConfig(): SubagentsUserConfig | null {
