@@ -381,6 +381,23 @@ export interface NativeRunLink {
    * no kind at all rather than a guessed one.
    */
   kind?: string;
+  /**
+   * The agent name this dispatch asked for, from this package's own record of the
+   * call.
+   *
+   * It is a record of what we sent, not a reading of the runner's state: the
+   * runner's own per-run view is the snapshot's `agent`, and `/Coworkflow:lanes`
+   * shows that one whenever it is available.
+   */
+  agent?: string;
+  /**
+   * The task text this dispatch was given, from this package's own record.
+   *
+   * Truncated before it is stored, and never presented as the runner's own `goal`
+   * field: the fleet DTO's goal belongs to an opaque display row that cannot be
+   * attributed to a run, so a goal shown next to a run id can only come from here.
+   */
+  goal?: string;
   handoffPath?: string;
   workflowReceiptPath?: string;
   sessionId?: string;

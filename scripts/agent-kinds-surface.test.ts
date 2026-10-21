@@ -606,8 +606,8 @@ test("lanes: /Coworkflow:lanes groups the task's runs by the recorded kind", asy
     await commands.get("Coworkflow:lanes")!.handler("", { cwd: root, mode: "tui" });
     const report = messages.at(-1) ?? "";
     assert.match(report, /按 kind 分组: 执行者（executor） ×1 · 非 kind 派单 ×1 · 审计者（auditor） ×1/, report);
-    assert.match(report, /run run-kind \[[^\]]*\] · kind 执行者（executor）/, report);
-    assert.doesNotMatch(report, /run run-plain \[[^\]]*\] · kind/, "a non-kind run carries no kind");
+    assert.match(report, /run run-kind[^\n]*\[[^\]]*\][^\n]*· kind 执行者（executor）/, report);
+    assert.doesNotMatch(report, /run run-plain[^\n]*· kind/, "a non-kind run carries no kind");
   } finally {
     laneWorktreeModule.onSessionEnd!(host, state.runtime);
     rmSync(root, { recursive: true, force: true });

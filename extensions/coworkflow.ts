@@ -56,7 +56,7 @@ import {
   writeConfig,
 } from "../core/config.ts";
 import { sessionFlag, sessionKeys, setSessionFlag } from "../core/trellis.ts";
-import { existingSubagentsBridge } from "../core/subagents-client.ts";
+import { existingSubagentsBridge, formatRunSummary } from "../core/subagents-client.ts";
 import { decodeNativeCompletions, readUserConfig } from "../core/pi-subagents.ts";
 import { disposeUsage, formatNativeCost, refreshUsage, usageSnapshot } from "../core/usage.ts";
 import { nearestTrustDecision, trustFilePath, trustProject } from "../core/trust.ts";
@@ -826,7 +826,8 @@ function createControl(): WorkflowControl {
       const root = rootOf();
       const config = root === null ? null : readConfig(root);
       const own = readUserConfig()?.maxActiveAsyncRunsPerSession ?? null;
-      const activity = runtimeHost ? existingSubagentsBridge(runtimeHost)?.activity() : undefined;
+      const bridge = runtimeHost ? existingSubagentsBridge(runtimeHost) : undefined;
+      const activity = bridge?.activity();
       const rootLine = root === null
         ? `配置: 无法解析配置根（git 读取失败）；本会话不读取任何项目的 .pi/Coworkflow.json`
         : `配置: ${configPath(root)}${config === null ? "（不存在）" : ""}`;
@@ -836,6 +837,12 @@ function createControl(): WorkflowControl {
         `本会话: ${runtime.enabled ? "已加载" : `未加载（/${NS}:start）`}`,
         `pi-subagents 自身上限: ${own === null ? "不限（用户级配置）" : `${own}（用户级配置）`}`,
         `活跃 async run: ${activity?.kind === "known" ? activity.active : `未知（${activity?.reason ?? "尚未读取公开状态"}）`}`,
+        // What a "should I interrupt this?" decision can actually be based on:
+        // per-run state/agent/elapsed from the attributable snapshot, tokens from
+        // the bounded fleet window with its gaps stated, and nothing invented for
+        // what neither projection carries.
+        ...formatRunSummary(activity ?? { kind: "unknown", reason: "尚未读取公开状态" },
+          bridge?.fleetView() ?? { kind: "unknown", reason: "尚未读取公开 fleet 窗口" }, Date.now()),
         formatNativeCost(runtimeHost ? usageSnapshot(runtimeHost, runtime).cost : { kind: "unknown", reason: "会话未就绪" }),
       ];
     },

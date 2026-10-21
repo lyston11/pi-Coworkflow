@@ -28,11 +28,16 @@ interface Target { root: string; taskRef: string; sessionId?: string; kind?: str
 
 /** How much of a dispatch's own task text is kept as its recorded goal. */
 const MAX_GOAL = 120;
-/** A goal long enough to crowd a lane line is cut with a visible ellipsis. */
+/**
+ * The goal of one dispatch, from the task text this package itself sent.
+ *
+ * The `Active task:` line is routing metadata, not the goal, so it is dropped; what
+ * is left is flattened to one line (a lane line is one line) and cut with a visible
+ * ellipsis. Nothing here reads a runner-side goal: the fleet DTO's `goal` belongs to
+ * an opaque display row that cannot be attributed to a run.
+ */
 function goalText(task: string): string | undefined {
-  // One line, because a lane line is one line: the task text of a real dispatch is
-  // multi-line prose, and pasting it whole would bury every other run.
-  const flat = task.replace(/\s+/g, " ").trim();
+  const flat = task.split("\n").filter((line) => !/^\s*Active task:/i.test(line)).join(" ").replace(/\s+/g, " ").trim();
   if (!flat) return undefined;
   return flat.length > MAX_GOAL ? `${flat.slice(0, MAX_GOAL - 1)}…` : flat;
 }
@@ -202,7 +207,7 @@ export const laneWorktreeModule: WorkflowModule = {
     if (!state || state.commandRegistered || runtime.isChild || !host.registerCommand) return;
     state.commandRegistered = true;
     host.registerCommand(`${NS}:lanes`, {
-      description: "查看当前任务的原生子 run 与交接/补丁；`/Coworkflow:lanes stop <runId>` 请求停止一个本任务记录过的 run（接受≠终止）；最终验收和合并仍由主会话决定",
+      description: "查看当前任务的原生子 run（agent/状态/已运行多久/本包记录的目标）与交接/补丁；`/Coworkflow:lanes stop <runId>` 请求停止一个本任务记录过的 run（接受≠终止）；最终验收和合并仍由主会话决定",
       handler: async (args, ctx) => {
         runtime.refresh();
         const say = (text: string) => host.sendMessage?.({ customType: "pi-Coworkflow", content: text, display: true });

@@ -67,7 +67,7 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 | `/Coworkflow:run [focus]` | 在宿主验证过的当前任务 worktree 运行原生 `coworkflow.implement-review`，交付后仍需主会话验收 |
 | `/Coworkflow:stop <runId> [instructions]` | 请求停止一个异步 run；**接受≠终止**，会再读一次公开状态并把两件事分开说；带 instructions 时先 steer 再 stop（需先 /Coworkflow:start） |
 | `/Coworkflow:steer <runId> <instructions>` | 给运行中的 run 追加指令（不杀进程、不是新派单），指令只作为数据传给 pi-subagents |
-| `/Coworkflow:lanes` | 当前 Trellis 任务的 lane（worktree 隔离派单）状态、patch 路径与合并计划；按记录的 kind 分组；`/Coworkflow:lanes stop <runId>` 只停止本任务记录过的 run（需先 /Coworkflow:start） |
+| `/Coworkflow:lanes` | 当前 Trellis 任务的 lane（worktree 隔离派单）状态、patch 路径与合并计划；每个 run 带上可归属的 agent/状态/已运行多久、本包记录的目标，并按记录的 kind 分组；`/Coworkflow:lanes stop <runId>` 只停止本任务记录过的 run（需先 /Coworkflow:start） |
 | `--enable <id,...>` / `--disable <id,...>` | `/Coworkflow:init` 的参数：改模块开关并持久化；关掉某模块会收回它写下的东西 |
 | `--auto-enable on\|off` | 新会话是否自动加载 Coworkflow（默认 off） |
 | `--trellis-update` | 代跑 `trellis update -s`：升级未被本地改动的 Trellis 文件，保留本地改动与所有任务记录 |
@@ -311,6 +311,33 @@ kind 与 Trellis 角色的对应写在 kind 表里（`executor → implement`、
 （`params.message`），不做任何 shell 拼接或代码求值；`deliveryStatus: queued` 如实说「还在队列里」。
 
 上游没通告 `stop`/`steer`/`interrupt` 时，命令原样说明「没有通告 RPC <method> 方法」，一个请求都不发。
+
+### 决定要不要中断之前，父会话能看见什么
+
+`stop` 只在“该不该停”这个判断站得住时才值得发。所以这里把父会话**能看到**和**看不到**的分清楚，
+不把两者混成一句“可观测性齐全”：
+
+| 事实 | 能否看到 | 来源 |
+|---|---|---|
+| 某个 run 的状态、agent、model、开始时间 | **能**，且可归属到 run | 公开 `status` 的 `asyncSnapshot.runs[]`（`id` 是真正的 run id） |
+| 已运行多久 | **能**，渲染时用 `startedAt` 现算 | 同上；不装定时器、不轮询，渲染只读缓存 |
+| 这次派单的目标 | **能**，但只来自**本包自己的派单记录** | `tool_call` 时记下的 task 文本（去掉 `Active task:` 行、压成一行、超长截断加省略号） |
+| 各 run 的 token 用量 | **能，但可能不完整**，并且必须标出不完整 | 公开 fleet 窗口的 `entries[].tokens` |
+| 某个 run 正在读哪个文件 / 调哪个工具 | **不能** | 见下 |
+
+**fleet 窗口只能用来显示，不能用来归属。** 上游的 fleet DTO 明确不暴露 run/async/tool id，它的 `key`
+是不透明的显示键；本包**不做**“把 fleet 行对应到 run id”这件事——那个对应关系不存在，编一个出来只会
+把 A 的用量记到 B 头上。所以 lanes 里每个 run 的 agent/状态/耗时都来自 `asyncSnapshot`，而 fleet 只
+在面板汇总里作为“窗口内求和”出现。
+
+**窗口不完整时不说成完整。** fleet 是有界窗口，会报 `omitted`；另外某行没带用量、或者这次 status 回复
+撞上字节上限，都会让求和变成**下界**。这些情况下面板写「不完整 —— <具体原因>；窗口内求和只是下界」，
+不会把一个偏小的和当成总数，也不会把读不到的窗口显示成 `0`。
+
+**没有实时“正在做什么”。** 逐文件、逐工具的实时叙述只存在于上游的外部运行展示 API，不在 RPC
+`status` 里；`pi.events` 是进程内的，**不跨进程**，子会话里的动作不会流回父会话。这一项本包不假装能做：
+父会话能回答的是“这个 run 是什么、跑了多久、还在什么状态”，不是“它此刻正在读哪一行”。
+判断要不要停，靠的是状态、耗时、目标、用量这四个可归属事实，加上你自己的派单记录。
 
 
 ## 运行时模块怎么工作

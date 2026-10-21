@@ -163,7 +163,7 @@ test("lanes: production result/notification handlers preserve per-child identity
   try {
     await h.call("workflow");
     await h.result("workflow", { runId: "workflow-run", background: true, missionId: "mission" });
-    assert.match(await h.lanes(), /run workflow-run \[未知\]/, "launch is not terminal success");
+    assert.match(await h.lanes(), /run workflow-run[^\n]*\[未知\]/, "launch is not terminal success");
     const handoff = join(h.root, "handoff.json");
     writeFileSync(handoff, JSON.stringify({ version: 1, runId: "workflow-run", groups: [{ stepIndex: 0,
       children: [

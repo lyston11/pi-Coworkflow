@@ -208,6 +208,132 @@ export function decodeAsyncSnapshot(data: unknown): { runs: NativeRun[]; omitted
     truncated: omitted.runs !== 0 || omitted.children !== 0 || omitted.byteLimitExceeded };
 }
 
+export interface FleetTokens {
+  input: number;
+  output: number;
+  total: number;
+}
+
+/**
+ * One row of the public fleet window, exactly as the DTO documents it.
+ *
+ * `key` is an **opaque display key**: the DTO deliberately never exposes a run,
+ * async or tool id, so this row can enrich a display and can never be attributed
+ * to a run. Nothing in this package joins `key` to a run id — that join does not
+ * exist upstream, and inventing one would silently attribute one run's work to
+ * another.
+ */
+export interface FleetEntry {
+  key: string;
+  agent: string;
+  role?: string;
+  model?: string;
+  effort?: string;
+  /** The caller-facing goal the owner recorded, when it recorded one. */
+  goal?: string;
+  startedAt: number;
+  /** The row's `{ input, output, total }`, absent when the row carried no usage. */
+  tokens?: FleetTokens;
+}
+
+export interface FleetWindowKnown {
+  entries: FleetEntry[];
+  /** Active children before the bounded entry window. */
+  totalActive: number;
+  /** Active children the window does not describe. */
+  omitted: number;
+  /** Sum over this window's rows, or `null` when no row carried usage. */
+  tokens: FleetTokens | null;
+  /**
+   * Why the window's totals are a lower bound; empty means they are complete.
+   *
+   * A bounded window that reports `omitted > 0`, a row without usage, or a reply
+   * the owner cut at its byte limit can all leave the sum short of the real total,
+   * and the only honest way to show a short sum is to say it is short.
+   */
+  gaps: string[];
+}
+
+/** The fleet window, or the reason it cannot be read. Never a zero standing in for a gap. */
+export type FleetWindow = ({ kind: "known" } & FleetWindowKnown) | { kind: "unknown"; reason: string };
+
+function decodeFleetTokens(raw: unknown): FleetTokens | undefined {
+  const tokens = record(raw);
+  if (tokens === null) return undefined;
+  const input = count(tokens.input);
+  const output = count(tokens.output);
+  const total = count(tokens.total);
+  if (input === undefined || output === undefined || total === undefined) return undefined;
+  return { input, output, total };
+}
+
+/** The snapshot projection's own truncation marker, which also bounds this reply. */
+function byteLimitExceeded(data: unknown): boolean {
+  return record(record(record(data)?.asyncSnapshot)?.omitted)?.byteLimitExceeded === true;
+}
+
+/**
+ * The public fleet window: per-row display facts plus the gaps that make its sum a
+ * lower bound.
+ *
+ * Strictness is the same as every other decoder here: a row that is not fully
+ * readable (missing key/agent/startedAt, or a metadata field that is not text) is a
+ * protocol failure for the whole payload, not a half-trusted row. Unknown extra
+ * fields are ignored, so a newer owner adding one does not break this. `tokens` is
+ * the one optional field: it is display-only, so its absence degrades the sum
+ * (recorded in `gaps`) instead of discarding rows a caller may need for counting.
+ */
+export function decodeFleetWindow(data: unknown): FleetWindowKnown | null {
+  const fleet = record(record(data)?.fleet);
+  if (fleet?.version !== 1 || !Array.isArray(fleet.entries) || count(fleet.totalActive) === undefined ||
+      count(fleet.omitted) === undefined) return null;
+  const entries: FleetEntry[] = [];
+  let input = 0;
+  let output = 0;
+  let total = 0;
+  let withUsage = 0;
+  for (const entry of fleet.entries) {
+    const row = record(entry);
+    if (row === null) return null;
+    const key = text(row.key);
+    const agent = text(row.agent);
+    const startedAt = count(row.startedAt);
+    if (key === undefined || agent === undefined || startedAt === undefined) return null;
+    if (["role", "model", "effort", "goal"].some((field) => row[field] !== undefined && text(row[field]) === undefined)) return null;
+    const tokens = row.tokens === undefined ? undefined : decodeFleetTokens(row.tokens);
+    if (row.tokens !== undefined && tokens === undefined) return null;
+    if (tokens !== undefined) {
+      input += tokens.input;
+      output += tokens.output;
+      total += tokens.total;
+      withUsage += 1;
+    }
+    entries.push({ key, agent, startedAt,
+      ...(text(row.role) ? { role: text(row.role) } : {}),
+      ...(text(row.model) ? { model: text(row.model) } : {}),
+      ...(text(row.effort) ? { effort: text(row.effort) } : {}),
+      ...(text(row.goal) ? { goal: text(row.goal) } : {}),
+      ...(tokens ? { tokens } : {}),
+    });
+  }
+  const totalActive = fleet.totalActive as number;
+  const omitted = fleet.omitted as number;
+  const gaps: string[] = [];
+  if (omitted > 0) gaps.push(`窗口外还有 ${omitted} 个活跃 run`);
+  if (withUsage < entries.length) gaps.push(`窗口内有 ${entries.length - withUsage} 行没有携带用量`);
+  if (byteLimitExceeded(data)) gaps.push("这次 status 回复已超出字节上限");
+  if (entries.length + omitted !== totalActive) gaps.push("窗口行数与活跃计数不一致");
+  return {
+    entries,
+    totalActive,
+    omitted,
+    // Zero rows is a real zero only because `totalActive` agrees; otherwise the
+    // gap above says the window cannot describe what is running.
+    tokens: entries.length === 0 ? { input: 0, output: 0, total: 0 } : withUsage === 0 ? null : { input, output, total },
+    gaps,
+  };
+}
+
 export interface FleetAgentCounts {
   /** Live entries per resolved agent name, from the fleet's bounded public window. */
   counts: Map<string, number>;
@@ -226,17 +352,80 @@ export interface FleetAgentCounts {
  * caller must treat that as unknown, never as "nothing is running".
  */
 export function decodeFleetAgentCounts(data: unknown): FleetAgentCounts | null {
-  const fleet = record(record(data)?.fleet);
-  if (fleet?.version !== 1 || !Array.isArray(fleet.entries) || count(fleet.totalActive) === undefined ||
-      count(fleet.omitted) === undefined) return null;
+  const window = decodeFleetWindow(data);
+  if (window === null) return null;
   const counts = new Map<string, number>();
-  for (const entry of fleet.entries) {
-    const row = record(entry);
-    const agent = text(row?.agent);
-    if (row === null || agent === undefined || typeof row.key !== "string" || count(row.startedAt) === undefined) return null;
-    counts.set(agent, (counts.get(agent) ?? 0) + 1);
+  for (const entry of window.entries) counts.set(entry.agent, (counts.get(entry.agent) ?? 0) + 1);
+  return { counts, totalActive: window.totalActive, omitted: window.omitted };
+}
+
+/**
+ * How long a run has been going, from the public `startedAt` and a caller-supplied
+ * clock reading.
+ *
+ * No timer and no polling: the caller passes `now`, so a rendering path stays
+ * cache-only and a test can pin the clock. `undefined` means the start time is not
+ * known (or is in the future, which is a clock we cannot use) — never `0s`.
+ */
+export function elapsedLabel(startedAt: number | undefined, now: number): string | undefined {
+  if (startedAt === undefined) return undefined;
+  const ms = now - startedAt;
+  if (!Number.isFinite(ms) || ms < 0) return undefined;
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `已运行 ${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `已运行 ${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return minutes % 60 === 0 ? `已运行 ${hours}h` : `已运行 ${hours}h ${minutes % 60}m`;
+}
+
+/** How many run lines a panel summary prints before it stops. */
+const MAX_SUMMARY_RUNS = 8;
+
+function compactCount(value: number): string {
+  if (value < 1000) return String(value);
+  if (value < 1_000_000) return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0).replace(/\.0$/, "")}k`;
+  return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+}
+
+/**
+ * The bounded per-run summary a panel shows, from both public projections.
+ *
+ * Each projection does the job it can actually do: the snapshot names runs (id,
+ * agent, state, `startedAt`), so a line is attributable to a run; the fleet window
+ * carries usage, but only inside a bounded window that reports its own gaps. No
+ * fleet key is ever paired with a run id here.
+ *
+ * Elapsed time comes from `startedAt` at render time, so rendering stays
+ * cache-only, and a token sum that does not cover every active run is labelled a
+ * lower bound instead of being printed as the total.
+ */
+export function formatRunSummary(activity: NativeActivity, fleet: FleetWindow, now: number): string[] {
+  const lines: string[] = [];
+  if (activity.kind === "unknown") {
+    lines.push(`子 run 明细: 未知（${activity.reason}）`);
+  } else if (activity.runs.length === 0) {
+    lines.push("子 run 明细: 公开状态里没有正在运行的子 run");
+  } else {
+    lines.push(`子 run 明细: ${activity.runs.length} 个${activity.omitted > 0 ? `（另有 ${activity.omitted} 个不在公开窗口内）` : ""}`);
+    const shown = activity.runs.slice(0, MAX_SUMMARY_RUNS);
+    for (const run of shown) {
+      lines.push(`  · ${run.agent ?? "未知"} [${run.state}] · ${elapsedLabel(run.startedAt, now) ?? "已运行 未知"}${
+        run.model ? ` · ${run.model}` : ""} · run ${run.id.slice(0, 8)}`);
+    }
+    if (activity.runs.length > shown.length) lines.push(`  …… 其余 ${activity.runs.length - shown.length} 个未列出`);
   }
-  return { counts, totalActive: fleet.totalActive as number, omitted: fleet.omitted as number };
+  if (fleet.kind === "unknown") {
+    lines.push(`子 run tokens: 未知（${fleet.reason}）`);
+  } else if (fleet.tokens === null) {
+    lines.push("子 run tokens: 未知（fleet 窗口里的行没有携带用量）");
+  } else {
+    const sum = `in ${compactCount(fleet.tokens.input)} / out ${compactCount(fleet.tokens.output)}`;
+    lines.push(fleet.gaps.length === 0
+      ? `子 run tokens: ${sum}（fleet 窗口完整）`
+      : `子 run tokens: 不完整 —— ${fleet.gaps.join("；")}；窗口内求和只是下界（${sum}）`);
+  }
+  return lines;
 }
 
 /** Per-agent live counts, or the reason they cannot be counted. */
@@ -882,6 +1071,35 @@ export class SubagentsClient {
     return { kind: "known", counts: fleet.counts, totalActive: fleet.totalActive };
   }
 
+  /**
+   * The public fleet window, with its gaps preserved.
+   *
+   * Same capability floor as `agentActivity`: no `fleetStatus`, a failed reply or
+   * an unreadable payload is `unknown` with a reason, because a display that shows
+   * `0` for a window it could not read is worse than one that says it cannot see.
+   */
+  async fleetWindow(): Promise<FleetWindow> {
+    const capability = await this.ping();
+    if (!capability.ok) return { kind: "unknown", reason: capability.message };
+    if (!capability.data.methods.includes("status") || !hasCapability(capability.data, "status")) {
+      return { kind: "unknown", reason: "pi-subagents 没有通告 status 能力，无法读取 fleet 窗口。" };
+    }
+    if (!hasCapability(capability.data, "fleetStatus")) {
+      return {
+        kind: "unknown",
+        reason: "pi-subagents 没有通告 fleetStatus 能力，因此没有公开的 per-run 显示窗口可读（0.79 系列的 ping.capabilities.fleetStatus 才提供）。",
+      };
+    }
+    const reply = await this.status({});
+    if (!reply.ok) return { kind: "unknown", reason: reply.message };
+    if (this.closed) return { kind: "unknown", reason: this.unavailableReason() };
+    const window = decodeFleetWindow(reply.data);
+    if (window === null) {
+      return { kind: "unknown", reason: "pi-subagents 的 fleet 投影不是可解析的 entries/totalActive/omitted，无法当作已知值使用。" };
+    }
+    return { kind: "known", ...window };
+  }
+
   /** What the native runner reports as active for this session, or why it cannot say. */
   async observeActivity(): Promise<NativeActivity> {
     const capability = await this.ping();
@@ -951,8 +1169,12 @@ export interface SubagentsBridge {
   readonly epoch: number;
   /** Fresh read of native activity, cached for `admitSync` afterwards. */
   observe(): Promise<NativeActivity>;
+  /** Fresh read of the public fleet window, for a bounded per-run display. */
+  fleet(): Promise<FleetWindow>;
   /** Last public observation for synchronous rendering; never synthesizes zero. */
   activity(): NativeActivity;
+  /** Last fleet read for synchronous rendering; never synthesizes a complete window. */
+  fleetView(): FleetWindow;
   admit(launchId: string, limit: number | null): Promise<Admission>;
   admitSync(launchId: string, limit: number | null): Admission;
   /**
@@ -1004,6 +1226,7 @@ export function attachSubagents(
   const client = new SubagentsClient({ events: options.events });
   const reservations = new Map<string, Reservation>();
   let lastActivity: NativeActivity | null = null;
+  let lastFleet: FleetWindow | null = null;
   let disposed = false;
 
   // Serialize public reads and admission, so overlapping tools and our command share
@@ -1048,6 +1271,18 @@ export function attachSubagents(
     client,
     epoch: options.epoch,
     observe: () => serial(observe),
+    fleet() {
+      return serial(async () => {
+        if (disposed) return { kind: "unknown" as const, reason: "本会话已结束。" };
+        const window = await client.fleetWindow();
+        if (disposed) return { kind: "unknown" as const, reason: "本会话已结束。" };
+        lastFleet = window;
+        return window;
+      });
+    },
+    fleetView() {
+      return lastFleet ?? { kind: "unknown", reason: "尚未读取公开 fleet 窗口" };
+    },
     activity: () => lastActivity ?? { kind: "unknown", reason: "尚未读取公开状态" },
     admit(launchId, limit) {
       return serial(async () => {
@@ -1111,6 +1346,7 @@ export function attachSubagents(
       disposed = true;
       reservations.clear();
       lastActivity = null;
+      lastFleet = null;
       client.dispose();
       if (BRIDGES.get(host) === bridge) BRIDGES.delete(host);
     },

@@ -403,7 +403,14 @@ export function registerSettingsPanel(host: PiRuntimeHost, runtime: RuntimeConte
       runtime.refresh();
       const epoch = runtime.sessionEpoch;
       await refreshUsage(host, runtime, commandCtx);
-      if (runtime.enabled) await existingSubagentsBridge(host)?.observe();
+      if (runtime.enabled) {
+        // The facts block shows a bounded per-run summary, and the fleet window is
+        // the only public source of per-run tokens. One read at panel-open, like
+        // every other refresh boundary: rendering itself stays cache-only.
+        const bridge = existingSubagentsBridge(host);
+        await bridge?.observe();
+        await bridge?.fleet();
+      }
       // The kind section reports whether each kind is really in the owner's agent
       // list, and that answer arrives from a pass that awaits an import. Awaiting
       // it here is the difference between "registered" and "not loaded yet".
