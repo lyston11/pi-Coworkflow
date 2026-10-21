@@ -528,7 +528,14 @@ export const agentKindsModule: WorkflowModule = {
    */
   runtimeStatus(host: PiRuntimeHost): string[] | null {
     const state = STATES.get(host);
-    if (state === undefined) return null;
+    if (state === undefined) {
+      // The module is on in the project but this session never activated it (or the
+      // layer is off). A row must not read "enabled, see the status line below" when
+      // there is no line below and no gate running, so this answers with the reason
+      // instead of null — the same honesty as the `skipped: "off"` branch reachable
+      // when the module was activated and then gated off.
+      return [`  - agent-kinds: 本会话未激活 agent-kinds：kind 不注册，也不拦截派单（用 /Coworkflow:start 在本会话启用）`];
+    }
     const snapshot = state.snapshot;
     if (snapshot === null) {
       // Two different facts, and this line used to conflate them: a module that

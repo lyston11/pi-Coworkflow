@@ -64,6 +64,8 @@ export class SettingsPanel extends Container {
   private readonly keybindings: PanelKeybindings | undefined;
   private rows: SettingRow[] = [];
   private cursor = 0;
+  /** One row action at a time; see `run()` for why a second gesture is dropped. */
+  private inflight = false;
   private status = "";
   private readonly listContainer = new Container();
   private readonly statusText = new Text("", 0, 0);
@@ -180,15 +182,30 @@ export class SettingsPanel extends Container {
    * The row actions write the project config and reconcile the live session, so
    * a failure must surface as the panel's status line — not as a rejected promise
    * or as a row that looks applied but is not.
+   *
+   * One action at a time. A row gesture is built from the snapshot that rendered
+   * the row, so two gestures delivered inside one tick — a held Space, two quick
+   * Right presses — both started from the same stale value and the second silently
+   * overwrote the first: Right,Right on a limit of 3 produced 4, and Space,Space on
+   * a disabled kind left it enabled. A policy editor that appears to work while
+   * doing less is the exact failure this module exists to remove, so an action
+   * arriving while another is in flight is dropped rather than queued: the row is
+   * re-read after every action, so the queued gesture would apply to a value the
+   * user never saw.
    */
   private run(action: () => string | Promise<string>): void {
+    if (this.inflight) return;
+    this.inflight = true;
     void Promise.resolve()
       .then(action)
       .then(
         (status) => this.io.changed(status),
         (error: unknown) =>
           this.io.changed(`失败：${error instanceof Error ? error.message : String(error)}`),
-      );
+      )
+      .finally(() => {
+        this.inflight = false;
+      });
   }
 
   /** Re-read the rows from the owner, keeping the cursor on a selectable row. */
@@ -310,23 +327,28 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
   rows.push({ label: "子 agent 类型", value: "", header: true });
   const kinds = control.agentKinds();
   const status = control.agentKindStatus();
+  // The layer's own switch, read from the same place the module row above reads it.
+  // The row must not have to infer "is the gate running" from the absence of report
+  // lines: with the module off at load the report is empty, and the row then claimed
+  // "enabled, see the status line below" with no line below and no gate at all.
+  const layerOn = control.switches()["agent-kinds"] !== false;
   for (const entry of kinds) {
     // What this kind's availability actually is, from the module's own report —
     // never from the project's enablement, which says nothing about the agent list.
     const registered = status.some((line) => line.includes(entry.agent) && line.includes("已注册"));
     const failed = status.some((line) => line.includes(`${entry.kind} 注册失败`));
-    // The layer itself being off is its own fact, and it must not be inferred from
-    // "the report has no lines": a module switched off after it was on still has
-    // status lines, so that inference read as "enabled, pending" while nothing was
-    // registered and no gate was running. Match the report's own sentence instead.
-    const layerOff = status.some((line) => line.includes("本会话未加载或已关闭"));
+    const layerOff = !layerOn || status.some((line) => line.includes("未激活 agent-kinds") || line.includes("本会话未加载或已关闭"));
     rows.push({
       label: `${entry.label} ${entry.agent}`,
       value: `${entry.enabled ? "[x]" : "[ ]"} 开 · 上限 ${entry.maxConcurrent}`,
       detail: !entry.enabled
         ? "关闭时该 kind 的派单会被拒绝，其他 agent 不受影响"
         : layerOff
-          ? "agent-kinds 本层未启用：kind 不注册，也不拦截派单（在上面的模块开关里打开）"
+          ? layerOn
+            // On in the project but not loaded in this session: the fix is `/Coworkflow:start`,
+            // and pointing at the module switch would send the user to a switch that is already on.
+            ? "agent-kinds 在本项目已开启，但本会话还没加载它：kind 不注册，也不拦截派单（用 /Coworkflow:start）"
+            : "agent-kinds 本层未启用：kind 不注册，也不拦截派单（在上面的模块开关里打开）"
           : registered
             ? "已注册到 pi-subagents"
             : failed

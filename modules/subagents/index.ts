@@ -48,21 +48,25 @@ import { join, isAbsolute } from "node:path";
 import type { ModuleContext, PiRuntimeHost, RuntimeContext, WorkflowModule } from "../../core/module.ts";
 import { userSettingsPath, userSubagentConfigPath } from "../../core/agentdir.ts";
 import { readConfig } from "../../core/config.ts";
-import { installedVersion, readUserConfig, subagentsPackageDir } from "../../core/pi-subagents.ts";
+import { installedVersion, readUserConfig, subagentsPackageDir, decodeNativeCompletions } from "../../core/pi-subagents.ts";
 import { mainCheckout, repoRoot, activeTaskDir, resolveTaskDir, taskRefForDisplay } from "../../core/trellis.ts";
 import { attachSubagents, existingSubagentsBridge, type SubagentsBridge } from "../../core/subagents-client.ts";
 import { kindWorkflowAgents, syncAgentKinds } from "../agent-kinds/index.ts";
 import { requestSteer, requestStop } from "./run-control.ts";
 import { resolveKinds } from "../agent-kinds/defaults.ts";
 import {
+  FANOUT_NAME,
   WORKFLOW_NAME,
-  validTaskRef,
-  type PreparedWorkflowContext,
+  dispatchOverlap,
   readTaskIdentity,
   recordLaunchLink,
+  recordRunSettled,
   registerChildExtensionRequirement,
   registerImplementReviewWorkflow,
+  validTaskRef,
+  type PreparedWorkflowContext,
 } from "../../core/subagents-workflow.ts";
+import { formatOverlapLine } from "../../core/dispatch-timing.ts";
 
 const PROJECT_SETTINGS = join(".pi", "settings.json");
 const PACKAGE = "pi-subagents";
@@ -143,6 +147,27 @@ function reportContextDefault(ctx: ModuleContext): void {
   );
 }
 
+/**
+ * The one line that says whether this session's dispatches overlapped.
+ *
+ * Read from the recorded links at render time, so it reports what happened rather
+ * than what was believed to happen. Like every other status line here it is stored
+ * state, never a message: a status line delivered as a user turn rewrites the run
+ * it describes.
+ */
+function overlapLine(state: HostState): string[] {
+  try {
+    const runtime = state.runtime;
+    if (runtime === null) return [];
+    const root = runtime.configRoots.root(runtime.cwd);
+    if (root === null) return [];
+    return [`  = subagents: ${formatOverlapLine(dispatchOverlap(root, runtime.sessionId))}`];
+  } catch {
+    // A status render must not take the report down with it.
+    return [];
+  }
+}
+
 export const subagentsModule: WorkflowModule = {
   id: "subagents",
   title: "subagent 层（复用已安装的 pi-subagents，缺失时项目级安装）",
@@ -159,6 +184,7 @@ export const subagentsModule: WorkflowModule = {
   activate(host: PiRuntimeHost, runtime: RuntimeContext): void {
     if (runtime.isChild) return;
     const state = hostState(host);
+    state.runtime = runtime;
     attachObservers(host, state, runtime);
     void syncSubagentsRuntime(host, runtime);
   },
@@ -170,6 +196,7 @@ export const subagentsModule: WorkflowModule = {
    */
   onRuntimeChange(host: PiRuntimeHost, runtime: RuntimeContext): void {
     if (runtime.isChild) return;
+    hostState(host).runtime = runtime;
     void syncSubagentsRuntime(host, runtime);
   },
 
@@ -203,16 +230,17 @@ export const subagentsModule: WorkflowModule = {
     existingSubagentsBridge(host)?.dispose();
   },
 
-  /** Stored state, read on demand: a passive status never becomes a message. */
+/** Stored state, read on demand: a passive status never becomes a message. */
   runtimeStatus(host: PiRuntimeHost): string[] | null {
     const state = HOSTS.get(host);
     if (!state) return null;
     const set = state.current;
     const session = set ? `（session ${set.sessionId.slice(0, 8)}）` : "";
     return [
-      `  ${set?.workflow ? "=" : "-"} subagents: 工作流资源 ${WORKFLOW_NAME} ${set?.workflow ? `已注册${session}` : "未注册"}`,
+      `  ${set?.workflow ? "=" : "-"} subagents: 工作流资源 ${WORKFLOW_NAME}、${FANOUT_NAME} ${set?.workflow ? `已注册${session}` : "未注册"}`,
       `  ${set?.children ? "=" : "-"} subagents: 子会话必需扩展 ${set?.children ? "已登记" : "未登记（subagent-context 关闭或本会话未加载 Coworkflow 时不登记）"}`,
       ...(set?.failure === undefined ? [] : [`  x subagents: ${set.failure}`]),
+      ...overlapLine(state),
     ];
   },
 
@@ -322,6 +350,8 @@ interface HostState {
   runCommandRegistered: boolean;
   /** `/Coworkflow:stop` and `/Coworkflow:steer`, registered with the same lifetime. */
   controlCommandsRegistered: boolean;
+  /** The live runtime of the session this host is serving; refreshed on every activation. */
+  runtime: RuntimeContext | null;
 }
 
 /** One workflow-resource + child-requirement pair, built for one session. */
@@ -353,6 +383,7 @@ function hostState(host: PiRuntimeHost): HostState {
     permanentListener: false,
     runCommandRegistered: false,
     controlCommandsRegistered: false,
+    runtime: null,
   };
   HOSTS.set(host, created);
   return created;
@@ -905,14 +936,24 @@ function attachObservers(host: PiRuntimeHost, state: HostState, runtime: Runtime
   };
   refresh();
   track(state, host.on("tool_call", async (event: any) => {
-    if (event?.toolName !== "subagent" || event.input?.workflow !== WORKFLOW_NAME) return;
+    if (event?.toolName !== "subagent") return;
+    const workflow = event.input?.workflow;
+    // Only this package's own resources are policed here. A raw script, another
+    // extension's workflow, or a plain direct dispatch is not ours to judge.
+    if (workflow !== WORKFLOW_NAME && workflow !== FANOUT_NAME) return;
     if (!runtime.enabled || !runtime.control.moduleEnabled("subagents")) {
       return { block: true, reason: "Coworkflow 工作流模块已关闭。" };
     }
     await schedule(state, runtime, host);
     const current = state.current;
-    if (!current?.workflow || current.failure || !current.prepared) {
-      return { block: true, reason: current?.failure ?? "没有经过宿主校验的活跃任务工作树，未派单。" };
+    if (!current?.workflow || current.failure) {
+      return { block: true, reason: current?.failure ?? `工作流资源 ${String(workflow)} 未注册。` };
+    }
+    // The implement→review pair runs in a verified task worktree, so it is refused
+    // without one. A fanout is general-purpose: its children fall back to the
+    // workflow's own cwd when no task is prepared, which the host still chose.
+    if (workflow === WORKFLOW_NAME && !current.prepared) {
+      return { block: true, reason: "没有经过宿主校验的活跃任务工作树，未派单。" };
     }
     return undefined;
   }));
@@ -922,6 +963,19 @@ function attachObservers(host: PiRuntimeHost, state: HostState, runtime: Runtime
   }));
   track(state, host.on("tool_result", (event: any) => {
     if (event?.toolName === "subagent") refresh();
+    return undefined;
+  }));
+  // A structured native completion closes that run's dispatch interval. This is
+  // the only place a settle time is recorded, so a run whose completion is never
+  // observed keeps an open interval and is reported as unknown rather than counted
+  // as serial work. Deliberately passive: no message, no report, just the fact.
+  track(state, host.on("message_end", (event: any) => {
+    if (!runtime.enabled || !runtime.control.moduleEnabled("subagents")) return undefined;
+    const completions = decodeNativeCompletions(event?.message);
+    if (completions.length === 0) return undefined;
+    const root = runtime.configRoots.root(runtime.cwd);
+    if (root === null) return undefined;
+    for (const completion of completions) recordRunSettled(root, completion.runId);
     return undefined;
   }));
 }

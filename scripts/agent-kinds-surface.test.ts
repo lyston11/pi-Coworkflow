@@ -266,6 +266,8 @@ interface PanelHarness {
   focusOn(needle: string): void;
   /** Send one key and settle whatever row action it started. */
   press(key: string): Promise<void>;
+  /** Send several keys inside one tick, the way a held key or two fast presses do. */
+  pressBurst(...keys: string[]): Promise<void>;
   statuses: string[];
 }
 
@@ -306,6 +308,11 @@ function panelFor(control: Parameters<typeof buildSettingRows>[0]): PanelHarness
     },
     async press(key) {
       panel.handleInput(key);
+      await settle();
+    },
+    /** Deliver keys in one tick, the way a held key or two fast presses do. */
+    async pressBurst(...keys) {
+      for (const key of keys) panel.handleInput(key);
       await settle();
     },
     statuses,
@@ -696,6 +703,40 @@ test("panel: a kind row says the layer is off after it is switched off mid-sessi
       loaded.close();
     }
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Two gestures inside one tick must not silently cancel each other.
+ *
+ * A row action is built from the snapshot that rendered the row, so Right,Right
+ * used to produce limit 4 instead of 5 and Space,Space on a disabled kind left it
+ * enabled — the second gesture started from the same stale value and overwrote the
+ * first. A policy editor that appears to work while doing less is the failure this
+ * module exists to remove, so an action arriving while another is in flight is
+ * dropped, and the row is re-read afterwards.
+ */
+test("panel: a key burst is not a lost update", { skip }, async () => {
+  const { pi } = fakePi();
+  const root = tempProject({ auditor: { enabled: false, maxConcurrent: 1 } });
+  const loaded = await loadExtension(root, pi.events);
+  try {
+    await loaded.settled();
+    const panel = panelFor(loaded.control);
+    panel.focusOn("cw-executor");
+    const before = Number(/上限 (\d+)/.exec(panel.selected()?.value ?? "")?.[1]);
+    await panel.pressBurst("\x1b[C", "\x1b[C");
+    const after = Number(/上限 (\d+)/.exec(panel.selected()?.value ?? "")?.[1]);
+    assert.equal(after, before + 1, "exactly one step was applied, not a silent overwrite of the first");
+
+    panel.focusOn("cw-auditor");
+    await panel.pressBurst(" ", " ");
+    const enabled = (panel.selected()?.value ?? "").startsWith("[x]");
+    const disk = readConfig(root)?.agentKinds?.auditor?.enabled;
+    assert.equal(enabled, Boolean(disk), "the row and the written policy agree");
+  } finally {
+    loaded.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
