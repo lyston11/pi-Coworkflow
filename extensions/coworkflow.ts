@@ -43,7 +43,7 @@ import type {
   WorkflowControl,
 } from "../core/module.ts";
 import { createContext, renderModule } from "../core/module.ts";
-import type { WorkflowConfig } from "../core/config.ts";
+import type { WorkflowConfig, AgentKindConfig } from "../core/config.ts";
 import {
   configPath,
   configRootNote,
@@ -61,6 +61,8 @@ import { decodeNativeCompletions, readUserConfig } from "../core/pi-subagents.ts
 import { disposeUsage, formatNativeCost, refreshUsage, usageSnapshot } from "../core/usage.ts";
 import { nearestTrustDecision, trustFilePath, trustProject } from "../core/trust.ts";
 import { MODULES, findModule, moduleIds } from "../modules/index.ts";
+import { agentKindsModule, syncAgentKinds } from "../modules/agent-kinds/index.ts";
+import { BUILTIN_KINDS, agentNameFor, builtinKind, resolveKinds } from "../modules/agent-kinds/defaults.ts";
 import { installedPrefix } from "../modules/worktree/index.ts";
 
 const DEFAULT_PREFIX = "wt-";
@@ -214,6 +216,10 @@ let runtime: RuntimeContext = {
     setPrefix: () => "control 尚未就绪",
     subagentConcurrency: () => null,
     setSubagentConcurrency: () => "control 尚未就绪",
+    agentKinds: () => [],
+    setAgentKind: () => "control 尚未就绪",
+    agentKindStatus: () => [],
+    settleAgentKinds: () => Promise.resolve(),
     init: () => "control 尚未就绪",
   },
 };
@@ -649,6 +655,10 @@ function runSetup(args: string, ctx: CommandContext, forceDry: boolean): string 
       worktreePrefix: prefix,
       ...(autoEnable ? { autoEnable: true } : {}),
       modules: switches,
+      // Init writes the switch map it knows about, not the whole file: the kind
+      // policies (including kinds this build does not ship) belong to the project
+      // and would otherwise be silently retracted by a refresh.
+      ...(existing?.agentKinds === undefined ? {} : { agentKinds: existing.agentKinds }),
     });
   }
 
@@ -928,6 +938,53 @@ function createControl(): WorkflowControl {
         ? "子 agent 并发上限 → 不限（本项目；不再拦截派单）"
         : `子 agent 并发上限 → ${value}（本项目；由 Coworkflow 在派单时拦截）`;
     },
+    agentKinds: () => {
+      const root = rootOf();
+      return resolveKinds(root === null ? null : readConfig(root));
+    },
+    setAgentKind: async (kind, patch) => {
+      const root = rootOf();
+      if (root === null) return unresolved();
+      if (builtinKind(kind) === null) return `未知 kind：${kind}（本包只有 ${BUILTIN_KINDS.map((entry) => entry.kind).join("、")}）`;
+      const config = readConfig(root);
+      if (config === null) return `本项目未初始化：先 /${NS}:init`;
+      if (patch.maxConcurrent !== undefined && patch.maxConcurrent !== null &&
+          (!Number.isInteger(patch.maxConcurrent) || patch.maxConcurrent < 1)) {
+        return `并发上限需要 ≥ 1 的整数：${patch.maxConcurrent}`;
+      }
+      // An absent field keeps whatever the project already said, so toggling one
+      // switch cannot silently reset the other value to its built-in default.
+      const previous = config.agentKinds?.[kind] ?? {};
+      const next: AgentKindConfig = { ...previous };
+      if (patch.enabled !== undefined) next.enabled = patch.enabled;
+      if (patch.maxConcurrent === null) delete next.maxConcurrent;
+      else if (patch.maxConcurrent !== undefined) next.maxConcurrent = patch.maxConcurrent;
+      writeConfig(root, { ...config, agentKinds: { ...config.agentKinds, [kind]: next } });
+      // Same path as a module switch, then awaited: re-registering is what makes
+      // an enabled kind exist in the agent list before the next dispatch, and a
+      // report that says "已注册" must be reading a registration that happened.
+      //
+      // A gate still running in this session already re-reads the policy from disk
+      // after its own public read, so the toggle also decides a dispatch that was
+      // in flight — no restart, and no "applied but only for the next session".
+      if (runtimeHost !== null) await syncAgentKinds(runtimeHost, runtime);
+      const lines = runtimeHost === null ? [] : agentKindsModule.runtimeStatus?.(runtimeHost) ?? [];
+      const resolved = resolveKinds(readConfig(root)).find((entry) => entry.kind === kind);
+      const state = `${kind}（${agentNameFor(kind)}）→ ${resolved?.enabled ? "on" : "off"}${
+        resolved === undefined ? "" : `，上限 ${resolved.maxConcurrent}`
+      }`;
+      // The registration outcome, not just the policy: "on" and "available in the
+      // agent list" are two different facts and the panel shows both.
+      const failure = lines.find((line) => line.includes(`${kind} 注册失败`));
+      const registered = lines.some((line) => line.includes(agentNameFor(kind)) && line.includes("已注册"));
+      return failure !== undefined
+        ? `${state}；但注册失败：${failure.replace(/^\s*[x!=-]\s*agent-kinds:\s*/, "")}`
+        : resolved?.enabled === true && !registered
+          ? `${state}；未注册（原因见「子 agent 类型」下的状态行）`
+          : `${state}（本会话已生效，无需重启）`;
+    },
+    agentKindStatus: () => (runtimeHost === null ? [] : agentKindsModule.runtimeStatus?.(runtimeHost) ?? []),
+    settleAgentKinds: () => (runtimeHost === null ? Promise.resolve() : syncAgentKinds(runtimeHost, runtime)),
     init: (args) => runSetup(args, { cwd: rootOf() ?? runtime.cwd }, false),
   };
 }

@@ -46,6 +46,24 @@ export interface WorkflowConfig {
    * `newSwitchDefault` decides (see `resolveSwitch`).
    */
   modules: Record<string, boolean>;
+  /**
+   * Subagent kind → its project policy. A kind is a named agent definition plus
+   * two switches, so this is the only place a project decides which kinds exist
+   * and how many of each may run.
+   *
+   * Absent means the built-in default for that kind. A key naming a kind this
+   * package does not ship is **preserved**: the project declared it, and dropping
+   * it on the next read would silently delete a decision nobody retracted. That
+   * kind has no asset behind it, so it is reported as declared-but-unavailable
+   * instead of being registered or quietly ignored.
+   */
+  agentKinds?: Record<string, AgentKindConfig>;
+}
+
+/** One kind's project policy; every field absent means the built-in default. */
+export interface AgentKindConfig {
+  enabled?: boolean;
+  maxConcurrent?: number;
 }
 
 export function configPath(root: string): string {
@@ -248,7 +266,9 @@ function parseConfig(raw: string): WorkflowConfig | null {
       installedAt?: unknown;
       autoEnable?: unknown;
       subagentConcurrency?: unknown;
+      agentKinds?: unknown;
     };
+    const agentKinds = parseAgentKinds(record.agentKinds);
     const modules: Record<string, boolean> = {};
     if (record.modules !== null && typeof record.modules === "object" && !Array.isArray(record.modules)) {
       for (const [id, value] of Object.entries(record.modules as Record<string, unknown>)) {
@@ -266,10 +286,56 @@ function parseConfig(raw: string): WorkflowConfig | null {
         ? { subagentConcurrency: record.subagentConcurrency }
         : {}),
       modules,
+      ...(agentKinds === undefined ? {} : { agentKinds }),
     };
   } catch {
     return null;
   }
+}
+
+/** `cw-<kind>`: the namespace that keeps a kind away from builtins and project agents. */
+export const KIND_PREFIX = "cw-";
+
+/** One kind's policy with every default applied, which is what the gate reads. */
+export interface ResolvedAgentKind {
+  /** The kind as the project spells it, without the name prefix. */
+  kind: string;
+  /** How the panel and the reports name it (`执行者`, `审计者`). */
+  label: string;
+  /** The registered agent name: `cw-<kind>`. */
+  agent: string;
+  enabled: boolean;
+  maxConcurrent: number;
+}
+
+/**
+ * Decode the kinds block, or `undefined` when the project declared none.
+ *
+ * Three rules, each of which is a decision the gate depends on:
+ *
+ *   - a value that is not an object is not a policy, so it is dropped rather
+ *     than turned into "enabled with some default";
+ *   - a limit that is not a positive integer is dropped for the same reason —
+ *     `0` would read as "refuse everything" and `-1` as "no limit", and neither
+ *     is what an unreadable value means;
+ *   - an unknown kind is preserved with whatever it declared. The project owns
+ *     the key; only the built-in table decides whether there is an agent behind it.
+ */
+function parseAgentKinds(value: unknown): Record<string, AgentKindConfig> | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const kinds: Record<string, AgentKindConfig> = {};
+  for (const [kind, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (kind.trim() !== kind || !kind) continue;
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const entry = raw as { enabled?: unknown; maxConcurrent?: unknown };
+    kinds[kind] = {
+      ...(typeof entry.enabled === "boolean" ? { enabled: entry.enabled } : {}),
+      ...(typeof entry.maxConcurrent === "number" && Number.isInteger(entry.maxConcurrent) && entry.maxConcurrent > 0
+        ? { maxConcurrent: entry.maxConcurrent }
+        : {}),
+    };
+  }
+  return Object.keys(kinds).length > 0 ? kinds : undefined;
 }
 
 /**

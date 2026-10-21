@@ -65,6 +65,7 @@ import {
   taskRefForDisplay,
   type SubagentRole,
 } from "../../core/trellis.ts";
+import { kindRole } from "../agent-kinds/defaults.ts";
 
 const ROLES: SubagentRole[] = ["implement", "check", "research"];
 /**
@@ -72,6 +73,13 @@ const ROLES: SubagentRole[] = ["implement", "check", "research"];
  * `subagent-trellis-check-<runId>-1`, where `-` precedes it.
  */
 const AGENT_RE = /(?:^|[^A-Za-z0-9])trellis-(implement|check|research)(?![A-Za-z0-9])/;
+/**
+ * A kind's registered agent name (`cw-executor`, `cw-auditor`), matched the same
+ * way. It resolves through the *same* role table as `trellis-*`: a kind is how a
+ * project names a dispatcher, not a second injection path, so whichever name the
+ * child was launched under it receives the role context it corresponds to.
+ */
+const KIND_AGENT_RE = /(?:^|[^A-Za-z0-9])cw-(executor|auditor)(?![A-Za-z0-9])/;
 const MARKER_RE = /<!--\s*trellis-agent:\s*(implement|check|research)\s*-->/;
 /**
  * The task path after `Active task:`, anywhere in the text. It must not be
@@ -104,13 +112,26 @@ function asRole(value: string | undefined): SubagentRole | null {
   return (ROLES as string[]).includes(value) ? (value as SubagentRole) : null;
 }
 
+/**
+ * The role a kind's agent name stands for, from the one kind→role table.
+ *
+ * `kindRole` is the single mapping (`executor → implement`, `auditor → check`), so
+ * a change to what a kind means reaches both the registration and this match
+ * instead of leaving two tables to disagree.
+ */
+function roleOfKind(agent: string): SubagentRole | null {
+  const kind = KIND_AGENT_RE.exec(agent)?.[1];
+  return kind === undefined ? null : kindRole(kind);
+}
+
 /** The role this child was dispatched as, or null when it is not a Trellis role. */
 export function detectRole(
   sessionName: string | undefined,
   ...texts: (string | undefined)[]
 ): SubagentRole | null {
   const agent = sessionName?.split(":")[0]?.trim();
-  const fromAgent = asRole(agent) ?? asRole(AGENT_RE.exec(agent ?? "")?.[1]);
+  const fromAgent =
+    asRole(agent) ?? asRole(AGENT_RE.exec(agent ?? "")?.[1]) ?? roleOfKind(agent ?? "");
   if (fromAgent) return fromAgent;
 
   for (const text of texts) {

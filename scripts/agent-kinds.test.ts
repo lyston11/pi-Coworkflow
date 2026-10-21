@@ -1,0 +1,951 @@
+/**
+ * Agent kinds, Stage 1: the config shape, the kind table, and registration
+ * against the *installed* pi-subagents owner.
+ *
+ * What can break silently here, and is therefore what this file drives:
+ *
+ *   - **the contract is read, not assumed.** The registration goes through the
+ *     installed package's public `./agents` export and its documented
+ *     `runtime-agent-register:v1` event. A stub registry would pass while the real
+ *     owner refused every name — the collision path would never run.
+ *   - **idempotent re-registration.** The owner rejects a duplicate name, so a
+ *     reconcile that skipped disposal would fail on the *second* call. Toggling
+ *     twice must leave one registration, no collision error, and no stale entry.
+ *   - **honest degradation.** With no event bus, or with no owner listening, the
+ *     contract is unavailable: nothing registers, the reason is returned, and a
+ *     declared kind is *not* reported as available.
+ *   - **a collision fails one kind only.** The others still register.
+ *
+ * Everything registers into the installed owner's process-local registry keyed by
+ * a fake `pi`, and every test disposes it. Nothing spawns a child or touches a
+ * real project: the project roots are temp directories with a config file.
+ */
+
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+
+import { readConfig, createConfigRootResolver, type WorkflowConfig } from "../core/config.ts";
+import { exportEntry } from "../core/subagents-workflow.ts";
+import {
+  BUILTIN_KINDS,
+  agentNameFor,
+  builtinAgentNames,
+  kindOf,
+  kindSystemPrompt,
+  resolveKinds,
+  unshippedKinds,
+} from "../modules/agent-kinds/defaults.ts";
+import {
+  createKindRegistry,
+  disposeKindRegistrations,
+  kindRegistryFor,
+  loadRuntimeAgentContract,
+  type DesiredKind,
+} from "../modules/agent-kinds/registration.ts";
+import { agentKindsModule, decodeKindDispatch, kindRegistrationPlan, syncAgentKinds } from "../modules/agent-kinds/index.ts";
+import { capacityModule } from "../modules/capacity/index.ts";
+
+const here = (rel: string): string => new URL(rel, import.meta.url).pathname;
+
+/** The installed owner, resolved exactly as the production code resolves it. */
+function ownerModule(): string | { error: string } {
+  return exportEntry("./agents", mkdtempSync(join(tmpdir(), "coworkflow-kinds-probe-")));
+}
+
+const ownerPath = ownerModule();
+const installed = typeof ownerPath === "string";
+const skip = installed
+  ? false
+  : `pi-subagents with a public ./agents export is not installed here (${(ownerPath as { error: string }).error})`;
+
+interface OwnerAgents {
+  RUNTIME_AGENT_REGISTER_EVENT: string;
+  /** The owner's real registration: its own validation, collision and cleanup. */
+  registerAgent(input: { pi: unknown; name: string; definition: object }): { dispose(): void };
+  registerAgentViaEvents(input: { pi: unknown; name: string; definition: object }): { dispose(): void };
+}
+
+const owner = installed ? ((await import(`file://${ownerPath as string}`)) as OwnerAgents) : null;
+
+/** The owner's own view of what it registered for this fake `pi`. */
+interface RegistryView {
+  listRuntimeAgentConfigs(pi: unknown): { name: string; source?: string }[];
+  clearRuntimeAgentsForPi(pi: unknown): void;
+}
+
+const registryPath = installed
+  ? join((ownerPath as string).replace(/\/src\/api\/agents\.js$/, ""), "src", "agents", "runtime-agent-registry.js")
+  : null;
+const registryView: RegistryView | null =
+  registryPath !== null && existsSync(registryPath) ? ((await import(`file://${registryPath}`)) as RegistryView) : null;
+
+/** The owner's real event listener, from the installed package. */
+const eventsPath = installed
+  ? join((ownerPath as string).replace(/\/src\/api\/agents\.js$/, ""), "src", "agents", "runtime-agent-events.js")
+  : null;
+const ownerInstaller: ((pi: unknown) => () => void) | null =
+  eventsPath !== null && existsSync(eventsPath)
+    ? ((await import(`file://${eventsPath}`)) as { registerRuntimeAgentEventListener(pi: unknown): () => void })
+        .registerRuntimeAgentEventListener
+    : null;
+
+/**
+ * A fake `pi` with a real event bus, and the owner's **own** registration listener
+ * on it.
+ *
+ * `./agents` deliberately does not re-export the listener installer (only the
+ * owner's extension installs it), so this prefers the owner's actual installer
+ * from the installed package and falls back to the documented handler body —
+ * version check, `registerAgent`, write `request.result` — when that internal
+ * module is not where it is today. Either way the registration itself is the
+ * installed owner's `registerAgent`: its validation, builtin and duplicate
+ * collision checks, and its `dispose()`. Nothing here stubs registration.
+ *
+ * `rpc` answers `subagents:rpc:v1` requests on the same bus, so a test can drive
+ * the gate's real public-count path (`ping` + `status`) rather than a stub.
+ */
+function fakePi(rpc?: (request: any) => { data?: unknown; success?: boolean } | undefined): {
+  pi: { events: { emit(channel: string, data: unknown): void; on(channel: string, handler: (data: unknown) => void): () => void }; on(): void; registerTool(): void };
+  listener: () => void;
+  requests: any[];
+} {
+  const listeners = new Map<string, ((data: unknown) => void)[]>();
+  const requests: any[] = [];
+  const pi = {
+    events: {
+      emit(channel: string, data: unknown) {
+        const request = data as { requestId?: unknown };
+        if (channel === "subagents:rpc:v1:request" && rpc) {
+          requests.push(data);
+          const answer = rpc(data);
+          if (answer !== undefined && typeof request.requestId === "string") {
+            queueMicrotask(() => {
+              for (const handler of listeners.get(`subagents:rpc:v1:reply:${request.requestId}`) ?? []) handler({
+                version: 1,
+                requestId: request.requestId,
+                success: answer.success !== false,
+                ...(answer.success === false ? { error: { code: "unsupported", message: "not supported" } } : { data: answer.data }),
+              });
+            });
+          }
+          return;
+        }
+        for (const handler of listeners.get(channel) ?? []) handler(data);
+      },
+      on(channel: string, handler: (data: unknown) => void) {
+        listeners.set(channel, [...(listeners.get(channel) ?? []), handler]);
+        return () => listeners.set(channel, (listeners.get(channel) ?? []).filter((entry) => entry !== handler));
+      },
+    },
+    on() {},
+    registerTool() {},
+  };
+  if (ownerInstaller !== null) return { pi, listener: ownerInstaller(pi), requests };
+  const listener = pi.events.on(owner!.RUNTIME_AGENT_REGISTER_EVENT, (raw: unknown) => {
+    const request = raw as { version: number; name: string; definition: object; result?: unknown };
+    if (request.result !== undefined) return;
+    try {
+      if (request.version !== 1) throw new Error("unsupported version");
+      request.result = { ok: true, registration: owner!.registerAgent({ pi, name: request.name, definition: request.definition }) };
+    } catch (error) {
+      request.result = { ok: false, error: error instanceof Error ? error : new Error(String(error)) };
+    }
+  });
+  return { pi, listener, requests };
+}
+
+function tempProject(kinds?: Record<string, { enabled?: boolean; maxConcurrent?: number }>): string {
+  const root = mkdtempSync(join(tmpdir(), "coworkflow-kinds-"));
+  mkdirSync(join(root, ".pi"), { recursive: true });
+  writeFileSync(
+    join(root, ".pi", "Coworkflow.json"),
+    JSON.stringify({ version: 1, autoEnable: true, modules: { "agent-kinds": true }, ...(kinds ? { agentKinds: kinds } : {}) }),
+  );
+  return root;
+}
+
+/**
+ * The production plan for the named kinds — assets included — rather than a
+ * hand-built definition, so a missing asset or a wrong description fails here too.
+ */
+const moduleUrl = new URL("../modules/agent-kinds/index.ts", import.meta.url).href;
+
+function desired(kinds: string[]): DesiredKind[] {
+  const policy = kinds.map((kind) => ({
+    kind,
+    label: kind,
+    agent: agentNameFor(kind),
+    enabled: true,
+    maxConcurrent: 1,
+  }));
+  const plan = kindRegistrationPlan(policy, moduleUrl);
+  assert.deepEqual(plan.missingAssets, [], "every shipped kind must have a system-prompt asset");
+  assert.equal(plan.desired.length, kinds.length);
+  return plan.desired;
+}
+
+// ── the config shape ─────────────────────────────────────────────────
+
+test("kinds config: unknown kinds and unreadable fields are preserved as the project wrote them", () => {
+  const root = mkdtempSync(join(tmpdir(), "coworkflow-kinds-config-"));
+  try {
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    writeFileSync(
+      join(root, ".pi", "Coworkflow.json"),
+      JSON.stringify({
+        version: 1,
+        modules: {},
+        agentKinds: {
+          executor: { enabled: false, maxConcurrent: 5 },
+          auditor: { maxConcurrent: 0 },
+          reviewer: { enabled: true, maxConcurrent: 2 },
+          "  spaced  ": { enabled: true },
+          broken: "not-an-object",
+        },
+      }),
+    );
+    const config = readConfig(root);
+    assert.ok(config);
+    // An unknown kind is a decision the project made: dropping it would silently
+    // retract it, so it is kept and reported as unshipped instead.
+    assert.deepEqual(unshippedKinds(config), ["reviewer"]);
+    assert.deepEqual(config.agentKinds?.reviewer, { enabled: true, maxConcurrent: 2 });
+    // `0` is not "refuse everything" and not a valid limit; the field is dropped
+    // and the built-in default applies, which `resolveKinds` reads.
+    assert.deepEqual(config.agentKinds?.auditor, {});
+    // A malformed entry and a key with stray whitespace are not policies.
+    assert.equal(config.agentKinds?.broken, undefined);
+    assert.equal(config.agentKinds?.["  spaced  "], undefined);
+
+    const resolved = resolveKinds(config);
+    assert.deepEqual(
+      resolved.map((entry) => [entry.kind, entry.agent, entry.enabled, entry.maxConcurrent]),
+      [
+        ["executor", "cw-executor", false, 5],
+        ["auditor", "cw-auditor", false, 1],
+      ],
+      "the built-in defaults fill what the project did not say",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("kinds table: names are cw- prefixed, map to Trellis roles, and prompts are assets not strings", () => {
+  assert.deepEqual(builtinAgentNames(), ["cw-executor", "cw-auditor"]);
+  assert.deepEqual(BUILTIN_KINDS.map((entry) => entry.role), ["implement", "check"]);
+  assert.equal(kindOf("cw-executor"), "executor");
+  assert.equal(kindOf("trellis-implement"), null, "a non-kind dispatch is not ours");
+  assert.equal(kindOf("cw-unknown"), null, "only a shipped kind is ours");
+  for (const entry of BUILTIN_KINDS) {
+    const prompt = kindSystemPrompt(moduleUrl, entry.kind);
+    assert.ok(prompt && prompt.length > 100, `${entry.kind} prompt comes from its asset`);
+  }
+  // A project that declares nothing gets the built-in defaults.
+  assert.deepEqual(
+    resolveKinds(null).map((entry) => [entry.kind, entry.enabled, entry.maxConcurrent]),
+    [["executor", true, 3], ["auditor", false, 1]],
+  );
+});
+
+// ── the contract, against the installed owner ────────────────────────
+
+test("contract: the public ./agents export and its event are what registration uses", { skip }, async () => {
+  const { pi, listener } = fakePi();
+  try {
+    const loaded = await loadRuntimeAgentContract({ events: pi.events });
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    assert.equal(loaded.contract.event, owner!.RUNTIME_AGENT_REGISTER_EVENT);
+    assert.equal(loaded.contract.event, "pi-subagents:runtime-agent-register:v1");
+  } finally {
+    listener();
+  }
+});
+
+test("contract: no event bus means unavailable, with a reason instead of a silent no-op", async () => {
+  const loaded = await loadRuntimeAgentContract({});
+  assert.equal(loaded.ok, false);
+  if (loaded.ok) return;
+  assert.match(loaded.reason, /事件总线/);
+});
+
+test("contract: a bus with no owner listening is a refusal, not a registration", { skip }, async () => {
+  const { pi } = fakePi();
+  // A second bus that nobody listens on: this is exactly "pi-subagents is not
+  // loaded in this process", the case a direct call would silently paper over.
+  const orphan = {
+    emit() {},
+    on() {
+      return () => {};
+    },
+  };
+  const loaded = await loadRuntimeAgentContract({ events: orphan });
+  assert.equal(loaded.ok, true);
+  if (!loaded.ok) return;
+  assert.throws(() => loaded.contract.register("cw-executor", desired(["executor"])[0]!.definition), /not installed|not ready|does not support/);
+  // The real bus still works, which is what makes the failure above meaningful.
+  const real = await loadRuntimeAgentContract({ events: pi.events });
+  assert.equal(real.ok, true);
+});
+
+test("registration: reconcile is idempotent, disposes before re-registering, and re-registers after dispose", { skip }, async () => {
+  const { pi, listener } = fakePi();
+  try {
+    const contract = await loadRuntimeAgentContract({ events: pi.events });
+    assert.equal(contract.ok, true);
+    if (!contract.ok) return;
+    const registry = createKindRegistry();
+    const wanted = desired(["executor"]);
+
+    const first = registry.reconcile(contract.contract, wanted);
+    assert.deepEqual(first, [{ ok: true, kind: "executor", agent: "cw-executor" }]);
+    assert.deepEqual(registry.registered().map((entry) => entry.agent), ["cw-executor"]);
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name), ["cw-executor"]);
+
+    // Toggling twice: the second reconcile must not collide. The owner refuses a
+    // duplicate name, so this passing is the disposal-before-registration rule.
+    const second = registry.reconcile(contract.contract, wanted);
+    assert.deepEqual(second, [{ ok: true, kind: "executor", agent: "cw-executor" }]);
+    assert.deepEqual(registry.failures(), []);
+    assert.equal(registryView?.listRuntimeAgentConfigs(pi).length, 1, "no duplicate, no stale entry");
+
+    // A changed definition re-registers rather than being ignored.
+    const changed = [{ ...wanted[0]!, definition: { description: "edited", systemPrompt: "edited prompt" } }];
+    assert.equal(registry.reconcile(contract.contract, changed)[0]?.ok, true);
+    assert.equal(registryView?.listRuntimeAgentConfigs(pi).length, 1);
+
+    // Off, then on: dispose removes it from the owner, and a later pass restores it.
+    registry.dispose();
+    assert.deepEqual(registry.registered(), []);
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi), []);
+    assert.equal(registry.reconcile(contract.contract, wanted)[0]?.ok, true);
+    assert.equal(registryView?.listRuntimeAgentConfigs(pi).length, 1);
+
+    // An empty desired set withdraws what is no longer wanted.
+    assert.deepEqual(registry.reconcile(contract.contract, []), []);
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi), []);
+  } finally {
+    listener();
+    registryView?.clearRuntimeAgentsForPi(pi);
+  }
+});
+
+test("registration: a name collision fails that kind only, with the owner's own reason", { skip }, async () => {
+  const { pi, listener } = fakePi();
+  try {
+    const contract = await loadRuntimeAgentContract({ events: pi.events });
+    assert.equal(contract.ok, true);
+    if (!contract.ok) return;
+    // A project (or another extension) already holds one of our names.
+    const squatter = owner!.registerAgent({ pi, name: "cw-auditor", definition: { description: "theirs", systemPrompt: "theirs" } });
+    const registry = createKindRegistry();
+    const results = registry.reconcile(contract.contract, desired(["executor", "auditor"]));
+    assert.deepEqual(
+      results.map((entry) => [entry.kind, entry.ok]),
+      [["executor", true], ["auditor", false]],
+      "one bad kind never prevents the others",
+    );
+    const failure = registry.failures().find((entry) => entry.kind === "auditor");
+    assert.ok(failure);
+    assert.match(failure.reason, /collides with runtime agent 'cw-auditor'/);
+    assert.deepEqual(registry.registered().map((entry) => entry.agent), ["cw-executor"]);
+    squatter.dispose();
+  } finally {
+    listener();
+    registryView?.clearRuntimeAgentsForPi(pi);
+  }
+});
+
+// ── the module: gates, session end, and honest status ────────────────
+
+interface Runtime {
+  runtime: Parameters<typeof syncAgentKinds>[1];
+  root: string;
+  setEnabled(on: boolean): void;
+  setModule(on: boolean): void;
+}
+
+function runtimeFor(root: string): Runtime {
+  let enabled = true;
+  let moduleOn = true;
+  const resolver = createConfigRootResolver({ runGit: () => ({ kind: "no-repo" }) });
+  return {
+    root,
+    setEnabled(on) {
+      enabled = on;
+    },
+    setModule(on) {
+      moduleOn = on;
+    },
+    runtime: {
+      isChild: false,
+      get enabled() {
+        return enabled;
+      },
+      cwd: root,
+      sessionId: "session-kinds",
+      parentSessionId: null,
+      sessionEpoch: 1,
+      loadState: "auto",
+      configRoots: resolver,
+      refresh() {},
+      control: {
+        moduleEnabled: (id: string) => moduleOn && id === "agent-kinds",
+        subagentConcurrency: () => null,
+      },
+    } as unknown as Parameters<typeof syncAgentKinds>[1],
+  };
+}
+
+test("module: enabled kinds register with the owner, session end withdraws them, status tells the truth", { skip }, async () => {
+  const { pi, listener } = fakePi();
+  const root = tempProject({ auditor: { enabled: true } });
+  const host = { events: pi.events } as unknown as Parameters<typeof syncAgentKinds>[0];
+  try {
+    const state = runtimeFor(root);
+    await syncAgentKinds(host, state.runtime);
+    assert.deepEqual(
+      registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(),
+      ["cw-auditor", "cw-executor"],
+      "declared-enabled kinds appear in the owner's agent list",
+    );
+    const lines = agentKindsModule.runtimeStatus!(host) ?? [];
+    assert.ok(lines.some((line) => line.includes("cw-executor") && line.includes("已注册")), lines.join("\n"));
+
+    // The session switch off withdraws them: a withdrawn layer must not keep
+    // resolving a kind the model could still dispatch.
+    state.setEnabled(false);
+    await syncAgentKinds(host, state.runtime);
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi), []);
+
+    // And back on restores them, in the same session, with no duplicate.
+    state.setEnabled(true);
+    await syncAgentKinds(host, state.runtime);
+    assert.equal(registryView?.listRuntimeAgentConfigs(pi).length, 2);
+    await syncAgentKinds(host, state.runtime);
+    assert.equal(registryView?.listRuntimeAgentConfigs(pi).length, 2, "repeated reconcile registers nothing twice");
+
+    // Session end: disposal must not throw and must leave nothing that would act
+    // on the next session.
+    agentKindsModule.onSessionEnd!(host, state.runtime);
+    agentKindsModule.onSessionEnd!(host, state.runtime);
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi), []);
+    assert.deepEqual(agentKindsModule.runtimeStatus!(host), ["  - agent-kinds: 本会话未加载或已关闭，未注册任何 kind"]);
+  } finally {
+    disposeKindRegistrations(host);
+    registryView?.clearRuntimeAgentsForPi(pi);
+    rmSync(root, { recursive: true, force: true });
+    listener();
+  }
+});
+
+test("module: a disabled kind is not registered, and the project switch withdraws the rest", { skip }, async () => {
+  const { pi, listener } = fakePi();
+  const root = tempProject();
+  const host = { events: pi.events } as unknown as Parameters<typeof syncAgentKinds>[0];
+  try {
+    const state = runtimeFor(root);
+    await syncAgentKinds(host, state.runtime);
+    // Built-in defaults: executor on, auditor off.
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name), ["cw-executor"]);
+    const lines = agentKindsModule.runtimeStatus!(host) ?? [];
+    assert.ok(lines.some((line) => line.includes("auditor") && line.includes("已关闭")), lines.join("\n"));
+
+    state.setModule(false);
+    await syncAgentKinds(host, state.runtime);
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi), []);
+    state.setModule(true);
+    await syncAgentKinds(host, state.runtime);
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name), ["cw-executor"]);
+  } finally {
+    disposeKindRegistrations(host);
+    registryView?.clearRuntimeAgentsForPi(pi);
+    rmSync(root, { recursive: true, force: true });
+    listener();
+  }
+});
+
+test("module: no compatible contract registers nothing and says why, never listing a kind as available", async () => {
+  const root = tempProject({ auditor: { enabled: true } });
+  // No `events` at all: the host does not expose a bus, so no owner can be reached.
+  const host = {} as unknown as Parameters<typeof syncAgentKinds>[0];
+  try {
+    const state = runtimeFor(root);
+    await syncAgentKinds(host, state.runtime);
+    const lines = agentKindsModule.runtimeStatus!(host) ?? [];
+    assert.ok(lines.some((line) => /x agent-kinds:.*事件总线/.test(line)), lines.join("\n"));
+    assert.ok(!lines.some((line) => line.includes("已注册")), "nothing may be reported as available");
+    assert.ok(lines.some((line) => line.includes("未注册任何 kind")));
+    assert.deepEqual(kindRegistryFor(host).registered(), []);
+
+    // A config declaring kinds that has no bus must still not register anything on
+    // a later pass, and must keep reporting the reason.
+    await syncAgentKinds(host, state.runtime);
+    assert.ok(!(agentKindsModule.runtimeStatus!(host) ?? []).some((line) => line.includes("已注册")));
+  } finally {
+    disposeKindRegistrations(host);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("degradation: an installed owner without the public ./agents export registers nothing and says why", async () => {
+  const root = tempProject({ auditor: { enabled: true } });
+  const pkg = join(root, "node_modules", "pi-subagents");
+  mkdirSync(pkg, { recursive: true });
+  writeFileSync(
+    join(pkg, "package.json"),
+    JSON.stringify({ name: "pi-subagents", exports: { "./workflow-resources": "./workflow.js" } }),
+  );
+  const bus = {
+    emit() {},
+    on() {
+      return () => {};
+    },
+  };
+  const host = { events: bus } as unknown as Parameters<typeof syncAgentKinds>[0];
+  try {
+    const state = runtimeFor(root);
+    await syncAgentKinds(host, state.runtime);
+    const lines = agentKindsModule.runtimeStatus!(host) ?? [];
+    // The exact reason, not a list of kinds that do not exist: a project-local
+    // owner is preferred over the user-level one, so this is the one that answers.
+    assert.ok(lines.some((line) => line.startsWith("  x agent-kinds: ") && line.includes("./agents")), lines.join("\n"));
+    assert.ok(lines.some((line) => line.includes("未注册任何 kind")));
+    assert.ok(!lines.some((line) => line.includes("已注册")));
+    assert.deepEqual(kindRegistryFor(host).registered(), []);
+  } finally {
+    disposeKindRegistrations(host);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("module: a declared-but-unshipped kind is preserved and reported, never registered", { skip }, async () => {
+  const { pi, listener } = fakePi();
+  const root = tempProject({ reviewer: { enabled: true, maxConcurrent: 2 } });
+  const host = { events: pi.events } as unknown as Parameters<typeof syncAgentKinds>[0];
+  try {
+    const config: WorkflowConfig | null = readConfig(root);
+    assert.deepEqual(unshippedKinds(config), ["reviewer"]);
+    await syncAgentKinds(host, runtimeFor(root).runtime);
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name), ["cw-executor"]);
+    const lines = agentKindsModule.runtimeStatus!(host) ?? [];
+    assert.ok(lines.some((line) => line.includes("reviewer") && line.includes("本包没有这个 kind")), lines.join("\n"));
+  } finally {
+    disposeKindRegistrations(host);
+    registryView?.clearRuntimeAgentsForPi(pi);
+    rmSync(root, { recursive: true, force: true });
+    listener();
+  }
+});
+
+// ── the gate: `tool_call` admission, per kind ────────────────────────
+//
+// These drive the production `tool_call` hook, not `decodeKindDispatch` alone: the
+// count comes from a real `ping` + `status` round trip over the fake bus, so a gate
+// that never asked the owner (and therefore never counted) fails here.
+
+interface GateHarness {
+  root: string;
+  host: Parameters<typeof syncAgentKinds>[0];
+  runtime: Parameters<typeof syncAgentKinds>[1];
+  /** Live children the fake owner reports, one entry per running run. */
+  live: string[];
+  requests: any[];
+  /** The first blocking result for one `subagent` call, if any. */
+  call(input: Record<string, unknown>): Promise<{ block?: true; reason?: string } | undefined>;
+  setEnabled(on: boolean): void;
+  setModule(on: boolean): void;
+  setConcurrency(limit: number | null): void;
+  /** Hooks currently installed for one event name. */
+  count(name: string): number;
+  close(): void;
+}
+
+function gateHarness(options: {
+  kinds?: Record<string, { enabled?: boolean; maxConcurrent?: number }>;
+  fleetStatus?: boolean;
+  malformedFleet?: boolean;
+  omitted?: number;
+  events?: boolean;
+} = {}): GateHarness {
+  const root = tempProject(options.kinds);
+  const live: string[] = [];
+  const built = fakePi((request) => {
+    if (request.method === "ping") {
+      return {
+        data: {
+          version: 1,
+          methods: ["ping", "status", "spawn"],
+          capabilities: {
+            status: true,
+            asyncSpawn: true,
+            ...(options.fleetStatus === false ? {} : { fleetStatus: { version: 1 } }),
+          },
+          events: {},
+          session: { sessionId: "session-gate" },
+        },
+      };
+    }
+    if (request.method === "status") {
+      return {
+        data: {
+          fleet: options.malformedFleet
+            ? { version: 1, entries: [{ key: 1 }], totalActive: 1, omitted: 0 }
+            : {
+                version: 1,
+                entries: live.map((agent, index) => ({
+                  key: `fleet-${index + 1}`,
+                  agent,
+                  startedAt: index,
+                  tokens: { input: 0, output: 0, total: 0 },
+                })),
+                totalActive: live.length,
+                omitted: options.omitted ?? 0,
+                topLevelAsyncCapacity: { used: live.length, limit: 10 },
+              },
+        },
+      };
+    }
+    return undefined;
+  });
+
+  const listeners = new Map<string, Set<(event: any, ctx: any) => any>>();
+  const host = {
+    on(name: string, handler: (event: any, ctx: any) => any) {
+      const set = listeners.get(name) ?? new Set();
+      set.add(handler);
+      listeners.set(name, set);
+      return () => set.delete(handler);
+    },
+    ...(options.events === false ? {} : { events: built.pi.events }),
+  } as unknown as Parameters<typeof syncAgentKinds>[0];
+
+  let enabled = true;
+  let moduleOn = true;
+  let limit: number | null = null;
+  const resolver = createConfigRootResolver({ runGit: () => ({ kind: "no-repo" }) });
+  const runtime = {
+    isChild: false,
+    get enabled() {
+      return enabled;
+    },
+    cwd: root,
+    sessionId: "session-gate",
+    parentSessionId: null,
+    sessionEpoch: 1,
+    loadState: "auto",
+    configRoots: resolver,
+    refresh() {},
+    control: {
+      moduleEnabled: (id: string) => moduleOn && (id === "agent-kinds" || id === "capacity"),
+      subagentConcurrency: () => limit,
+    },
+  } as unknown as Parameters<typeof syncAgentKinds>[1];
+
+  // The production activation: this is what registers the `tool_call` hook, so the
+  // tests below drive the shipped gate rather than calling its helper directly.
+  agentKindsModule.activate!(host, runtime);
+
+  async function emit(name: string, event: any): Promise<any[]> {
+    const results: any[] = [];
+    for (const handler of listeners.get(name) ?? []) {
+      const result = await handler(event, {});
+      results.push(result);
+      // The host stops at the first refusal, which is how a gate's block is real.
+      if (name === "tool_call" && result?.block) break;
+    }
+    return results;
+  }
+
+  return {
+    root,
+    host,
+    runtime,
+    live,
+    requests: built.requests,
+    async call(input) {
+      const results = await emit("tool_call", { toolName: "subagent", toolCallId: "call-1", input });
+      return results.find((result) => result?.block === true);
+    },
+    setEnabled(on) {
+      enabled = on;
+    },
+    setModule(on) {
+      moduleOn = on;
+    },
+    setConcurrency(value) {
+      limit = value;
+    },
+    count(name) {
+      return listeners.get(name)?.size ?? 0;
+    },
+    close() {
+      agentKindsModule.onSessionEnd!(host, runtime);
+      capacityModule.onSessionEnd!(host, runtime);
+      disposeKindRegistrations(host);
+      registryView?.clearRuntimeAgentsForPi(built.pi);
+      built.listener();
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+test("gate decoder: only a kind dispatch is ours, and only a work-starting call", () => {
+  assert.deepEqual(decodeKindDispatch({ agent: "cw-executor", task: "x" }), { agent: "cw-executor", kind: "executor", async: true });
+  assert.deepEqual(decodeKindDispatch({ agent: " cw-auditor ", task: "x", async: false }), { agent: "cw-auditor", kind: "auditor", async: false });
+  // `resume`/`append-step` start work on a run that was already admitted.
+  assert.equal(decodeKindDispatch({ agent: "cw-executor", action: "resume", message: "go" })?.kind, "executor");
+  assert.equal(decodeKindDispatch({ agent: "cw-executor", action: "append-step" })?.kind, "executor");
+  for (const input of [
+    // Not ours: the builtin table and other extensions keep their own agents.
+    { agent: "worker", task: "x" },
+    { agent: "trellis-implement", task: "x" },
+    { agent: "cw-unknown", task: "x" },
+    // Not a dispatch: management actions use `agent` as a target, not a child.
+    { action: "status" },
+    { action: "stop", agent: "cw-executor" },
+    { action: "create", agent: "cw-executor" },
+    { agent: "" },
+    {},
+    null,
+    undefined,
+    "subagent",
+    ["cw-executor"],
+  ]) {
+    assert.equal(decodeKindDispatch(input), null, JSON.stringify(input) ?? "undefined");
+  }
+});
+
+test("gate: a disabled kind is refused, and the reason names only kinds that really exist", { skip }, async () => {
+  const h = gateHarness();
+  try {
+    await syncAgentKinds(h.host, h.runtime);
+    // Built-in defaults: executor on (and registered), auditor off.
+    const refused = await h.call({ agent: "cw-auditor", task: "audit this" });
+    assert.ok(refused, "a disabled kind must not be dispatched");
+    assert.match(refused.reason ?? "", /关闭了 kind auditor（cw-auditor）/);
+    assert.match(refused.reason ?? "", /当前可用的 kind：cw-executor/);
+    assert.match(refused.reason ?? "", /没有启动任何子进程/);
+    assert.equal(h.requests.length, 0, "a disabled kind costs no public read: it is refused before counting");
+  } finally {
+    h.close();
+  }
+});
+
+test("gate: over-limit is refused with the limit and the occupancy; one below the limit is admitted", { skip }, async () => {
+  const h = gateHarness({ kinds: { executor: { enabled: true, maxConcurrent: 2 } } });
+  try {
+    await syncAgentKinds(h.host, h.runtime);
+    h.live.push("cw-executor");
+    assert.equal(await h.call({ agent: "cw-executor", task: "one" }), undefined, "1 of 2 occupies the limit but does not reach it");
+    // Exactly at the limit: no room for one more, which is what a limit of 2 means.
+    h.live.push("cw-executor");
+    const refused = await h.call({ agent: "cw-executor", task: "two" });
+    assert.ok(refused);
+    assert.match(refused.reason ?? "", /并发上限是 2/);
+    assert.match(refused.reason ?? "", /当前已有 2 个在运行/);
+    // Another agent's occupancy is not this kind's occupancy: three runs, one of
+    // them ours, is still one of two.
+    h.live.length = 0;
+    h.live.push("cw-executor", "trellis-implement", "worker");
+    assert.equal(await h.call({ agent: "cw-executor", task: "three" }), undefined, "other agents do not consume a kind slot");
+    h.live.length = 0;
+    h.live.push("trellis-implement", "worker");
+    assert.equal(await h.call({ agent: "cw-executor", task: "four" }), undefined, "zero of ours is below the limit");
+    h.live.length = 0;
+    h.live.push("cw-executor", "cw-executor");
+    assert.ok(await h.call({ agent: "cw-executor", task: "five" }), "two of two is at the limit");
+  } finally {
+    h.close();
+  }
+});
+
+test("gate: an unreadable or unavailable fleet count refuses instead of assuming there is room", { skip }, async () => {
+  for (const options of [{ fleetStatus: false }, { malformedFleet: true }, { omitted: 2 }]) {
+    const h = gateHarness(options);
+    try {
+      await syncAgentKinds(h.host, h.runtime);
+      assert.equal(h.live.length, 0, "the owner reports nothing running");
+      const refused = await h.call({ agent: "cw-executor", task: "work" });
+      assert.ok(refused, `unknown count must refuse (${JSON.stringify(options)})`);
+      // Never `0`: the refusal says it could not count, and why.
+      assert.match(refused.reason ?? "", /无法确认现在有几个在运行/);
+      assert.match(refused.reason ?? "", /上限 3/);
+      assert.doesNotMatch(refused.reason ?? "", /当前已有 0 个/);
+    } finally {
+      h.close();
+    }
+  }
+});
+
+test("gate: an enabled kind that nothing registered is refused, never silently started", async () => {
+  // No `events` on the host: the runtime-agent contract cannot be reached, so no
+  // kind is registered. The gate must still refuse a declared kind.
+  const h = gateHarness({ events: false });
+  try {
+    await syncAgentKinds(h.host, h.runtime);
+    const refused = await h.call({ agent: "cw-executor", task: "work" });
+    assert.ok(refused);
+    assert.match(refused.reason ?? "", /没有被注册到 pi-subagents/);
+    assert.match(refused.reason ?? "", /事件总线/);
+  } finally {
+    h.close();
+  }
+});
+
+test("gate: non-kind dispatches and management calls are byte-for-byte untouched", { skip }, async () => {
+  const h = gateHarness({ kinds: { executor: { enabled: true, maxConcurrent: 1 } } });
+  try {
+    await syncAgentKinds(h.host, h.runtime);
+    // A kind already at its limit, so any leak of the gate onto other names shows.
+    h.live.push("cw-executor");
+    const before = h.requests.length;
+    for (const input of [
+      { agent: "trellis-implement", task: "work" },
+      { agent: "worker", task: "work" },
+      { agent: "reviewer", task: "review" },
+      { agent: "cw-unknown", task: "work" },
+      { action: "status" },
+      { action: "stop", agent: "cw-executor" },
+      { action: "list" },
+      {},
+      { agent: "cw-executor", action: "status" },
+    ]) {
+      assert.equal(await h.call(input), undefined, JSON.stringify(input));
+    }
+    assert.equal(h.requests.length, before, "no public read, no block: these calls never touch the gate's count");
+  } finally {
+    h.close();
+  }
+});
+
+test("gate: the project-wide limit and the per-kind limit both hold, and neither masks the other", { skip }, async () => {
+  const h = gateHarness({ kinds: { executor: { enabled: true, maxConcurrent: 1 } } });
+  try {
+    capacityModule.activate!(h.host, h.runtime);
+    await syncAgentKinds(h.host, h.runtime);
+
+    // Per-kind refuses while the project-wide limit has room: its own reason wins.
+    h.setConcurrency(5);
+    h.live.push("cw-executor");
+    const kindBlocked = await h.call({ agent: "cw-executor", task: "one" });
+    assert.ok(kindBlocked);
+    assert.match(kindBlocked.reason ?? "", /并发上限是 1/);
+
+    // The project-wide limit refuses while the kind has room: the coarse gate still
+    // applies to a kind, which is what "both must admit" means.
+    h.live.length = 0;
+    h.live.push("trellis-implement");
+    h.setConcurrency(1);
+    const globalBlocked = await h.call({ agent: "cw-executor", task: "two" });
+    assert.ok(globalBlocked);
+    assert.match(globalBlocked.reason ?? "", /本项目（Coworkflow）的子 agent 并发上限是 1/);
+    assert.doesNotMatch(globalBlocked.reason ?? "", /并发上限是 1\./);
+
+    // Both would block: the narrower, more specific refusal is the one the model
+    // reads, which is what "per-kind admission runs first" buys.
+    h.setConcurrency(1);
+    h.live.push("cw-executor");
+    const both = await h.call({ agent: "cw-executor", task: "both" });
+    assert.ok(both);
+    assert.match(both.reason ?? "", /kind executor（cw-executor） 的并发上限是 1/);
+    assert.doesNotMatch(both.reason ?? "", /本项目（Coworkflow）的子 agent 并发上限/);
+
+    // Both admit: the dispatch goes through.
+    h.setConcurrency(5);
+    h.live.length = 0;
+    assert.equal(await h.call({ agent: "cw-executor", task: "three" }), undefined);
+  } finally {
+    h.close();
+  }
+});
+
+test("gate: it runs only in the parent session and only while the layer is on", { skip }, async () => {
+  const h = gateHarness({ kinds: { executor: { enabled: true, maxConcurrent: 1 } } });
+  try {
+    await syncAgentKinds(h.host, h.runtime);
+    h.live.push("cw-executor");
+    h.setModule(false);
+    assert.equal(await h.call({ agent: "cw-executor", task: "work" }), undefined, "a switched-off module does not police");
+    h.setModule(true);
+    h.setEnabled(false);
+    assert.equal(await h.call({ agent: "cw-executor", task: "work" }), undefined, "a switched-off session does not police");
+    h.setEnabled(true);
+    assert.ok(await h.call({ agent: "cw-executor", task: "work" }), "back on, the gate refuses again with no reload");
+    // A child must not gate its own subtree.
+    (h.runtime as { isChild: boolean }).isChild = true;
+    assert.equal(await h.call({ agent: "cw-executor", task: "work" }), undefined);
+    (h.runtime as { isChild: boolean }).isChild = false;
+  } finally {
+    h.close();
+  }
+});
+
+test("gate: session end releases the hook, and re-activation installs exactly one", { skip }, async () => {
+  const h = gateHarness({ kinds: { executor: { enabled: true, maxConcurrent: 1 } } });
+  try {
+    assert.equal(h.count("tool_call"), 1);
+    // A second activation in the same session must not add a listener: two gates
+    // would ask the owner twice and could admit one launch into two slots.
+    agentKindsModule.activate!(h.host, h.runtime);
+    assert.equal(h.count("tool_call"), 1);
+
+    agentKindsModule.onSessionEnd!(h.host, h.runtime);
+    assert.equal(h.count("tool_call"), 0, "nothing stays registered for the next session");
+
+    (h.runtime as { sessionEpoch: number }).sessionEpoch = 2;
+    agentKindsModule.activate!(h.host, h.runtime);
+    assert.equal(h.count("tool_call"), 1, "one hook again, not two");
+    await syncAgentKinds(h.host, h.runtime);
+    assert.deepEqual(kindRegistryFor(h.host).registered().map((entry) => entry.agent), ["cw-executor"], "re-registered after the session ended");
+    assert.equal(await h.call({ agent: "cw-executor", task: "work" }), undefined, "the reinstated gate does not refuse a free kind");
+  } finally {
+    h.close();
+  }
+});
+
+
+/**
+ * A configured agent holding a kind's name must not break the whole session.
+ *
+ * The owner validates builtin and runtime collisions at registration, but a
+ * *configured* agent (`.pi/agents/cw-executor.md`) is only caught later, in its
+ * discovery merge — which throws on a path with no try around it. One such file
+ * therefore broke every dispatch in the session, kinds and plain agents alike,
+ * while this package still reported the kind as registered.
+ */
+test("registration: a configured agent with a kind's name fails that kind only, and the owner still works", { skip }, async () => {
+  const { pi } = fakePi();
+  const project = realpathSync(mkdtempSync(join(tmpdir(), "coworkflow-kinds-configured-")));
+  try {
+    mkdirSync(join(project, ".pi", "agents"), { recursive: true });
+    writeFileSync(
+      join(project, ".pi", "agents", "cw-executor.md"),
+      "---\nname: cw-executor\ndescription: project owned\n---\n\nProject's own executor.\n",
+    );
+    const loaded = await loadRuntimeAgentContract({ events: pi.events, cwd: project, agentDir: join(project, "user-agent-dir") });
+    assert.equal(loaded.ok, true);
+
+    // The colliding kind is refused here, locally, instead of poisoning the whole
+    // session's agent discovery on the first dispatch.
+    assert.throws(
+      () => loaded.ok && loaded.contract.register("cw-executor", { description: "ours", systemPrompt: "ours", tools: [] }),
+      /占用了名称 cw-executor/,
+    );
+    // Its neighbours are unaffected: one collision is not the entire layer.
+    const other = loaded.ok ? loaded.contract.register("cw-auditor", { description: "audit", systemPrompt: "audit", tools: [] }) : null;
+    assert.ok(other !== null);
+    assert.deepEqual(
+      registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name),
+      ["cw-auditor"],
+      "the non-colliding kind registered in the owner",
+    );
+    other?.dispose();
+  } finally {
+    rmSync(project, { recursive: true, force: true });
+  }
+});

@@ -61,11 +61,13 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 |---|---|
 | `/Coworkflow:init` | **初始化/刷新本项目**（首次运行 = 一键装上全部模块）；未初始化前其他功能都不存在 |
 | `/Coworkflow:start` | **在本会话加载 Coworkflow**（子 agent 的 Trellis 注入、`/Coworkflow:lanes`、`/Comodels`）；`off` 卸载本会话，`status` 看状态 |
-| `/Coworkflow:settings` | 设置面板：模块开关、新会话是否自动加载、worktree 前缀、Trellis 范式对齐；未初始化时可直接从面板初始化 |
+| `/Coworkflow:settings` | 设置面板：模块开关、新会话是否自动加载、worktree 前缀、子 agent 并发上限、子 agent 类型（每个 kind 的开关与上限）、Trellis 范式对齐；未初始化时可直接从面板初始化 |
 | `/Coworkflow:status` | 查看初始化状态、模块开关、自动加载、安装产物与本会话是否已加载（等价 `--dry-run`，不改文件） |
 | `/Comodels` | 模型面板（需先 /Coworkflow:start）：主会话 / 子 agent 两个 tab，三列 = 模型 \| 思考等级 \| 用量 |
 | `/Coworkflow:run [focus]` | 在宿主验证过的当前任务 worktree 运行原生 `coworkflow.implement-review`，交付后仍需主会话验收 |
-| `/Coworkflow:lanes` | 当前 Trellis 任务的 lane（worktree 隔离派单）状态、patch 路径与合并计划（需先 /Coworkflow:start） |
+| `/Coworkflow:stop <runId> [instructions]` | 请求停止一个异步 run；**接受≠终止**，会再读一次公开状态并把两件事分开说；带 instructions 时先 steer 再 stop（需先 /Coworkflow:start） |
+| `/Coworkflow:steer <runId> <instructions>` | 给运行中的 run 追加指令（不杀进程、不是新派单），指令只作为数据传给 pi-subagents |
+| `/Coworkflow:lanes` | 当前 Trellis 任务的 lane（worktree 隔离派单）状态、patch 路径与合并计划；按记录的 kind 分组；`/Coworkflow:lanes stop <runId>` 只停止本任务记录过的 run（需先 /Coworkflow:start） |
 | `--enable <id,...>` / `--disable <id,...>` | `/Coworkflow:init` 的参数：改模块开关并持久化；关掉某模块会收回它写下的东西 |
 | `--auto-enable on\|off` | 新会话是否自动加载 Coworkflow（默认 off） |
 | `--trellis-update` | 代跑 `trellis update -s`：升级未被本地改动的 Trellis 文件，保留本地改动与所有任务记录 |
@@ -125,8 +127,9 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 | `worktree` | 安装 | 任务隔离的**机制** | `.trellis/scripts/hooks/auto_worktree.py` + `.trellis/config.yaml` 的 `hooks.after_start` | 移除 `after_start` 注册（脚本保留） |
 | `agents` | 安装 | 两份指令文件 | `AGENTS.md` 受管区（主会话）+ `.pi/Coworkflow/subagent-AGENTS.md`（子 agent）；不注册任何运行时钩子 | 移除受管区与子 agent 约定（其余内容不动） |
 | `subagents` | 安装 | 复用已装的 `pi-subagents`，缺失时项目级安装 | 检测用户级/项目级/npm 目录；必要时写项目 `.pi/settings.json` 的 `packages`；写 `subagents.projectRootResolution: "git-root"` | 移除 `projectRootResolution`（packages 保留） |
-| `subagent-context` | 运行时 | 子会话按角色注入 Trellis 上下文 | 在**子会话**里读角色 + 任务，注入 `implement.jsonl`/`check.jsonl`/spec 树 + prd/design/implement | 不注册钩子 = 不注入 |
-| `lane-worktree` | 运行时 | lane 账目与合并计划 | 在**主会话**里记录原生身份链接（兼容旧 lane 指针），提供 `/Coworkflow:lanes` | 不注册钩子 = 不记账 |
+| `subagent-context` | 运行时 | 子会话按角色注入 Trellis 上下文 | 在**子会话**里读角色 + 任务，注入 `implement.jsonl`/`check.jsonl`/spec 树 + prd/design/implement；角色来源接受 `trellis-<role>` 与 kind 名（`cw-executor`→implement、`cw-auditor`→check），只有一条注入路径 | 不注册钩子 = 不注入 |
+| `agent-kinds` | 运行时 | 把项目声明的子 agent **类型**变成真 agent，并按 kind 控制开关与并发 | 在**主会话**里通过 pi-subagents 的公开 `./agents` 契约（`pi-subagents:runtime-agent-register:v1`）注册 `cw-<kind>`；在 `tool_call` 拦截关闭的/超上限的 kind；`/Coworkflow:settings` 的「子 agent 类型」一节 | 不注册钩子 = 不注册 kind、不拦截（已注册的会被撤销） |
+| `lane-worktree` | 运行时 | lane 账目与合并计划 | 在**主会话**里记录原生身份链接（含派单的 kind，兼容旧 lane 指针），提供 `/Coworkflow:lanes` | 不注册钩子 = 不记账 |
 | `capacity` | 运行时 | 项目级子 agent 并发上限 | 在**主会话**里拦截超出本项目上限的派单（`tool_call` gate）；不写 pi-subagents 的配置文件；**失败不自动重派**（早期版本的自动重派会重跑错的任务，已删除） | 不注册钩子 = 不拦截 |
 | `panel` | 常驻 | 模型面板 | `/Comodels`：主会话（本会话）/ 子 agent（本项目）两个 tab，模型 + 思考等级 + token 用量；不写全局 | 关掉即无面板 |
 
@@ -189,6 +192,35 @@ pi-Coworkflow · 模型面板
 
 ### `/Coworkflow:settings`
 
+一段一组，`↑↓` 移动、`Enter` 修改。两类键手势只作用于带对应动作的行，其余行行为不变：
+
+| 键 | 作用 |
+|---|---|
+| `↑↓` | 在可选行之间移动 |
+| `Enter` | 修改当前项（并发上限会问一个数；留空 = 默认/不限） |
+| `Space` | 切换当前行的开关（`子 agent 类型` 的每个 kind） |
+| `←→` | 把当前行的上限减/加 1（`子 agent 类型` 的每个 kind） |
+| `Esc` | 关闭 |
+
+面板里改的每一项都**当场写进 `.pi/Coworkflow.json` 并立刻生效**，不需要重启：模块开关走 `setSwitch`，
+kind 开关与上限走同一条运行期对齐（重新注册/撤销注册），并发上限由 `capacity` 模块在下一次派单时读取。
+连续切换两次同一项会回到原状态，不会留下重复注册、重复钩子或上游的重名冲突。
+
+### 子 agent 类型（agent kinds）
+
+`子 agent 类型` 一节每个内置 kind 一行：
+
+```
+  执行者 cw-executor   [x] 开 · 上限 3   已注册到 pi-subagents
+  审计者 cw-auditor    [ ] 开 · 上限 1   关闭时该 kind 的派单会被拒绝，其他 agent 不受影响
+  = agent-kinds: cw-executor（kind executor）已注册
+  - agent-kinds: auditor 已关闭（不注册；派单会被拒绝）
+```
+
+最后几行是 `agent-kinds` 模块自己的状态，原样显示：**注册成功、注册失败的原因、契约不可用的原因**。
+一个没有真正注册进 pi-subagents agent 列表的 kind 永远不会在这份面板里显示成可用——包括宿主没有
+暴露运行时 agent 契约、`./agents` 导出不存在、以及项目已有同名 agent 造成的重名冲突。
+
 ## 面板里的用量统计
 
 原生总量与模型日图有不同口径，不把无法归属的总量分摊到某个模型：
@@ -221,6 +253,66 @@ pi-Coworkflow · 模型面板
 
 同一门控覆盖 `subagent` 工具和本包 `/Coworkflow:run` 的 RPC spawn。它不控制其它扩展直接发出的 RPC，也不承诺跨进程协调；不会改用户级上游容量配置。已确认的 no-launch/完成会释放预留，模糊超时保留关联直到公开状态确认或会话结束，不靠 TTL 假设运行消失。
 
+### 子 agent 类型（agent kinds）
+
+项目可以在 `.pi/Coworkflow.json` 里声明自己用哪些**类型**的子 agent：
+
+```json
+{
+  "agentKinds": {
+    "executor": { "enabled": true,  "maxConcurrent": 3 },
+    "auditor":  { "enabled": false, "maxConcurrent": 1 }
+  }
+}
+```
+
+缺省的 kind 用内置默认（`executor` 开、上限 3；`auditor` 关、上限 1）；缺省的字段用内置默认；
+本包不发的 kind 保留配置但**不注册**，并在面板和 `/Coworkflow:status` 里报为「已声明、本包没有」。
+
+注册走已安装 pi-subagents 的**公开** `./agents` 导出与 `pi-subagents:runtime-agent-register:v1` 事件，
+名字统一 `cw-<kind>`（避让 `worker` / `reviewer` / 项目自己的 agent）。走事件而不是直接调
+`registerRuntimeAgent`：直调会在**没有任何 owner 加载**时也写进全局注册表，于是本包会把一个根本没被
+合并进 agent 列表的 kind 报成可用——而那正是一个什么也拦不住的“门”。
+
+派单就是一个普通调用：`subagent({ agent: "cw-executor", … })`。本包保证的是两件事，且只保证这两件：
+
+- 关闭的 kind 被拒绝，理由里列出**当下真的可用**的 kind（未注册的不算可用）；
+- 超过该 kind `maxConcurrent` 的派单被拒绝，理由里是上限与当前占用；占用数来自公开 fleet 投影
+  （`entries[].agent`），不是本包自己的账本。读不到（没 `fleetStatus`、投影不可解析、有界窗口溢出、
+  回复落在会话切换之后）就**拒绝**，不把未知当 0。
+
+其它派单（`trellis-*`、`worker`、其它扩展的 agent、`status`/`stop` 这类管理调用）一次都不读公开状态，行为与
+没有本模块时完全一致。项目级 `subagentConcurrency` **仍然是第二道、更粗的门**，两者都要放行。
+
+kind 与 Trellis 角色的对应写在 kind 表里（`executor → implement`、`auditor → check`），所以
+`cw-executor` 的子会话拿到的就是现有那条 `subagent-context` 注入路径给的 implement 上下文——不新增按 kind 的第二条注入。
+`/Coworkflow:run` 的原生 `implement → review` 工作流会跟随这两个 kind（已启用**且**已注册时），否则保持内置的
+`trellis-implement` / `trellis-check`。
+
+一行一个 kind 在 `/Coworkflow:settings` 的「子 agent 类型」里改，**当场生效、无需重启**；改两次等于没改：
+不会留下重复注册、不会撞上游重名，也不会多出第二个 `tool_call` 钩子。
+
+## 中断一个 run：`stop` / `steer`
+
+主会话必须能随时打断自己派出去的 run，所以三个命令都走 pi-subagents 的公开 RPC
+（`stop`、`steer`、`interrupt`），客户端在 `core/subagents-client.ts`：
+
+- 先按 `ping.methods` 检查方法是否被通告，**没有就什么都不发**并说明原因；
+- 保留上游自己的错误文字与 code（`invalid_state`、`not_found` 等），不改写成别的原因；
+- 回复读不出来（没有 `state`、没有回执）就是 `protocol` 错误，不当成功；
+- `stop` 的返回类型是**接受回执**（`{ accepted: true, state: "stopping" }`），不是终止：
+  上游明确写 `state: "stopping"` 只表示这次停止操作被接受，终止要靠随后的 `status` 与进程终止证据确认；
+- 失败的 stop 不会被报成“超时所以 run 死了”，也没有 `ambiguous` 重试别名。
+
+`/Coworkflow:stop <runId>` 会先打印上游的接受回执，再读一次公开状态打印「停止后的公开状态」，两行分开；
+状态仍是 `running`/`queued`/`stopping` 时明确说「停止尚未生效」。**任何情况下都不打印“已停止”**。
+`/Coworkflow:lanes stop <runId>` 只接受本任务在 `.trellis/.runtime/native-runs.json` 里记录过的 run，
+拒绝任意 id；其它 lanes 输出仍然只读。`/Coworkflow:steer <runId> <instructions>` 把指令作为数据传
+（`params.message`），不做任何 shell 拼接或代码求值；`deliveryStatus: queued` 如实说「还在队列里」。
+
+上游没通告 `stop`/`steer`/`interrupt` 时，命令原样说明「没有通告 RPC <method> 方法」，一个请求都不发。
+
+
 ## 运行时模块怎么工作
 
 ### `subagent-context`：子会话只拿到它要执行的那部分
@@ -230,7 +322,7 @@ pi-Coworkflow · 模型面板
 
 | 事实 | 来源（按优先级） |
 |---|---|
-| 角色 | 子会话名（pi-subagents 写作 `subagent-trellis-check-<runId>-<n>`，或 `<agent>: <task excerpt>`）→ `trellis-implement` / `trellis-check` / `trellis-research`；其次 `<!-- trellis-agent: <role> -->` 标记 |
+| 角色 | 子会话名（pi-subagents 写作 `subagent-trellis-check-<runId>-<n>`，或 `<agent>: <task excerpt>`）→ `trellis-implement` / `trellis-check` / `trellis-research`；kind 名同样按同一张表解析（`cw-executor` → `implement`、`cw-auditor` → `check`）；其次 `<!-- trellis-agent: <role> -->` 标记 |
 | 任务 | 派单提示词里的 `Active task: <任务目录>`（pi-subagents 会把它包成 `Task: Active task: …`）→ 会话名里的任务路径 → 父会话的 Trellis 会话指针 |
 
 注入内容与字节预算沿用上游 Trellis 子 agent 钩子的语义（每文件 32K、每工件 64K、总计 128K，读
@@ -254,9 +346,9 @@ pi-Coworkflow · 模型面板
 parallel handoff manifest（`lane.status` / `lane.recordMerge` / `worktree.cleanup`）。本模块**不重造**这些，
 只补 Trellis 这一侧缺的账：
 
-1. 从已关联的工具/RPC 成功回执取得原生 run/mission 身份，将任务与身份及显式 artifact 引用存到 `.trellis/.runtime/native-runs.json`。这不是状态数据库，不保存生命周期、任务提示词或重试队列。
+1. 从已关联的工具/RPC 成功回执取得原生 run/mission 身份，将任务与身份及显式 artifact 引用存到 `.trellis/.runtime/native-runs.json`。这不是状态数据库，不保存生命周期、任务提示词或重试队列。kind 型派单额外存下**派单时看到的 kind**（不是事后从会话名猜的），非 kind 派单存空。
 2. 从原生 `subagent-notify.details.runs` 和公开 status 更新可见引用，读取明确指定的 handoff/receipt；每个 child 按精确 runId 或原生索引对应它自己的 patch/output/worktree，不解析通知正文、不按数组顺序猜身份。
-3. `/Coworkflow:lanes` 保留证据、合并与清理指导；git apply 的目标使用已验证的任务 integration worktree。目标不合法时只显示原因和产物，不生成应用命令。
+3. `/Coworkflow:lanes` 保留证据、合并与清理指导，并按记录的 kind 分组（`按 kind 分组: 执行者（executor） ×2 · 非 kind 派单 ×1`，每个 run 行也带 `kind`）；git apply 的目标使用已验证的任务 integration worktree。目标不合法时只显示原因和产物，不生成应用命令。
 
 原来的 `.trellis/.runtime/lanes/<任务>/<runId>.json` 指针保持可读，不迁移或删除已有 lane 产物。新版本删除私有运行目录探测及 `core/ledger.ts`；不会从旧 meta 扫描结果重建原生生命周期。完成通知/唤醒、mission 恢复记录和执行状态始终由上游负责。
 
@@ -319,6 +411,8 @@ pi-Coworkflow/
 ├── core/capacity.ts             # async 执行/管理分类（公开准入由 client 拥有）
 ├── core/trust.ts                # 项目信任决定（写 Pi 自己的 trust.json）
 ├── scripts/test.ts              # 契约 fixture 测试（node --test，无第三方依赖）
+├── scripts/agent-kinds.test.ts       # kind 注册与按 kind 的门禁
+├── scripts/agent-kinds-surface.test.ts  # 面板 / 状态 / 角色映射 / lane 分组 / 工作流跟随
 └── modules/
     ├── index.ts                 # 注册表：顺序 = 安装顺序
     ├── trellis/index.ts
@@ -326,6 +420,11 @@ pi-Coworkflow/
     ├── agents/index.ts + assets/{main-AGENTS.region.md,subagent-AGENTS.md}
     ├── subagents/index.ts
     ├── subagent-context/index.ts
+    ├── agent-kinds/
+    │   ├── index.ts             # 注册 + 按 kind 的 tool_call 门禁 + 状态行
+    │   ├── registration.ts      # pi-subagents 运行时 agent 契约（加载/注册/dispose）
+    │   ├── defaults.ts          # 内置 kind 表（含 kind → Trellis 角色）与资产加载
+    │   └── assets/{executor,auditor}.md   # 每个 kind 的系统提示
     ├── lane-worktree/index.ts
     ├── capacity/index.ts
     └── panel/

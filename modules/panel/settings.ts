@@ -12,7 +12,7 @@
  */
 
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
-import { Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Key, Spacer, Text, matchesKey } from "@earendil-works/pi-tui";
 import type { PiRuntimeHost, RuntimeContext, WorkflowControl } from "../../core/module.ts";
 import { refreshUsage } from "../../core/usage.ts";
 import { existingSubagentsBridge } from "../../core/subagents-client.ts";
@@ -20,6 +20,11 @@ import { FALLBACK_KEYS, type PanelKeybindings, type PanelTheme } from "./shared.
 
 /**
  * A settings row: a label, its current value, and what Enter does.
+ *
+ * `toggle` and `adjust` are the two extra gestures a value that is more than a
+ * switch needs (a kind is on/off *and* has a limit): Space toggles, ←→ steps the
+ * number, Enter does what the row's own label says it does. Rows that declare
+ * neither keep exactly the old behaviour — Enter only.
  */
 export interface SettingRow {
   label: string;
@@ -30,6 +35,10 @@ export interface SettingRow {
   /** Read-only rows are shown but do nothing on Enter. */
   readOnly?: boolean;
   act?: () => string | Promise<string>;
+  /** Space: flip a boolean without leaving the row. */
+  toggle?: () => string | Promise<string>;
+  /** ←→: step a bounded number by `delta`. */
+  adjust?: (delta: number) => string | Promise<string>;
 }
 
 /**
@@ -81,7 +90,7 @@ export class SettingsPanel extends Container {
     this.addChild(this.listContainer);
     this.addChild(new Spacer(1));
     this.addChild(this.statusText);
-    this.addChild(new Text(theme.fg("muted", "↑↓ 移动 · Enter 修改 · Esc 关闭"), 0, 0));
+    this.addChild(new Text(theme.fg("muted", "↑↓ 移动 · Enter 修改 · Space 开关 · ←→ 调上限 · Esc 关闭"), 0, 0));
     this.addChild(new Spacer(1));
     this.addChild(border());
 
@@ -94,6 +103,11 @@ export class SettingsPanel extends Container {
   /** Rows currently shown, for tests. */
   currentRows(): SettingRow[] {
     return this.rows;
+  }
+
+  /** The row the cursor is on, for tests: a key gesture has to land on a row. */
+  selectedRow(): SettingRow | undefined {
+    return this.rows[this.cursor];
   }
 
   private matches(data: string, action: "up" | "down" | "confirm" | "cancel"): boolean {
@@ -146,15 +160,35 @@ export class SettingsPanel extends Container {
     }
     if (this.matches(data, "up")) return this.move(-1);
     if (this.matches(data, "down")) return this.move(1);
+    const row = this.rows[this.cursor];
+    if (row && !row.header && !row.readOnly) {
+      // Matched the way the model panel matches its own column switch, because
+      // these keys are per-row gestures rather than list navigation.
+      if (row.toggle && matchesKey(data, Key.space)) return this.run(row.toggle);
+      if (row.adjust && matchesKey(data, Key.left)) return this.run(() => row.adjust!(-1));
+      if (row.adjust && matchesKey(data, Key.right)) return this.run(() => row.adjust!(1));
+    }
     if (this.matches(data, "confirm")) {
-      const row = this.rows[this.cursor];
       if (!row?.act || row.readOnly) return;
-      void Promise.resolve(row.act()).then(
+      this.run(row.act);
+    }
+  }
+
+  /**
+   * Run one row action and hand its outcome back to the owner.
+   *
+   * The row actions write the project config and reconcile the live session, so
+   * a failure must surface as the panel's status line — not as a rejected promise
+   * or as a row that looks applied but is not.
+   */
+  private run(action: () => string | Promise<string>): void {
+    void Promise.resolve()
+      .then(action)
+      .then(
         (status) => this.io.changed(status),
         (error: unknown) =>
           this.io.changed(`失败：${error instanceof Error ? error.message : String(error)}`),
       );
-    }
   }
 
   /** Re-read the rows from the owner, keeping the cursor on a selectable row. */
@@ -194,6 +228,27 @@ async function editProjectLimit(
     return `并发上限需要 ≥ 1 的整数（留空 = 不限）：${trimmed}`;
   }
   return control.setSubagentConcurrency(parsed);
+}
+
+/** Ask for one kind's limit; an empty answer restores the built-in default. */
+async function editKindLimit(
+  control: WorkflowControl,
+  commandCtx: any,
+  kind: string,
+  current: number,
+): Promise<string> {
+  const value = await commandCtx?.ui?.input?.(
+    `kind ${kind} 的并发上限（≥ 1；留空 = 内置默认）`,
+    String(current),
+  );
+  if (value === undefined) return "未修改";
+  const trimmed = value.trim();
+  if (!trimmed) return control.setAgentKind(kind, { maxConcurrent: null });
+  const parsed = Number(trimmed);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    return `并发上限需要 ≥ 1 的整数（留空 = 内置默认）：${trimmed}`;
+  }
+  return control.setAgentKind(kind, { maxConcurrent: parsed });
 }
 
 async function editPrefix(control: WorkflowControl, commandCtx: any): Promise<string> {
@@ -248,6 +303,46 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
     detail: "同一会话同时活跃的顶层 async run；留空 = 不限（本项目；由 Coworkflow 拦截）",
     act: () => editProjectLimit(control, commandCtx, limit),
   });
+
+  // Per-kind policy. One row per kind, because the two facts a kind has — is it
+  // usable at all, and how many of it may run — belong to the same decision and a
+  // user changing one is usually looking at the other.
+  rows.push({ label: "子 agent 类型", value: "", header: true });
+  const kinds = control.agentKinds();
+  const status = control.agentKindStatus();
+  for (const entry of kinds) {
+    // What this kind's availability actually is, from the module's own report —
+    // never from the project's enablement, which says nothing about the agent list.
+    const registered = status.some((line) => line.includes(entry.agent) && line.includes("已注册"));
+    const failed = status.some((line) => line.includes(`${entry.kind} 注册失败`));
+    rows.push({
+      label: `${entry.label} ${entry.agent}`,
+      value: `${entry.enabled ? "[x]" : "[ ]"} 开 · 上限 ${entry.maxConcurrent}`,
+      detail: !entry.enabled
+        ? "关闭时该 kind 的派单会被拒绝，其他 agent 不受影响"
+        : registered
+          ? "已注册到 pi-subagents"
+          : failed
+            ? "注册失败（原因见下方状态行）"
+            : status.length === 0
+              ? "agent-kinds 本层未启用：kind 不注册，也不拦截派单（在上面的模块开关里打开）"
+              : "已启用；注册状态见下方状态行",
+      toggle: () => control.setAgentKind(entry.kind, { enabled: !entry.enabled }),
+      adjust: (delta) =>
+        control.setAgentKind(entry.kind, { maxConcurrent: Math.max(1, entry.maxConcurrent + delta) }),
+      act: () => editKindLimit(control, commandCtx, entry.kind, entry.maxConcurrent),
+    });
+  }
+  if (kinds.length === 0) {
+    rows.push({ label: "（本构建没有内置 kind）", value: "", readOnly: true });
+  }
+  // The module's own lines, verbatim: a kind that did not register must never be
+  // shown as available, and the reason is the only actionable thing here. The
+  // leading status glyph is kept in the label rather than rendered as a value,
+  // because these are sentences, not settings.
+  for (const line of status) {
+    rows.push({ label: line.trim(), value: "", readOnly: true });
+  }
 
   rows.push({ label: "维护", value: "", header: true });
   rows.push({
@@ -304,6 +399,10 @@ export function registerSettingsPanel(host: PiRuntimeHost, runtime: RuntimeConte
       const epoch = runtime.sessionEpoch;
       await refreshUsage(host, runtime, commandCtx);
       if (runtime.enabled) await existingSubagentsBridge(host)?.observe();
+      // The kind section reports whether each kind is really in the owner's agent
+      // list, and that answer arrives from a pass that awaits an import. Awaiting
+      // it here is the difference between "registered" and "not loaded yet".
+      await runtime.control.settleAgentKinds();
       if (epoch !== runtime.sessionEpoch || registration.runtime !== runtime) return;
       const control = runtime.control;
       const say = (text: string): void => {

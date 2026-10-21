@@ -60,6 +60,18 @@ export interface PreparedWorkflowContext {
   worktree: string;
   mainCheckout: string;
   title?: string;
+  /**
+   * A registered kind standing in for the `implement` step (`cw-executor`), when
+   * the project has one.
+   *
+   * The fixed workflow then runs the same two steps with the agents the project
+   * actually dispatches, so a kind's enablement governs this path too — and the
+   * child's role context still comes from the one mapping, because
+   * `subagent-context` resolves `cw-executor` to `implement`.
+   */
+  implementAgent?: string;
+  /** A registered kind standing in for the `review` step (`cw-auditor`). */
+  reviewAgent?: string;
 }
 
 export type Expansion = { script: string } | { error: string };
@@ -84,8 +96,12 @@ export function resolveImplementReview(args: Readonly<Record<string, unknown>>, 
   if (args.taskRef !== prepared.taskRef) return { error: "args.taskRef does not match the host's prepared active task." };
   const focus = args.focus === undefined ? undefined : str(args.focus);
   if (args.focus !== undefined && (!focus || focus.length > MAX_FOCUS)) return { error: `args.focus must contain 1–${MAX_FOCUS} characters.` };
-  const implementAgent = args.implementAgent === undefined ? DEFAULT_IMPLEMENT_AGENT : str(args.implementAgent);
-  const reviewAgent = args.reviewAgent === undefined ? DEFAULT_REVIEW_AGENT : str(args.reviewAgent);
+  const implementAgent = args.implementAgent === undefined
+    ? (prepared.implementAgent ?? DEFAULT_IMPLEMENT_AGENT)
+    : str(args.implementAgent);
+  const reviewAgent = args.reviewAgent === undefined
+    ? (prepared.reviewAgent ?? DEFAULT_REVIEW_AGENT)
+    : str(args.reviewAgent);
   for (const [name, value] of [["implementAgent", implementAgent], ["reviewAgent", reviewAgent]] as const) {
     if (!value || value.length > MAX_AGENT || !AGENT_RE.test(value)) return { error: `args.${name} must be a safe agent name.` };
   }
@@ -356,6 +372,15 @@ export interface NativeRunLink {
   taskRef: string;
   worktree?: string;
   workflow?: string;
+  /**
+   * The subagent kind this run was dispatched as (`executor`, `auditor`), when one
+   * of this package's kinds launched it.
+   *
+   * Recorded from the dispatch itself, not inferred later: `/Coworkflow:lanes`
+   * groups by it, and a run whose agent was a builtin or another extension's has
+   * no kind at all rather than a guessed one.
+   */
+  kind?: string;
   handoffPath?: string;
   workflowReceiptPath?: string;
   sessionId?: string;
@@ -444,7 +469,9 @@ interface RequiredChildExtensionsModule {
  * Reading `exports` rather than guessing a file path keeps this working when the
  * package layout changes; a missing entry is reported, never patched over.
  */
-export function exportEntry(subpath: "./workflow-resources" | "./required-child-extensions", projectRoot = process.cwd()): string | { error: string } {
+export type SubagentsSubpath = "./workflow-resources" | "./required-child-extensions" | "./agents";
+
+export function exportEntry(subpath: SubagentsSubpath, projectRoot = process.cwd()): string | { error: string } {
   const require = createRequire(join(resolve(projectRoot), "package.json"));
   const directories = [join(projectRoot, ".pi", "npm", "node_modules", "pi-subagents"),
     ...(require.resolve.paths("pi-subagents") ?? []).slice(0, 16).map((path) => join(path, "pi-subagents")),
@@ -477,7 +504,14 @@ export function exportEntry(subpath: "./workflow-resources" | "./required-child-
   }
 }
 
-async function loadExport<T>(subpath: "./workflow-resources" | "./required-child-extensions", projectRoot?: string): Promise<{ ok: true; module: T } | { ok: false; message: string }> {
+/**
+ * Import one documented subpath of the installed owner.
+ *
+ * Shared by every consumer rather than copied: "where is the installed
+ * pi-subagents" is one question with one answer, and a second copy would drift the
+ * moment either the layout or the search order changes.
+ */
+export async function loadSubagentsExport<T>(subpath: SubagentsSubpath, projectRoot?: string): Promise<{ ok: true; module: T } | { ok: false; message: string }> {
   const entry = exportEntry(subpath, projectRoot);
   if (typeof entry !== "string") return { ok: false, message: entry.error };
   try { return { ok: true, module: (await import(pathToFileURL(entry).href)) as T }; }
@@ -499,7 +533,7 @@ export async function registerImplementReviewWorkflow(
   sessionId: string,
   options: { projectRoot?: string; context?: () => PreparedWorkflowContext | null } = {},
 ): Promise<RegistrationOutcome> {
-  const loaded = await loadExport<WorkflowResourcesModule>("./workflow-resources", options.projectRoot);
+  const loaded = await loadSubagentsExport<WorkflowResourcesModule>("./workflow-resources", options.projectRoot);
   if (!loaded.ok) return { ok: false, message: loaded.message };
   const api = loaded.module;
   if (typeof api.registerWorkflowResource !== "function") {
@@ -540,7 +574,7 @@ export async function registerChildExtensionRequirement(
   extensionPath: string,
   projectRoot?: string,
 ): Promise<RegistrationOutcome> {
-  const loaded = await loadExport<RequiredChildExtensionsModule>("./required-child-extensions", projectRoot);
+  const loaded = await loadSubagentsExport<RequiredChildExtensionsModule>("./required-child-extensions", projectRoot);
   if (!loaded.ok) return { ok: false, message: loaded.message };
   const api = loaded.module;
   if (typeof api.registerRequiredChildExtensions !== "function") {

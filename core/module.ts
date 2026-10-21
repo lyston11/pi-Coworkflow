@@ -14,7 +14,7 @@
 import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ConfigRootResolver, SwitchDefault } from "./config.ts";
+import type { ConfigRootResolver, ResolvedAgentKind, SwitchDefault } from "./config.ts";
 
 export type Status = "created" | "updated" | "ok" | "skipped" | "warn" | "error";
 
@@ -353,6 +353,44 @@ export interface WorkflowControl {
    */
   subagentConcurrency(): number | null;
   setSubagentConcurrency(value: number | null): string;
+  /**
+   * The project's subagent kinds with every default applied, read from disk.
+   *
+   * The panel renders these and the gate admits against them, so there is one
+   * decoder for "what is this project's kind policy" rather than a panel copy
+   * that can disagree with what a dispatch is actually measured against.
+   */
+  agentKinds(): ResolvedAgentKind[];
+  /**
+   * Persist one kind's policy; an absent field keeps the current value, and
+   * `null` for the limit means "back to the built-in default".
+   *
+   * A promise, because applying it means re-registering with the owner: the
+   * caller reports what actually happened (`已注册` / `注册失败：…`) instead of a
+   * policy it just wrote while the agent list may not contain the kind yet.
+   */
+  setAgentKind(
+    kind: string,
+    patch: { enabled?: boolean; maxConcurrent?: number | null },
+  ): string | Promise<string>;
+  /**
+   * The `agent-kinds` module's own status lines: which kinds registered, or the
+   * exact reason none did. Empty when the module is not active in this session.
+   *
+   * The panel shows these instead of computing an availability of its own — a
+   * kind that never registered must not appear available anywhere.
+   */
+  agentKindStatus(): string[];
+  /**
+   * Wait for the pending kind reconciliation to land.
+   *
+   * Registration goes through an import of the installed owner's public subpath,
+   * so the snapshot that `agentKindStatus` reads is `null` until that pass finishes.
+   * A panel opening in that window would show "not loaded" for a loaded session;
+   * awaiting here is what makes its rows describe the state that exists now.
+   * Resolves immediately when nothing is pending.
+   */
+  settleAgentKinds(): Promise<void>;
   /** Why this session is (not) loaded: `off`, `auto`, `started`, or `child`. */
   loadState(): RuntimeContext["loadState"];
   /**

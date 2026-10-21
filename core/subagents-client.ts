@@ -208,6 +208,42 @@ export function decodeAsyncSnapshot(data: unknown): { runs: NativeRun[]; omitted
     truncated: omitted.runs !== 0 || omitted.children !== 0 || omitted.byteLimitExceeded };
 }
 
+export interface FleetAgentCounts {
+  /** Live entries per resolved agent name, from the fleet's bounded public window. */
+  counts: Map<string, number>;
+  totalActive: number;
+  /** Active runs the window does not describe: overflow, or rows it could not render. */
+  omitted: number;
+}
+
+/**
+ * Per-agent counts from the public fleet projection.
+ *
+ * The fleet DTO exposes `entries[].agent` (a resolved agent name) and never a run
+ * or async id, which is exactly what a per-kind limit needs and nothing more: how
+ * many `cw-executor` are active right now, from the owner's own state rather than
+ * from a mirror of it. `null` means the payload is not a readable fleet DTO — the
+ * caller must treat that as unknown, never as "nothing is running".
+ */
+export function decodeFleetAgentCounts(data: unknown): FleetAgentCounts | null {
+  const fleet = record(record(data)?.fleet);
+  if (fleet?.version !== 1 || !Array.isArray(fleet.entries) || count(fleet.totalActive) === undefined ||
+      count(fleet.omitted) === undefined) return null;
+  const counts = new Map<string, number>();
+  for (const entry of fleet.entries) {
+    const row = record(entry);
+    const agent = text(row?.agent);
+    if (row === null || agent === undefined || typeof row.key !== "string" || count(row.startedAt) === undefined) return null;
+    counts.set(agent, (counts.get(agent) ?? 0) + 1);
+  }
+  return { counts, totalActive: fleet.totalActive as number, omitted: fleet.omitted as number };
+}
+
+/** Per-agent live counts, or the reason they cannot be counted. */
+export type NativeAgentCounts =
+  | { kind: "known"; counts: Map<string, number>; totalActive: number }
+  | { kind: "unknown"; reason: string };
+
 /** The fleet counter counts top-level async owners, not the fleet's displayed children. */
 export function decodeTopLevelCapacity(data: unknown): number | null {
   const fleet = record(record(data)?.fleet);
@@ -301,6 +337,110 @@ export function decodeCost(data: unknown): NativeCost | null {
     unresolvedAsyncChildren: unresolved,
     incomplete: unresolved > 0,
   };
+}
+
+/**
+ * What pi-subagents acknowledges when a stop request is accepted.
+ *
+ * `accepted` is deliberately not `stopped`: the owner documents a successful
+ * `stop` reply as an acceptance receipt for the exact run (`state: "stopping"`),
+ * not as its retirement. Termination has to be established by a later `status`
+ * read plus process-terminal evidence, so the type must not let a caller render
+ * this as "the run died".
+ */
+export interface StopReceipt {
+  /** The request was accepted. This is *not* proof the run terminated. */
+  accepted: true;
+  /** The owner's own acknowledgement state (documented as `stopping`). */
+  state: string;
+  /** The run the acknowledgement is for, when the owner names it. */
+  runId: string | null;
+  /** The state the run was in when the stop was accepted (`running`/`queued`/`paused`). */
+  previousState?: string;
+  /** Set for a child-scoped stop. */
+  childId?: string;
+  asyncDir?: string;
+  /** The owner's own sentence, passed through unchanged. */
+  text: string;
+}
+
+/**
+ * One `stop` reply, or `null` when it is not an acceptance receipt.
+ *
+ * A reply without a `state` is unreadable and therefore a protocol error: turning
+ * it into "success" would claim an acceptance nobody made.
+ */
+export function decodeStopReceipt(data: unknown): StopReceipt | null {
+  const payload = record(data);
+  const state = text(payload?.state);
+  if (payload === null || state === undefined) return null;
+  return {
+    accepted: true,
+    state,
+    runId: text(payload.runId) ?? null,
+    ...(text(payload.previousState) ? { previousState: text(payload.previousState)! } : {}),
+    ...(text(payload.childId) ? { childId: text(payload.childId)! } : {}),
+    ...(text(payload.asyncDir) ? { asyncDir: text(payload.asyncDir)! } : {}),
+    text: text(payload.message) ?? "",
+  };
+}
+
+/**
+ * What pi-subagents acknowledges when instructions were delivered to a run.
+ *
+ * `deliveryStatus: "queued"` is a normal, successful acknowledgement: the
+ * instructions are on their way, not necessarily applied yet.
+ */
+export interface SteerReceipt {
+  accepted: true;
+  /** `delivered` or `queued`, from the owner's own steering receipt. */
+  deliveryStatus?: string;
+  /** The steering request id, for correlating an owner-side event. */
+  requestId?: string;
+  state?: string;
+  /** The owner's own sentence, passed through unchanged. */
+  text: string;
+}
+
+/**
+ * One `steer` reply, or `null` when it carries neither a steering receipt nor a
+ * sentence. An empty object is not an acknowledgement.
+ */
+export function decodeSteerReceipt(data: unknown): SteerReceipt | null {
+  const payload = record(data);
+  if (payload === null) return null;
+  // The owner answers through the ordinary `steer` action, so the receipt is the
+  // tool result: a sentence plus optional `details.steering`. Neither alone is
+  // required, but an empty object is not an acknowledgement.
+  const steering = record(record(payload.details)?.steering);
+  const line = text(payload.text) ?? "";
+  if (steering === null && !line) return null;
+  return {
+    accepted: true,
+    text: line,
+    ...(text(steering?.deliveryStatus) ? { deliveryStatus: text(steering?.deliveryStatus)! } : {}),
+    ...(text(steering?.requestId) ? { requestId: text(steering?.requestId)! } : {}),
+    ...(text(steering?.state) ? { state: text(steering?.state)! } : {}),
+  };
+}
+
+/**
+ * What pi-subagents acknowledges when an interrupt was requested.
+ *
+ * An interrupt asks the running child to stop at its next step; like `stop`, the
+ * acknowledgement is not a terminal state.
+ */
+export interface InterruptReceipt {
+  accepted: true;
+  /** The owner's own sentence, passed through unchanged. */
+  text: string;
+}
+
+export function decodeInterruptReceipt(data: unknown): InterruptReceipt | null {
+  const payload = record(data);
+  const textValue = text(payload?.text);
+  if (payload === null || textValue === undefined) return null;
+  return { accepted: true, text: textValue };
 }
 
 export interface SpawnReceipt {
@@ -600,6 +740,148 @@ export class SubagentsClient {
     return decoded;
   }
 
+  /**
+   * Whether the installed owner advertises one RPC method.
+   *
+   * A method that is not advertised is never sent. pi-subagents would answer an
+   * unknown method with `unsupported_method`, but "we tried and it said no" is a
+   * different fact from "this build cannot do it" — and only the second one is
+   * honest to report as a missing capability. An explicit `capabilities[method]`
+   * of `false` counts as not advertised; an absent entry does not, because the
+   * advertised method list is the documented seam.
+   */
+  private async advertises(
+    method: string,
+  ): Promise<{ ok: true; ping: SubagentsPing } | { ok: false; message: string }> {
+    const reply = await this.ping();
+    if (!reply.ok) return { ok: false, message: reply.message };
+    const ping = reply.data;
+    if (!ping.methods.includes(method) || ping.capabilities[method] === false) {
+      return {
+        ok: false,
+        message: [
+          `已安装的 pi-subagents 没有通告 RPC ${method} 方法（它通告的方法是：${ping.methods.join("、")}），`,
+          "所以这次不做任何操作：本扩展不会发一个对方可能不认识的请求，也不会退回读取它的私有运行目录。请升级 pi-subagents。",
+        ].join(""),
+      };
+    }
+    return { ok: true, ping };
+  }
+
+  /**
+   * Request that one async run stop — an *accepted request*, never a terminated run.
+   *
+   * Three things are deliberately different from `spawn`:
+   *
+   *   - the capability is checked first, so nothing is emitted into a build that
+   *     does not have the method;
+   *   - a refused or timed-out reply is reported as `refused`/`timeout` with the
+   *     owner's own message, with no `ambiguous` alias: a stop that failed does not
+   *     mean the run died, and a caller must not read it that way;
+   *   - a readable reply is an acceptance receipt. Termination needs a subsequent
+   *     `status` read (and process-terminal evidence), which is the caller's job.
+   */
+  async stop(params: Record<string, unknown>): Promise<Result<StopReceipt>> {
+    const advertised = await this.advertises("stop");
+    if (!advertised.ok) return { ok: false, reason: "unavailable", message: advertised.message };
+    const reply = await this.send("stop", params, this.requestTimeoutMs);
+    if (this.closed) return { ok: false, reason: "closed", message: this.unavailableReason() };
+    if (!reply.ok) return reply;
+    const receipt = decodeStopReceipt(reply.data);
+    if (receipt === null) {
+      return {
+        ok: false,
+        reason: "protocol",
+        message: "pi-subagents 的 stop 回复不带 state 字段：无法确认这次停止请求是否被接受；本扩展不把它当成成功，也不当成 run 已经结束。",
+      };
+    }
+    return { ok: true, data: receipt };
+  }
+
+  /**
+   * Deliver instructions to a running async run without killing it.
+   *
+   * The message travels as data in the RPC params, never as a command line or an
+   * evaluated string: this wrapper does no quoting, no interpolation and no
+   * script generation.
+   */
+  async steer(params: Record<string, unknown>): Promise<Result<SteerReceipt>> {
+    const advertised = await this.advertises("steer");
+    if (!advertised.ok) return { ok: false, reason: "unavailable", message: advertised.message };
+    const reply = await this.send("steer", params, this.requestTimeoutMs);
+    if (this.closed) return { ok: false, reason: "closed", message: this.unavailableReason() };
+    if (!reply.ok) return reply;
+    const receipt = decodeSteerReceipt(reply.data);
+    if (receipt === null) {
+      return {
+        ok: false,
+        reason: "protocol",
+        message: "pi-subagents 的 steer 回复既没有 steering 回执也没有说明文字：无法确认指令是否被接收，本扩展不把它当成已送达。",
+      };
+    }
+    return { ok: true, data: receipt };
+  }
+
+  /**
+   * Ask a running async run to interrupt at its next step.
+   *
+   * Like `stop`, an acknowledgement is not a terminal state; unlike `stop`, the
+   * owner's own interrupt path only supports non-workflow, non-external async runs
+   * and says so in its refusal, which is passed through unchanged.
+   */
+  async interrupt(params: Record<string, unknown>): Promise<Result<InterruptReceipt>> {
+    const advertised = await this.advertises("interrupt");
+    if (!advertised.ok) return { ok: false, reason: "unavailable", message: advertised.message };
+    const reply = await this.send("interrupt", params, this.requestTimeoutMs);
+    if (this.closed) return { ok: false, reason: "closed", message: this.unavailableReason() };
+    if (!reply.ok) return reply;
+    const receipt = decodeInterruptReceipt(reply.data);
+    if (receipt === null) {
+      return {
+        ok: false,
+        reason: "protocol",
+        message: "pi-subagents 的 interrupt 回复没有说明文字：无法确认这次中断请求是否被接受，本扩展不把它当成成功。",
+      };
+    }
+    return { ok: true, data: receipt };
+  }
+
+  /**
+   * How many runs of each agent are live, from the public fleet projection.
+   *
+   * A per-kind limit needs this and only this. Everything that makes the count
+   * unreadable — no `fleetStatus` capability, a failed or malformed reply, a
+   * truncated window — is `unknown` with a reason, because a limit that cannot be
+   * counted must refuse rather than assume there is room.
+   */
+  async agentActivity(): Promise<NativeAgentCounts> {
+    const capability = await this.ping();
+    if (!capability.ok) return { kind: "unknown", reason: capability.message };
+    if (!capability.data.methods.includes("status") || !hasCapability(capability.data, "status")) {
+      return { kind: "unknown", reason: "pi-subagents 没有通告 status 能力，无法读取每个 agent 当前有几个在运行。" };
+    }
+    if (!hasCapability(capability.data, "fleetStatus")) {
+      return {
+        kind: "unknown",
+        reason: "pi-subagents 没有通告 fleetStatus 能力，因此没有公开的 per-agent 活跃条目可数（0.79 系列的 ping.capabilities.fleetStatus 才提供）。",
+      };
+    }
+    const reply = await this.status({});
+    if (!reply.ok) return { kind: "unknown", reason: reply.message };
+    if (this.closed) return { kind: "unknown", reason: this.unavailableReason() };
+    const fleet = decodeFleetAgentCounts(reply.data);
+    if (fleet === null) {
+      return { kind: "unknown", reason: "pi-subagents 的 fleet 投影不是可解析的 entries/totalActive/omitted，无法按 agent 计数。" };
+    }
+    if (fleet.omitted > 0) {
+      return {
+        kind: "unknown",
+        reason: `pi-subagents 的 fleet 投影是有界窗口，还有 ${fleet.omitted} 个活跃 run 不在其中，无法按 agent 精确计数。`,
+      };
+    }
+    return { kind: "known", counts: fleet.counts, totalActive: fleet.totalActive };
+  }
+
   /** What the native runner reports as active for this session, or why it cannot say. */
   async observeActivity(): Promise<NativeActivity> {
     const capability = await this.ping();
@@ -673,6 +955,12 @@ export interface SubagentsBridge {
   activity(): NativeActivity;
   admit(launchId: string, limit: number | null): Promise<Admission>;
   admitSync(launchId: string, limit: number | null): Admission;
+  /**
+   * Live runs of one agent, from the same serialized public reads admission uses.
+   * `unknown` means the count could not be established; a caller enforcing a
+   * per-kind limit must refuse then, not assume zero.
+   */
+  agentCount(agent: string): Promise<{ kind: "known"; count: number } | { kind: "unknown"; reason: string }>;
   /**
    * Record that an admitted launch became this native run, so the reservation is
    * dropped as soon as the runtime reports the run itself.
@@ -788,6 +1076,15 @@ export function attachSubagents(
         };
       }
       return settle(launchId, limit, lastActivity);
+    },
+    agentCount(agent) {
+      return serial(async () => {
+        if (disposed) return { kind: "unknown" as const, reason: "本会话已结束。" };
+        const observed = await client.agentActivity();
+        if (disposed) return { kind: "unknown" as const, reason: "本会话已结束。" };
+        if (observed.kind === "unknown") return observed;
+        return { kind: "known" as const, count: observed.counts.get(agent) ?? 0 };
+      });
     },
     release(launchId) {
       reservations.delete(launchId);

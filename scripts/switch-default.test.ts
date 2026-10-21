@@ -221,8 +221,11 @@ test("switch default: a project that never chose starts an observation and skips
     for (const id of Object.keys(modules)) {
       assert.equal(written[id], true, `${id} keeps the value the project had chosen`);
     }
-    // The map is still complete: an init pass records every module it knows.
-    assert.equal(Object.keys(written).length, modules ? Object.keys(modules).length + 2 : 0);
+    // The map is still complete: an init pass records every module it knows —
+    // the registry's, not this fixture's list, which is exactly the "modules that
+    // existed then" this test is about.
+    const { MODULES: registryModules } = (await import(here("../modules/index.ts"))) as typeof import("../modules/index.ts");
+    assert.equal(Object.keys(written).length, registryModules.length);
 
     // And the report says which of those was never chosen. `on` alone would read
     // as consent this project did not give.

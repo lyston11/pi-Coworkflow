@@ -8,13 +8,23 @@ import { activeTaskDir, laneDir, resolveTaskDir, taskRefForDisplay } from "../..
 import { decodeNativeCompletions, decodeNativeResult, mergeNativeChildren, readNativeHandoff,
   readNativeWorkflowReceipt, type NativeChild, type NativeResult } from "../../core/pi-subagents.ts";
 import { resolveChildTask } from "../subagent-context/index.ts";
+import { builtinKind, kindOf } from "../agent-kinds/defaults.ts";
 import { planRun } from "../subagents/index.ts";
+import { requestStop } from "../subagents/run-control.ts";
 import { attachSubagents } from "../../core/subagents-client.ts";
 import { readRunLink, readTaskLinks, recordLaunchLink, type NativeRunLink } from "../../core/subagents-workflow.ts";
 
 const NS = "Coworkflow";
 const MAX_DISPLAY = 20;
-interface Target { root: string; taskRef: string; sessionId?: string }
+/**
+ * One dispatch that was attributed to a task.
+ *
+ * `kind` is read from the dispatch itself, at `tool_call` time: it is the only
+ * moment the caller's own agent choice is observable, and a value reconstructed
+ * afterwards from a session name or `results[]` would be a guess about which of
+ * several children was ours.
+ */
+interface Target { root: string; taskRef: string; sessionId?: string; kind?: string }
 interface State {
   runtime: RuntimeContext;
   closed: boolean;
@@ -69,6 +79,26 @@ function adoptResult(state: State, root: string, result: NativeResult): void {
   }
 }
 
+/**
+ * `/Coworkflow:lanes` arguments: a task reference (the default form), or a stop
+ * request naming one run.
+ *
+ * Everything except the stop form leaves the command read-only. The stop form is
+ * parsed here rather than by splitting on whitespace at the call site, because a
+ * task reference is free-form text and must keep working unchanged.
+ */
+export function parseLanesArgs(args: string): { taskRef: string; stop?: string } | { error: string } {
+  const trimmed = args.trim();
+  const match = /^stop(?:\s+(.*))?$/i.exec(trimmed);
+  if (match === null) return { taskRef: trimmed };
+  const runId = (match[1] ?? "").trim();
+  if (!runId) {
+    return { error: "用法：/Coworkflow:lanes stop <runId>；runId 不能为空。先用 /Coworkflow:lanes 查看本任务记录过的 run。" };
+  }
+  if (/\s/.test(runId)) return { error: `runId 不能包含空白字符：${runId}` };
+  return { taskRef: "", stop: runId };
+}
+
 export const laneWorktreeModule: WorkflowModule = {
   id: "lane-worktree",
   title: "Lane worktree（原生身份与交接指针）",
@@ -102,7 +132,18 @@ export const laneWorktreeModule: WorkflowModule = {
         activeTaskDir(root, current.runtime.sessionId);
       if (!taskDir) return;
       const taskRef = taskRefForDisplay(root, taskDir);
-      if (taskRef) current.calls.set(event.toolCallId, { root, taskRef, sessionId: current.runtime.sessionId ?? undefined });
+      if (taskRef) {
+        // A kind this package ships is recorded; any other agent (a builtin,
+        // another extension's, a `cw-` name we do not ship) has no kind, which is
+        // a different fact from "kind unknown" and is stored as absence.
+        const kind = kindOf(typeof input.agent === "string" ? input.agent : undefined);
+        current.calls.set(event.toolCallId, {
+          root,
+          taskRef,
+          sessionId: current.runtime.sessionId ?? undefined,
+          ...(kind === null ? {} : { kind }),
+        });
+      }
       // A blocked call from another extension may have no result. This is transient
       // correlation only; dropping old entries loses no persisted native identity.
       if (current.calls.size > 200) current.calls.delete(current.calls.keys().next().value!);
@@ -117,6 +158,7 @@ export const laneWorktreeModule: WorkflowModule = {
       const result = decodeNativeResult(event.details);
       if (!result) return;
       if (target && event.isError !== true) recordLaunchLink(target.root, { taskRef: target.taskRef, sessionId: target.sessionId, runId: result.runId,
+        ...(target.kind ? { kind: target.kind } : {}),
         ...(result.missionId ? { missionId: result.missionId } : {}),
         ...(result.handoffPath ? { handoffPath: result.handoffPath } : {}),
         ...(result.workflowReceiptPath ? { workflowReceiptPath: result.workflowReceiptPath } : {}),
@@ -140,20 +182,47 @@ export const laneWorktreeModule: WorkflowModule = {
     if (!state || state.commandRegistered || runtime.isChild || !host.registerCommand) return;
     state.commandRegistered = true;
     host.registerCommand(`${NS}:lanes`, {
-      description: "查看当前任务的原生子 run 与交接/补丁；最终验收和合并仍由主会话决定",
+      description: "查看当前任务的原生子 run 与交接/补丁；`/Coworkflow:lanes stop <runId>` 请求停止一个本任务记录过的 run（接受≠终止）；最终验收和合并仍由主会话决定",
       handler: async (args, ctx) => {
         runtime.refresh();
         const say = (text: string) => host.sendMessage?.({ customType: "pi-Coworkflow", content: text, display: true });
         if (!runtime.enabled || !enabled(state)) { say(`本会话未加载或 lane-worktree 已关闭；先 /${NS}:start 并启用该模块。`); return; }
         resetEpoch(state);
         const epoch = runtime.sessionEpoch;
+        const parsed = parseLanesArgs(args);
+        if ("error" in parsed) { say(parsed.error); return; }
         // The command's own cwd may be a worktree: the resolver returns the main
         // checkout for it, or null when git could not answer.
         const root = runtime.configRoots.root(typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : runtime.cwd);
         if (root === null) { say("配置根无法解析（git 读取失败）：不读取任何项目的 lane 记录。"); return; }
-        const taskDir = args.trim() ? resolveTaskDir(root, args.trim()) : activeTaskDir(root, runtime.sessionId);
+        const taskDir = parsed.taskRef ? resolveTaskDir(root, parsed.taskRef) : activeTaskDir(root, runtime.sessionId);
         if (!taskDir) { say("没有可解析的任务；可传入 .trellis/tasks/<name>。"); return; }
         const taskRef = taskRefForDisplay(root, taskDir) ?? taskDir;
+        if (parsed.stop !== undefined) {
+          // Only a run this task recorded may be stopped: an arbitrary id would let
+          // this command act on work that belongs to another task or session.
+          const link = readRunLink(root, parsed.stop);
+          const recorded = link !== undefined && link.taskRef === taskRef;
+          if (!recorded) {
+            say([
+              `run ${parsed.stop} 不是任务 ${taskRef} 记录过的 run：本命令只停止自己记录过的 run，不接受任意 id。`,
+              ...(link === undefined ? [] : [`该 run 记录在任务 ${link.taskRef} 下。`]),
+              "用 /Coworkflow:lanes 查看本任务记录过的 run id。",
+            ].join("\n"));
+            return;
+          }
+          if (link.sessionId !== undefined && link.sessionId !== runtime.sessionId) {
+            // pi-subagents 只停止当前会话的 run；先本地说清，而不是发一个必然被拒的请求。
+            say([
+              `run ${parsed.stop} 属于会话 ${link.sessionId.slice(0, 8)}，不是当前会话：pi-subagents 的 stop 只接受当前会话的 run。`,
+              "未发出任何停止请求。",
+            ].join("\n"));
+            return;
+          }
+          const report = await requestStop(host, runtime, parsed.stop);
+          say([`任务: ${taskRef}`, "", ...report.lines].join("\n"));
+          return;
+        }
         let links = readTaskLinks(root, taskRef);
         const legacy = readLegacyPointers(root, taskDir);
         for (const pointer of legacy) if (!links.some((link) => link.runId === pointer.runId)) links.push({
@@ -171,17 +240,31 @@ export const laneWorktreeModule: WorkflowModule = {
         }));
         if (state.closed || runtime.sessionEpoch !== epoch || !runtime.enabled || !enabled(state)) return;
         links = shown.map((link) => readRunLink(root, link.runId) ?? link);
-        const integration = planRun(root, args.trim() || null, taskDir);
+        const integration = planRun(root, parsed.taskRef || null, taskDir);
         // The exit block is a report: planRun already validated the worktree, and
         // everything below is a git read. Nothing here merges, archives or removes.
         const lines = [`任务: ${taskRef}`, ...exitState(root, taskRef, integration)];
         if (!links.length) lines.push("尚未记录原生 run；已有 legacy lane 文件保持原样。");
+        // A grouping line, not a second listing: which kinds this task's runs were
+        // dispatched as, and how many each. Grouped only by the recorded kind, so
+        // a run without one is counted as such instead of being attributed.
+        const byKind = new Map<string, number>();
+        for (const link of links) byKind.set(link.kind ?? "", (byKind.get(link.kind ?? "") ?? 0) + 1);
+        if (byKind.size > 0) {
+          lines.push(`按 kind 分组: ${[...byKind.entries()]
+            .map(([kind, count]) => `${kind ? kindLabel(kind) : "非 kind 派单"} ×${count}`)
+            .join(" · ")}`);
+        }
         if (readTaskLinks(root, taskRef).length > MAX_DISPLAY) lines.push(`仅显示最近 ${MAX_DISPLAY} 个 run。`);
         for (const link of links) {
           const observation = state.observations.get(link.runId);
           const nativeState = link.sessionId === runtime.sessionId && activity?.kind === "known"
             ? activity.runs.find((run) => run.id === link.runId)?.state : undefined;
-          lines.push("", `- run ${link.runId} [${observation?.status ?? nativeState ?? "未知"}]`,
+          // The kind is on the line itself, so a run is attributable without
+          // cross-referencing anything: `[kind]` is absent for a dispatch that was
+          // not one of this package's kinds, which is a fact, not a gap.
+          lines.push("", `- run ${link.runId} [${observation?.status ?? nativeState ?? "未知"}]${
+            link.kind ? ` · kind ${kindLabel(link.kind)}` : ""}`,
             ...(link.missionId ? [`  mission: ${link.missionId}`] : []),
             ...(link.worktree ? [`  worktree: ${shortPath(root, link.worktree)}`] : []));
           const handoffRef = observation?.handoffPath ?? link.handoffPath;
@@ -219,6 +302,12 @@ export const laneWorktreeModule: WorkflowModule = {
 function shortPath(root: string, path: string): string {
   const rel = relative(root, resolve(root, path));
   return rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel : path;
+}
+
+/** `执行者（executor）`, or the bare kind for one this build does not ship. */
+function kindLabel(kind: string): string {
+  const label = builtinKind(kind)?.label;
+  return label === undefined ? kind : `${label}（${kind}）`;
 }
 function renderChild(root: string, parent: string, child: NativeChild): string[] {
   const identity = child.runId ?? `${parent} / index ${child.index}${child.stepIndex === undefined ? "" : ` / step ${child.stepIndex}`}`;

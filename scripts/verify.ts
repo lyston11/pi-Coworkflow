@@ -12,7 +12,7 @@
  *   node scripts/verify.ts <project-dir> Coworkflow:lanes
  *   node scripts/verify.ts <project-dir> commands
  *   node scripts/verify.ts <project-dir> config
- *   node scripts/verify.ts <project-dir> settings [DOWN|ENTER …]
+ *   node scripts/verify.ts <project-dir> settings [DOWN|UP|ENTER|LEFT|RIGHT|SPACE …]
  *   node scripts/verify.ts <project-dir> panel
  *   node scripts/verify.ts <project-dir> child-inject "<dispatch prompt>"
  *   node scripts/verify.ts <project-dir> lane-record <handoff.json>
@@ -162,8 +162,16 @@ switch (command) {
     };
     panel = new SettingsPanel(io, theme, { requestRender: () => {} }) as unknown as typeof panel;
 
+    // Named keys, so the harness drives the same gestures a user does: the
+    // settings panel's Space/←→ act on the row the cursor is on.
     const keyOf = (name: string): string =>
-      name === "DOWN" ? "\x1b[B" : name === "UP" ? "\x1b[A" : name === "ENTER" ? "\r" : name;
+      name === "DOWN" ? "\x1b[B"
+      : name === "UP" ? "\x1b[A"
+      : name === "ENTER" ? "\r"
+      : name === "LEFT" ? "\x1b[D"
+      : name === "RIGHT" ? "\x1b[C"
+      : name === "SPACE" ? " "
+      : name;
 
     console.log("--- settings (width 76) ---");
     console.log(panel.render(76).join("\n"));

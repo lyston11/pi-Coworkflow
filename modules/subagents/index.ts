@@ -47,9 +47,13 @@ import { fileURLToPath } from "node:url";
 import { join, isAbsolute } from "node:path";
 import type { ModuleContext, PiRuntimeHost, RuntimeContext, WorkflowModule } from "../../core/module.ts";
 import { userSettingsPath, userSubagentConfigPath } from "../../core/agentdir.ts";
+import { readConfig } from "../../core/config.ts";
 import { installedVersion, readUserConfig, subagentsPackageDir } from "../../core/pi-subagents.ts";
 import { mainCheckout, repoRoot, activeTaskDir, resolveTaskDir, taskRefForDisplay } from "../../core/trellis.ts";
 import { attachSubagents, existingSubagentsBridge, type SubagentsBridge } from "../../core/subagents-client.ts";
+import { kindWorkflowAgents, syncAgentKinds } from "../agent-kinds/index.ts";
+import { requestSteer, requestStop } from "./run-control.ts";
+import { resolveKinds } from "../agent-kinds/defaults.ts";
 import {
   WORKFLOW_NAME,
   validTaskRef,
@@ -173,6 +177,7 @@ export const subagentsModule: WorkflowModule = {
   onSessionActivate(host: PiRuntimeHost, runtime: RuntimeContext): void {
     if (runtime.isChild) return;
     registerRunCommand(host, runtime);
+    registerControlCommands(host, runtime);
   },
 
   /**
@@ -192,6 +197,7 @@ export const subagentsModule: WorkflowModule = {
       withdraw(state);
       releaseListeners(state);
       state.runCommandRegistered = false;
+      state.controlCommandsRegistered = false;
     }
     // The client's listeners belong to this session's RPC bridge too.
     existingSubagentsBridge(host)?.dispose();
@@ -314,6 +320,8 @@ interface HostState {
   /** True when a listener could not be released, so it must not be re-attached. */
   permanentListener: boolean;
   runCommandRegistered: boolean;
+  /** `/Coworkflow:stop` and `/Coworkflow:steer`, registered with the same lifetime. */
+  controlCommandsRegistered: boolean;
 }
 
 /** One workflow-resource + child-requirement pair, built for one session. */
@@ -344,6 +352,7 @@ function hostState(host: PiRuntimeHost): HostState {
     observersAttached: false,
     permanentListener: false,
     runCommandRegistered: false,
+    controlCommandsRegistered: false,
   };
   HOSTS.set(host, created);
   return created;
@@ -355,6 +364,23 @@ function disposeQuietly(handle: { dispose(): void } | null): void {
   } catch {
     // Disposal is idempotent upstream; a throw must not escape a shutdown path.
   }
+}
+
+/**
+ * A validated plan, carrying the agents the fixed workflow should run.
+ *
+ * The two step agents follow the project's kinds when one is enabled *and* live in
+ * this session's agent list; otherwise the built-in pair stays. Read at plan time
+ * rather than at registration, because the plan is what `resolve` hands to the
+ * workflow, and a toggle in `/Coworkflow:settings` must reach this path with no
+ * restart.
+ */
+function withKindAgents(
+  host: PiRuntimeHost,
+  root: string,
+  plan: RunPlan,
+): PreparedWorkflowContext {
+  return { ...plan, ...kindWorkflowAgents(host, resolveKinds(readConfig(root))) };
 }
 
 /** Withdraw the set we wanted: the registration goes, the generation moves. */
@@ -400,7 +426,7 @@ function releaseListeners(state: HostState): void {
  * that runs before that event (or in a host that never fires it) still knows which
  * session it is registering for.
  */
-function schedule(state: HostState, runtime: RuntimeContext, explicitSessionId?: string): Promise<void> {
+function schedule(state: HostState, runtime: RuntimeContext, host: PiRuntimeHost, explicitSessionId?: string): Promise<void> {
   const wanted = runtime.enabled && runtime.control.moduleEnabled("subagents");
   const sessionId = explicitSessionId ?? runtime.sessionId;
   if (!wanted || !sessionId) {
@@ -421,7 +447,7 @@ function schedule(state: HostState, runtime: RuntimeContext, explicitSessionId?:
     return Promise.resolve();
   }
   const plan = planRun(root, null, activeTaskDir(root, sessionId));
-  const prepared = plan.ok ? plan : null;
+  const prepared = plan.ok ? withKindAgents(host, root, plan) : null;
 
   const current = state.current;
   if (
@@ -502,7 +528,7 @@ function existsAsFile(path: string): boolean {
  */
 export function syncSubagentsRuntime(host: PiRuntimeHost, runtime: RuntimeContext): Promise<void> {
   if (runtime.isChild) return Promise.resolve();
-  return schedule(hostState(host), runtime);
+  return schedule(hostState(host), runtime, host);
 }
 
 /**
@@ -606,6 +632,104 @@ function parseRunArgs(args: string): { focus?: string } | { error: string } {
 }
 
 /**
+ * `<runId> [rest]`, or the reason the arguments cannot name a run.
+ *
+ * The run id is a single token; everything after it is free text (instructions),
+ * passed on as data. An empty id is refused here, before any RPC: a control call
+ * with no target would either act on "the newest run" or fail upstream, and
+ * neither is what the user asked for.
+ */
+export function parseControlArgs(
+  args: string,
+  options: { instructionsRequired: boolean },
+): { runId: string; instructions: string } | { error: string } {
+  const trimmed = args.trim();
+  if (!trimmed) return { error: "缺少 runId：用法见 /Coworkflow:stop <runId> [instructions] 与 /Coworkflow:steer <runId> <instructions>。" };
+  const split = /^(\S+)\s*([\s\S]*)$/.exec(trimmed);
+  const runId = split?.[1] ?? "";
+  const instructions = (split?.[2] ?? "").trim();
+  if (!runId) return { error: "runId 不能为空。" };
+  if (options.instructionsRequired && !instructions) {
+    return { error: `缺少指令：用法 /Coworkflow:steer ${runId} <instructions>。` };
+  }
+  if (instructions.length > 4000) return { error: "指令过长（最多 4000 字符）。" };
+  return { runId, instructions };
+}
+
+/**
+ * `/Coworkflow:stop <runId> [instructions]` and `/Coworkflow:steer <runId> <instructions>`.
+ *
+ * The general control commands: they accept any run id this session's owner will
+ * act on, so a run started by `/Coworkflow:run`, by a plain dispatch, or by another
+ * Coworkflow command is reachable. Ownership and lifecycle stay upstream's — the
+ * owner rejects a foreign or already-terminal target in its own words, and those
+ * words are what the user reads.
+ *
+ * Both commands are capability-honest: when the installed owner does not advertise
+ * the method, nothing is sent and the command says exactly that.
+ */
+function registerControlCommands(host: PiRuntimeHost, runtime: RuntimeContext): void {
+  const state = hostState(host);
+  if (state.controlCommandsRegistered) return;
+  state.controlCommandsRegistered = true;
+  const say = (text: string, ctx: any): void => {
+    try {
+      host.sendMessage?.({ customType: "pi-Coworkflow", content: text, display: true });
+    } catch {
+      // Fall through to the console path.
+    }
+    if (ctx?.mode !== "tui") {
+      try {
+        console.error(text);
+      } catch {
+        // stderr unavailable.
+      }
+    }
+  };
+
+  host.registerCommand?.(`${NS}:stop`, {
+    description:
+      "请求停止一个异步 run（接受≠终止：会再读一次公开状态并把两件事分开说）；可选 instructions 会先作为 steer 指令送达再停止。run 的归属与生命周期仍由 pi-subagents 判定",
+    handler: async (args: string, ctx: any) => {
+      runtime.refresh();
+      if (!runtime.enabled) { say(`本会话未加载 Coworkflow：先运行 /${NS}:start`, ctx); return; }
+      if (!runtime.control.moduleEnabled("subagents")) {
+        say("本项目把 subagents 模块关掉了：`/Coworkflow:settings` 打开它之后才能控制 run。", ctx);
+        return;
+      }
+      const parsed = parseControlArgs(args, { instructionsRequired: false });
+      if ("error" in parsed) { say(parsed.error, ctx); return; }
+      const lines: string[] = [];
+      if (parsed.instructions) {
+        // Instructions first, then the stop: the caller asked for both, and
+        // reporting each outcome separately is the only way neither is implied.
+        const steered = await requestSteer(host, runtime, parsed.runId, parsed.instructions);
+        lines.push(...steered.lines, "");
+      }
+      const report = await requestStop(host, runtime, parsed.runId);
+      say([...lines, ...report.lines].join("\n"), ctx);
+    },
+  });
+
+  host.registerCommand?.(`${NS}:steer`, {
+    description:
+      "给一个正在运行的异步 run 追加指令（不杀进程，也不是新派单）；指令只作为数据传给 pi-subagents",
+    handler: async (args: string, ctx: any) => {
+      runtime.refresh();
+      if (!runtime.enabled) { say(`本会话未加载 Coworkflow：先运行 /${NS}:start`, ctx); return; }
+      if (!runtime.control.moduleEnabled("subagents")) {
+        say("本项目把 subagents 模块关掉了：`/Coworkflow:settings` 打开它之后才能控制 run。", ctx);
+        return;
+      }
+      const parsed = parseControlArgs(args, { instructionsRequired: true });
+      if ("error" in parsed) { say(parsed.error, ctx); return; }
+      const report = await requestSteer(host, runtime, parsed.runId, parsed.instructions);
+      say(report.lines.join("\n"), ctx);
+    },
+  });
+}
+
+/**
  * `/Coworkflow:run [复核重点]` — launch the implement → review workflow.
  *
  * The command never falls back to a foreground/CLI launch: if the public bridge is
@@ -675,7 +799,7 @@ function registerRunCommand(host: PiRuntimeHost, runtime: RuntimeContext): void 
       // registered or awaits the build that is in flight, so two commands in
       // one turn cannot observe a half-built registration.
       if (!runtime.enabled || runtime.sessionEpoch !== epoch) { say("会话已更换或关闭，未派单。"); return; }
-      await schedule(state, runtime, sessionId);
+      await schedule(state, runtime, host, sessionId);
       const registered = state.current;
       if (registered === null || registered.sessionId !== sessionId || registered.workflow === null) {
         say(
@@ -695,7 +819,7 @@ function registerRunCommand(host: PiRuntimeHost, runtime: RuntimeContext): void 
         return;
       }
 
-      registered.prepared = plan;
+      registered.prepared = withKindAgents(host, root, plan);
       const launchId = `coworkflow-run-${randomUUID()}`;
       const admission = await bridge.admit(launchId, runtime.control.moduleEnabled("capacity") ? runtime.control.subagentConcurrency() : null);
       if (!admission.admit) {
@@ -712,7 +836,10 @@ function registerRunCommand(host: PiRuntimeHost, runtime: RuntimeContext): void 
         say("会话或任务工作树已改变，未派单；请重新检查当前任务。");
         return;
       }
-      registered.prepared = freshPlan;
+      // The kind pass first: which agents this workflow runs must be the ones the
+      // owner really has, not whichever pair a not-yet-landed registration left.
+      await syncAgentKinds(host, runtime);
+      registered.prepared = withKindAgents(host, root, freshPlan);
       const missionTitle = `Trellis ${plan.taskRef.split("/").pop() ?? plan.taskRef}: 实现与复核`;
       const result = await bridge.client.spawn({
         workflow: WORKFLOW_NAME,
@@ -782,7 +909,7 @@ function attachObservers(host: PiRuntimeHost, state: HostState, runtime: Runtime
     if (!runtime.enabled || !runtime.control.moduleEnabled("subagents")) {
       return { block: true, reason: "Coworkflow 工作流模块已关闭。" };
     }
-    await schedule(state, runtime);
+    await schedule(state, runtime, host);
     const current = state.current;
     if (!current?.workflow || current.failure || !current.prepared) {
       return { block: true, reason: current?.failure ?? "没有经过宿主校验的活跃任务工作树，未派单。" };
@@ -828,4 +955,5 @@ export function resetSubagentsRuntime(host: PiRuntimeHost): void {
   if (!state) return;
   withdraw(state);
   state.runCommandRegistered = false;
+  state.controlCommandsRegistered = false;
 }
