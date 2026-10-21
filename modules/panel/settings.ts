@@ -315,17 +315,22 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
     // never from the project's enablement, which says nothing about the agent list.
     const registered = status.some((line) => line.includes(entry.agent) && line.includes("已注册"));
     const failed = status.some((line) => line.includes(`${entry.kind} 注册失败`));
+    // The layer itself being off is its own fact, and it must not be inferred from
+    // "the report has no lines": a module switched off after it was on still has
+    // status lines, so that inference read as "enabled, pending" while nothing was
+    // registered and no gate was running. Match the report's own sentence instead.
+    const layerOff = status.some((line) => line.includes("本会话未加载或已关闭"));
     rows.push({
       label: `${entry.label} ${entry.agent}`,
       value: `${entry.enabled ? "[x]" : "[ ]"} 开 · 上限 ${entry.maxConcurrent}`,
       detail: !entry.enabled
         ? "关闭时该 kind 的派单会被拒绝，其他 agent 不受影响"
-        : registered
-          ? "已注册到 pi-subagents"
-          : failed
-            ? "注册失败（原因见下方状态行）"
-            : status.length === 0
-              ? "agent-kinds 本层未启用：kind 不注册，也不拦截派单（在上面的模块开关里打开）"
+        : layerOff
+          ? "agent-kinds 本层未启用：kind 不注册，也不拦截派单（在上面的模块开关里打开）"
+          : registered
+            ? "已注册到 pi-subagents"
+            : failed
+              ? "注册失败（原因见下方状态行）"
               : "已启用；注册状态见下方状态行",
       toggle: () => control.setAgentKind(entry.kind, { enabled: !entry.enabled }),
       adjust: (delta) =>

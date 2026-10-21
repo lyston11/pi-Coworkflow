@@ -664,3 +664,38 @@ test("status: registered kinds are reported by agent name; declared-but-unshippe
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+
+/**
+ * A layer switched off after it was on must not read as "enabled, pending".
+ *
+ * The row used to infer the layer's state from "the report has no lines". A module
+ * switched off mid-session still has a status line, so that inference produced
+ * `已启用；注册状态见下方状态行` while nothing was registered and the tool_call gate
+ * returned early — the row claimed a gate that was not running.
+ */
+test("panel: a kind row says the layer is off after it is switched off mid-session", async () => {
+  const root = tempProject({});
+  try {
+    const loaded = await loadExtension(root);
+    try {
+      await loaded.settled();
+      const onRows = buildSettingRows(loaded.control, {});
+      const onRow = onRows.find((row) => row.label.includes("cw-executor"));
+      assert.ok(onRow);
+      assert.match(onRow.detail ?? "", /已注册到 pi-subagents|注册状态见下方状态行/);
+
+      // Switch the layer off the way a user does, then read the panel again.
+      loaded.control.setSwitch("agent-kinds", false);
+      const offRows = buildSettingRows(loaded.control, {});
+      const offRow = offRows.find((row) => row.label.includes("cw-executor"));
+      assert.ok(offRow);
+      assert.match(offRow.detail ?? "", /本层未启用/);
+      assert.doesNotMatch(offRow.detail ?? "", /已启用；注册状态见下方状态行/);
+    } finally {
+      loaded.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
