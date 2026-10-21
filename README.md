@@ -119,74 +119,15 @@ const b = await runs.run("b", …);
 ```js
 subagent({ workflow: "coworkflow.fanout", args: {
   tasks: [
-    { kind: "executor", task: "实现 A" },
-    { kind: "executor", task: "实现 B" },
-    { kind: "auditor",  task: "只读审计 C" },
+    { kind: "executor", task: "<第一部分的活，按已定契约写>" },
+    { kind: "executor", task: "<第二部分的活，按同一份契约写，不要等第一部分>" },
   ],
-  focus: "本次扇出的共同要求",     // 可选
-} })
-```
-
-- 每个 task 只有 `kind` 与 `task`；写 `agent`、`model`、`worktree` 会被拒。
-- `kind` 解析成 agent 名走同一张表，所以扇出的 child 和直接派单的 child 是同一个 agent。
-- 不认识的 kind 被拒，错误里列出可用的 kind。
-- **kind 的开关照样生效**：被关闭或未注册的 kind → 那个 task 直接失败（不启动），
-  兄弟照跑，用的是 `tool_call` 门那套原话。读不到策略时同样拒绝。
-- 这些 child **由 `Promise.all` 同时启动**，不是 `for` 里的 `await`。这是这个资源存在的全部理由。
-- 一个失败不影响兄弟；**全部失败**才 fail-closed。
-- 返回 `acceptance: "parent-owned"` 并明说：**扇出绿了只代表执行完成，不代表验收通过**。
-
-### 串行派单会被计数
-
-`/Coworkflow:status` 有一行事实：
-
-```
-派单重叠: 3 次并行、5 次串行、1 次仍在运行或时间未知（不计入串行）（本次会话）
-```
-
-从记录的派单区间算，不是我说的。两条区间相交 = 并行；有完整区间且不相交 = 串行；
-**时间戳缺失、仍在运行或时钟倒退都算未知，单独计数，绝不算串行**——「无法判断」混进「串行」
-会让这行数字自己变成假的。
-
-这一行是渲染时读的存储状态，既不是消息也不是提醒。早期版本有一段「工具调用次数提醒」被注入对话，
-后来删掉了：**自定义消息会以 user turn 的形式回到模型，打断并重写它正在描述的那次工作**。
-
-## 原生 implement → review 工作流
-
-`/Coworkflow:run [focus]` 使用 `coworkflow.implement-review`。Trellis 负责任务要求、当前任务指针和隔离
-worktree；pi-subagents 负责执行、mission、稳定 child key、原生验收与完成通知；本包只做公开 API 适配、
-项目策略和任务到原生身份的关联。
-
-宿主在 resolver 之外校验 `task.json`、真实路径、同仓库 linked-worktree 成员关系与任务分支，
-拒绝主检出、别的仓库、普通目录与不一致分支。工作流依次 await 稳定键 `implement`、`review`，
-两个 child 都是 `context: "fresh"`、同一已验证 cwd、`worktree: false`；只有最外层异步。
-实现必须给出有效完成结果与验收证据，独立审查必须明确 pass 且没有阻塞发现；失败、字段缺失或矛盾结论都失败。
-
-两个步骤的 agent 跟随配置的 kind（已启用**且**已注册时用 `cw-executor` / `cw-auditor`），
-否则保持内置的 `trellis-implement` / `trellis-check`。
-
-**流程完成不代表最终验收、合并或发布。**
-
-## 拆分：先定契约，再并行
-
-多段工作时默认并行，串行要给理由。顺序是：
-
-```
-1. 先定接口契约 —— 函数签名 / payload 形状 / 端点 / 状态字段
-2. 各段在各自 worktree 里并行实现（coworkflow.fanout + worktrees: true）
-3. 主会话按序 git apply --3way 集成，再派独立审阅
-```
-
-```js
-subagent({ workflow: "coworkflow.fanout", args: {
-  tasks: [
-    { kind: "executor", task: "按 docs/contract.md 实现后端状态与审核 API" },
-    { kind: "executor", task: "按 docs/contract.md 改 Dashboard（先按契约桩实现）" },
-  ],
-  focus: "契约见 docs/contract.md；两边都按它写，不要等对方",
+  focus: "契约就是这个任务里的 <契约文件>；两边都按它写",
   worktrees: true,
 }})
 ```
+
+契约定在哪、由谁写，是项目自己的事：一个接口说明文件、一段类型定义、一张表都行，只要**两份任务都能照着写而不必读对方的代码**。
 
 `worktrees: true` 给每个 lane 自己的独立 worktree —— **「共用一个 worktree，不能同时写」是配置问题，不是依赖问题**。真正必须串行的只有一种：后一步要看到前一步**已实现的行为**才能定下自己的接口；那说明契约还没定。
 

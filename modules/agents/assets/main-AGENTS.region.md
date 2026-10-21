@@ -19,8 +19,8 @@
 多个 agent 共用一个工作区曾导致 `reset` 抹掉 main 上已提交的改动。并行工作必须遵守：
 
 - 一个任务一个分支 + 一个 linked worktree。`task.py start` 的 `after_start` 钩子（`.trellis/scripts/hooks/auto_worktree.py`）自动创建 `feat/<任务目录名>` 分支、在仓库旁 `../{{worktreePrefix}}<任务目录名>` 建 worktree，并把两者写入 task.json 的 `branch` / `worktree_path`。钩子成功时无输出，以 task.json 为准；写代码前必须先 `cd` 进该 worktree，不得在主检出里改业务代码。
-- 在自己的分支上只允许 commit；禁止 `reset --hard`、`rebase`、`push -f`、切换到非本任务的分支。需要 main 新代码时 `git fetch` 后把 `origin/main` merge 进自己分支。
-- 任何 agent 不得改写 main 或他人分支的历史；历史整理只由人在专门时机做。
+- 在自己的分支上只允许 commit；禁止 `reset --hard`、`rebase`、`push -f`、切换到非本任务的分支。需要基线分支的新代码时 `git fetch` 后把上游基线 merge 进自己分支（分支名按仓库而定，常见是 `origin/main`；以 `git symbolic-ref refs/remotes/origin/HEAD` 的结果为准）。
+- 任何 agent 不得改写基线分支或他人分支的历史；历史整理只由人在专门时机做。
 - `task.py` 生命周期命令（current / finish / archive 等）在启动任务的主检出里执行；代码改动和提交都在任务 worktree 里。任务确实不需要隔离时（如纯文档小改），完成后用 `git worktree remove ../{{worktreePrefix}}<任务目录名>` 清理。
 - **默认并行，串行要给出理由。** 拆分多段工作时的顺序是：先定**接口契约**（函数签名、payload 形状、端点、状态字段），再让各段在**各自 worktree**里并行实现，最后由主会话集成后独立审阅。
 - **「共用一个 worktree，不能同时写」不是串行的理由** —— 那是配置问题不是依赖问题：`coworkflow.fanout` 传 `worktrees: true`，每个 lane 拿自己的独立 worktree，产出 patch 由主会话按顺序 `git apply --3way` 集成。

@@ -379,3 +379,34 @@ test("lanes: exit state prints cleanup only when the branch is merged and the wo
     assert.equal(fingerprint(), before, "a failed precondition leaves the repository untouched");
   } finally { h.close(); }
 });
+
+/**
+ * The base branch is a property of the repository, not a constant.
+ *
+ * The exit check defaulted to `main`, so a repository whose default branch is `master`
+ * (or anything else) got a verdict against a branch that may not exist — "尚未合并进 main"
+ * for work that was merged, or the reverse, with nothing saying the branch was a guess.
+ */
+test("lanes: the exit check reads the repository's base branch instead of assuming main", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cw-base-"));
+  const git = (args: string[]) => execFileSync("git", ["-C", root, ...args], { encoding: "utf-8" }).trim();
+  try {
+    git(["init", "-q", "-b", "trunk"]);
+    git(["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "init"]);
+    const { baseBranchProbe } = await import("../modules/lane-worktree/index.ts");
+    // No origin/HEAD here, so the branch that actually exists decides it.
+    assert.equal(baseBranchProbe(root), "trunk");
+    // A single-branch repository answers with that branch, whatever it is called.
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), "cw-base2-"));
+    execFileSync("git", ["-C", other, "init", "-q", "-b", "spine"]);
+    execFileSync("git", ["-C", other, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "i"]);
+    assert.equal(baseBranchProbe(other), "spine", "the checked-out default branch is the honest answer");
+    fs.rmSync(other, { recursive: true, force: true });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

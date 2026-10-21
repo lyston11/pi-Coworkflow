@@ -387,16 +387,44 @@ function gitProbe(cwd: string, args: string[]): { code: number; out: string } | 
   }
 }
 
+/**
+ * The branch a task would be merged into.
+ *
+ * `task.json` may record `base_branch`; when it does not, asking the repository is the
+ * only general answer. A hardcoded `main` reported "已合并" or "尚未合并" against a branch
+ * that may not exist in this repository at all — and `master`/`develop`/`trunk` projects
+ * then got a wrong exit verdict with no hint that the branch was a guess.
+ */
+export function baseBranchProbe(repo: string): string | null {
+  const configured = gitProbe(repo, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
+  const remoteHead = configured?.code === 0 ? configured.out.trim().replace(/^origin\//, "") : "";
+  if (remoteHead) return remoteHead;
+  const configuredDefault = gitProbe(repo, ["config", "--get", "init.defaultBranch"]);
+  const initDefault = configuredDefault?.code === 0 ? configuredDefault.out.trim() : "";
+  if (initDefault && gitProbe(repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${initDefault}`])?.code === 0) {
+    return initDefault;
+  }
+  for (const candidate of ["main", "master"]) {
+    if (gitProbe(repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${candidate}`])?.code === 0) return candidate;
+  }
+  // A repository with a single local branch has exactly one honest answer, whatever it is
+  // called. With several and nothing declaring which is the base, guessing would be worse
+  // than saying "unknown" — the exit check reports that rather than a wrong verdict.
+  const branches = gitProbe(repo, ["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+  const names = branches?.code === 0 ? branches.out.split("\n").map((line) => line.trim()).filter(Boolean) : [];
+  return names.length === 1 ? names[0]! : null;
+}
+
 /** The task identity fields the exit check needs; `planRun` remains the validator. */
-function readExitRecord(root: string, taskRef: string): { branch: string | null; base: string } {
+function readExitRecord(root: string, taskRef: string, repo: string): { branch: string | null; base: string | null } {
   const read = (value: unknown): string | null =>
     typeof value === "string" && value.trim() ? value.trim().replace(/^refs\/heads\//, "") : null;
   try {
     const parsed: unknown = JSON.parse(readFileSync(join(root, taskRef, "task.json"), "utf8"));
     const record = parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
-    return { branch: read(record.branch), base: read(record.base_branch) ?? "main" };
+    return { branch: read(record.branch), base: read(record.base_branch) ?? baseBranchProbe(repo) };
   } catch {
-    return { branch: null, base: "main" };
+    return { branch: null, base: baseBranchProbe(repo) };
   }
 }
 
@@ -410,14 +438,18 @@ function readExitRecord(root: string, taskRef: string): { branch: string | null;
  * forced removal: an unfinished task is a decision for the human, not a flag.
  */
 function exitState(root: string, taskRef: string, integration: ReturnType<typeof planRun>): string[] {
-  const record = readExitRecord(root, taskRef);
   const repo = integration.ok ? integration.mainCheckout : root;
+  const record = readExitRecord(root, taskRef, repo);
   const lines = ["", "任务退出状态（只读检查：本命令不合并、不归档、不删除任何东西）："];
   const failed: string[] = [];
   let merged: boolean | null = null;
   if (record.branch === null) {
     lines.push("- 分支: task.json 没有记录 branch，无法判断合并状态");
     failed.push("task.json 缺少 branch");
+  } else if (record.base === null) {
+    // No base branch could be determined: state that instead of guessing one.
+    lines.push(`- 分支 ${record.branch}: 无法确定基线分支（origin/HEAD 未设置，仓库里也没有 main/master），合并状态未判定`);
+    failed.push("无法确定基线分支");
   } else {
     const probe = gitProbe(repo, ["merge-base", "--is-ancestor", record.branch, record.base]);
     merged = probe === null ? null : probe.code === 0 ? true : probe.code === 1 ? false : null;
