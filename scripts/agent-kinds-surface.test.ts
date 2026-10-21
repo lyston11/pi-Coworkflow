@@ -268,10 +268,12 @@ interface PanelHarness {
   press(key: string): Promise<void>;
   /** Send several keys inside one tick, the way a held key or two fast presses do. */
   pressBurst(...keys: string[]): Promise<void>;
-  /** Which tab and column own the cursor. */
-  viewState(): { tab: "project" | "status"; focus: "item" | "value" };
+  /** Which tab and column own the cursor, and which tabs exist. */
+  viewState(): { tab: string; focus: "item" | "value"; tabs: string[] };
   /** Labels the active tab is showing. */
   visible(): string[];
+  /** Rows the active tab is showing, including prose rows. */
+  rows(): Array<{ label: string; value: string; prose?: boolean; readOnly?: boolean }>;
   statuses: string[];
 }
 
@@ -304,9 +306,14 @@ function panelFor(control: Parameters<typeof buildSettingRows>[0]): PanelHarness
     rows: () => panel.currentRows(),
     selected: () => panel.selectedRow(),
     focusOn(needle) {
-      for (let step = 0; step < 80; step += 1) {
-        if (panel.selectedRow()?.label.includes(needle)) return;
-        panel.handleInput("\x1b[B");
+      // Rows live on pages now, so finding a row means finding its page first.
+      const tabs = panel.viewState().tabs.length;
+      for (let page = 0; page < tabs; page += 1) {
+        for (let step = 0; step < 40; step += 1) {
+          if (panel.selectedRow()?.label.includes(needle)) return;
+          panel.handleInput("\x1b[B");
+        }
+        panel.handleInput("\t");
       }
       throw new Error(`no selectable row matching ${needle}: ${panel.currentRows().map((row) => row.label).join(" | ")}`);
     },
@@ -338,7 +345,7 @@ test("panel: Space toggles a kind and Enter edits its limit, with no restart", {
 
     const panel = panelFor(loaded.control);
     panel.focusOn("cw-auditor");
-    assert.match(panel.selected()?.value ?? "", /\[ \] 开 · 上限 1/, "the panel shows the built-in policy for auditor");
+    assert.match(panel.selected()?.value ?? "", /\[ \] 关 · 上限 1/, "the panel shows the built-in policy for auditor");
 
     // Space: enabled, registered, and the config says so — all without a reload.
     await panel.press(" ");
@@ -645,9 +652,9 @@ test("panel and status: no compatible contract means no kind is shown as registe
     const executor = rows.find((row) => row.label.includes("cw-executor"));
     assert.ok(executor);
     assert.doesNotMatch(executor.detail ?? "", /已注册到 pi-subagents/, "an unavailable contract never reads as registered");
-    assert.match(executor.detail ?? "", /注册状态见下方状态行/);
+    assert.match(executor.detail ?? "", /注册状态见 状态 tab/);
     // The exact reason is on the panel, not a list of kinds that do not exist.
-    assert.ok(rows.some((row) => row.readOnly && /事件总线/.test(row.label)), rows.map((row) => row.label).join(" | "));
+    assert.ok(rows.some((row) => row.readOnly && /事件总线/.test(row.prose ? row.value : row.label)), rows.map((row) => row.label || row.value).join(" | "));
     // And the gate agrees with the panel: the declared kind is refused, not started.
     const blocked = (await loaded.emit("tool_call", {
       toolName: "subagent",
@@ -699,7 +706,7 @@ test("panel: a kind row says the layer is off after it is switched off mid-sessi
       const onRows = buildSettingRows(loaded.control, {});
       const onRow = onRows.find((row) => row.label.includes("cw-executor"));
       assert.ok(onRow);
-      assert.match(onRow.detail ?? "", /已注册到 pi-subagents|注册状态见下方状态行/);
+      assert.match(onRow.detail ?? "", /已注册到 pi-subagents|注册状态见 状态 tab/);
 
       // Switch the layer off the way a user does, then read the panel again.
       loaded.control.setSwitch("agent-kinds", false);
@@ -758,37 +765,58 @@ test("panel: a key burst is not a lost update", { skip }, async () => {
  * reported. Mixing the modules' own status sentences into the editable list made every
  * row look like something you could change.
  */
-test("panel: settings is a table with two tabs, column switching and a filter", { skip }, async () => {
+test("panel: settings is one page per concern, with column switching and a filter", { skip }, async () => {
   const { pi } = fakePi();
   const root = tempProject({ auditor: { enabled: false } });
   const loaded = await loadExtension(root, pi.events);
   try {
     await loaded.settled();
     const panel = panelFor(loaded.control);
-    const projectRows = panel.visible();
+    const state = panel.viewState();
+    assert.deepEqual(state.tabs, ["模块", "会话", "子 agent", "维护", "状态"]);
 
-    // The writable tab must not carry the modules' read-only sentences.
-    assert.ok(projectRows.some((label) => label.includes("cw-executor")));
-    assert.ok(!projectRows.some((label) => label.trim().startsWith("=")), "status sentences live on the other tab");
+    // A page holds one concern: the kind policy is not mixed into the module switches.
+    assert.equal(state.tab, "模块");
+    assert.ok(panel.visible().includes("trellis"));
+    assert.ok(!panel.visible().some((label) => label.includes("cw-executor")), "kinds have their own page");
 
-    // Tab reaches the reported tab, which is where those sentences are, and comes back.
+    // Each page is reached by Tab, and its rows are the ones the page names.
     await panel.press("\t");
-    assert.equal(panel.viewState().tab, "status");
-    assert.ok(panel.visible().some((label) => label.trim().startsWith("=")), panel.visible().join(" | "));
-    const onStatus = panel.selected();
+    assert.equal(panel.viewState().tab, "会话");
+    await panel.press("\t");
+    assert.equal(panel.viewState().tab, "子 agent");
+    assert.ok(panel.visible().some((label) => label.includes("cw-executor")));
+    assert.ok(panel.visible().some((label) => label.includes("本项目并发上限")), "the ceiling lives with the kinds it applies to");
+
+    // Shift-Tab walks back, so a long tab bar is not one-way.
+    await panel.press("\x1b[Z");
+    assert.equal(panel.viewState().tab, "会话");
+
+    // The reported page carries the modules' sentences, full width, and Enter there does nothing.
+    await panel.press("\t");
+    await panel.press("\t");
+    await panel.press("\t");
+    assert.equal(panel.viewState().tab, "状态");
+    const prose = panel.rows().filter((row) => row.prose);
+    assert.ok(prose.length > 0, "the module's own sentences are prose rows, not truncated cells");
+    assert.ok(prose.some((row) => /agent-kinds/.test(row.value)), prose.map((row) => row.value).join(" | "));
+    const before = panel.selected();
     await panel.press("\r");
-    assert.equal(panel.selected()?.label, onStatus?.label, "Enter on a read-only row does nothing");
+    assert.equal(panel.selected(), before, "Enter on a read-only row does nothing");
 
-    await panel.press("\t");
-    assert.equal(panel.viewState().tab, "project");
-
-    // Typing filters the writable tab down to matching rows, and Esc still closes.
+    // Typing filters the rows of a writable page.
+    await panel.press("\x1b[Z");
+    await panel.press("\x1b[Z");
+    await panel.press("\x1b[Z");
+    await panel.press("\x1b[Z");
+    assert.equal(panel.viewState().tab, "模块");
+    await panel.press("l");
     await panel.press("a");
-    await panel.press("u");
-    assert.ok(panel.visible().every((label) => /au|审计/i.test(label)), panel.visible().join(" | "));
+    assert.ok(panel.visible().every((label) => /la/i.test(label)), panel.visible().join(" | "));
     assert.ok(!panel.visible().includes("trellis"), "an unrelated module row is filtered out");
   } finally {
     loaded.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
+

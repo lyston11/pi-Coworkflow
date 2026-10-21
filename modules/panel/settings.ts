@@ -30,8 +30,14 @@ export interface SettingRow {
   label: string;
   value: string;
   detail?: string;
-  /** Section header rows are not selectable. */
-  header?: boolean;
+  /**
+   * Which tab this row belongs to. The tab name *is* the grouping, so there are no
+   * header rows inside a table — a header that duplicates the tab it sits under was
+   * one of the reasons the first table read as a wall of headings.
+   */
+  section?: string;
+  /** A sentence rather than a value: rendered full width, never truncated into a cell. */
+  prose?: boolean;
   /** Read-only rows are shown but do nothing on Enter. */
   readOnly?: boolean;
   act?: () => string | Promise<string>;
@@ -56,12 +62,14 @@ export interface SettingsPanelIo {
  * Rows come from the control surface, so the panel shows the same state the slash
  * commands report and writes through the same code path.
  *
- * Laid out and driven like `/Comodels`: a tab bar, a three-column table with a rule
- * under the header, ←→ to move between the two live columns, ↑↓ to move within a
- * column, Enter to apply, Esc to close, and typing to filter. Two tabs split what is
- * *writable* (the project's configuration) from what is only *reported* (the modules'
- * own status lines), because mixing read-only prose into an editable list made every
- * row look like something you could change.
+ * Laid out and driven like `/Comodels`: a tab bar, a table with a rule under the
+ * header, ←→ to move between the live columns, ↑↓ to move within a column, Enter to
+ * apply, Esc to close, typing to filter.
+ *
+ * One tab per concern rather than one long list with headings. A heading inside a
+ * table duplicates the tab it sits under, mixes read-only prose with editable rows,
+ * and — because the narrow label column cannot hold a sentence — truncates exactly
+ * the part that explains what went wrong.
  */
 export class SettingsPanel extends Container {
   private readonly io: SettingsPanelIo;
@@ -70,7 +78,7 @@ export class SettingsPanel extends Container {
   private readonly keybindings: PanelKeybindings | undefined;
   private all: SettingRow[] = [];
   private rows: SettingRow[] = [];
-  private tab: SettingsTab = "project";
+  private tab: string = "";
   private focus: SettingsFocus = "item";
   private cursor = 0;
   private query = "";
@@ -104,7 +112,7 @@ export class SettingsPanel extends Container {
     this.addChild(this.statusText);
     this.addChild(
       new Text(
-        theme.fg("muted", "↑↓ 移动 · ←→ 切换 设置项/当前值 列 · Tab 切换 项目/状态 · Enter 修改 · Space 开关 · Esc 关闭 · 直接输入可筛选"),
+        theme.fg("muted", "↑↓ 移动 · ←→ 切换列 · Tab/⇧Tab 换页 · Enter 修改 · Space 开关 · Esc 关闭 · 直接输入可筛选"),
         0,
         0,
       ),
@@ -128,8 +136,14 @@ export class SettingsPanel extends Container {
   }
 
   /** Which tab and column currently own the cursor, for tests. */
-  viewState(): { tab: SettingsTab; focus: SettingsFocus } {
-    return { tab: this.tab, focus: this.focus };
+  viewState(): { tab: string; focus: SettingsFocus; tabs: string[] } {
+    return { tab: this.tab, focus: this.focus, tabs: this.tabNames() };
+  }
+
+  /** Tab / Shift-Tab: cycle pages. Shift-Tab also arrives as ESC [ Z on some terminals. */
+  private shiftTab(data: string): boolean {
+    if (matchesKey(data, "shift+tab")) return true;
+    return data === "\x1b[Z";
   }
 
   private matches(data: string, action: "up" | "down" | "confirm" | "cancel"): boolean {
@@ -144,40 +158,35 @@ export class SettingsPanel extends Container {
     return fallback[action]?.test(data) ?? false;
   }
 
-  /**
-   * Split the owner's rows into the two tabs and put the cursor on something real.
-   *
-   * The owner emits one list with section headers; the `状态` header marks where the
-   * read-only report begins. Splitting there rather than by `readOnly` keeps the
-   * intent in one place: everything after that header was never editable.
-   */
+  /** Tabs in a fixed order, so a keystroke count never changes what a tab means. */
+  private tabNames(): string[] {
+    const order = ["模块", "会话", "子 agent", "维护", "状态"];
+    const present = new Set(this.all.map((row) => row.section ?? ""));
+    return order.filter((name) => present.has(name));
+  }
+
   private adopt(rows: SettingRow[]): void {
     this.all = rows;
-    const statusAt = rows.findIndex((row) => row.header === true && row.label.trim() === "状态");
-    const project = statusAt < 0 ? rows : rows.slice(0, statusAt);
-    const reported = statusAt < 0 ? [] : rows.slice(statusAt);
-    this.projectRows = project;
-    this.statusRows = reported;
+    const names = this.tabNames();
+    if (!names.includes(this.tab)) this.tab = names[0] ?? "";
     this.rebuild();
   }
 
-  private projectRows: SettingRow[] = [];
-  private statusRows: SettingRow[] = [];
-
   private source(): SettingRow[] {
-    return this.tab === "project" ? this.projectRows : this.statusRows;
+    return this.all.filter((row) => (row.section ?? "") === this.tab);
   }
 
   /** Apply the filter and keep the cursor on a selectable row. */
   private rebuild(): void {
     const source = this.source();
-    if (this.tab === "project" && this.query.trim() !== "") {
+    const editable = source.filter((row) => !row.readOnly);
+    if (this.query.trim() !== "" && editable.length > 0) {
       const hits = new Set(
-        fuzzyFilter(source.filter((row) => !row.header).map((row, index) => ({ row, index })),
-          this.query.trim(),
-          (entry) => entry.row.label).map((entry) => entry.index),
+        fuzzyFilter(editable, this.query.trim(), (row) => `${row.label} ${row.value} ${row.detail ?? ""}`).map(
+          (row) => row,
+        ),
       );
-      this.rows = source.filter((row, index) => !row.header && hits.has(index));
+      this.rows = source.filter((row) => row.readOnly || hits.has(row));
     } else {
       this.rows = source;
     }
@@ -187,7 +196,9 @@ export class SettingsPanel extends Container {
   }
 
   private selectable(): number[] {
-    return this.rows.map((row, index) => (row.header ? -1 : index)).filter((index) => index >= 0);
+    // A prose row is a sentence, not a setting: the cursor skips it rather than
+    // stopping on something Enter cannot do anything with.
+    return this.rows.map((row, index) => (row.prose ? -1 : index)).filter((index) => index >= 0);
   }
 
   // ── table geometry, the same discipline as the model panel ──────────
@@ -204,27 +215,29 @@ export class SettingsPanel extends Container {
   private columnWidths(width: number): { item: number; value: number; detail: number } {
     const SEP = 3; // " │ "
     const total = Math.max(60, width - 2 - SEP * 2);
-    const value = Math.min(26, Math.max(14, Math.floor(total * 0.22)));
-    const item = Math.min(34, Math.max(18, Math.floor(total * 0.28)));
+    const value = Math.min(24, Math.max(12, Math.floor(total * 0.2)));
+    const item = Math.min(30, Math.max(16, Math.floor(total * 0.26)));
     return { item, value, detail: Math.max(10, total - item - value) };
   }
 
   private tableRule(widths: { item: number; value: number; detail: number }): Text {
     const bar = (w: number) => "─".repeat(w);
-    return new Text(
-      this.theme.fg("dim", `  ${bar(widths.item)}─┼─${bar(widths.value)}─┼─${bar(widths.detail)}`),
-      0,
-      0,
-    );
+    return new Text(this.theme.fg("dim", `  ${bar(widths.item)}─┼─${bar(widths.value)}─┼─${bar(widths.detail)}`), 0, 0);
   }
 
   private tabBar(): Text {
     const theme = this.theme;
-    const cell = (label: string, id: SettingsTab) =>
-      this.tab === id
-        ? theme.fg("accent", theme.bold ? theme.bold(`[${label}]`) : `[${label}]`)
-        : theme.fg("muted", ` ${label} `);
-    return new Text(`${cell("项目", "project")}  ${cell("状态", "status")}`, 0, 0);
+    const names = this.tabNames();
+    const line = names
+      .map((name) => {
+        if (name === this.tab) {
+          const text = `[${name}]`;
+          return theme.fg("accent", theme.bold ? theme.bold(text) : text);
+        }
+        return theme.fg("muted", ` ${name} `);
+      })
+      .join(" ");
+    return new Text(line, 0, 0);
   }
 
   private updateBody(): void {
@@ -232,39 +245,54 @@ export class SettingsPanel extends Container {
     const width = this.width ?? 100;
     const widths = this.columnWidths(width);
     const sep = theme.fg("dim", " │ ");
+    const onStatus = this.tab === "状态";
     this.body.clear();
     this.body.addChild(this.tabBar());
+
+    // The 状态 tab reports facts, not settings: its values are sentences, so it gets
+    // 项 │ 值 and lets the value column take the width the 说明 column would have had.
+    const valueWidth = onStatus ? widths.value + widths.detail + 3 : widths.value;
     const itemHeader = this.paint(this.cell("设置项", widths.item), this.focus === "item" ? "accent" : "muted");
-    const valueHeader = this.paint(this.cell("当前值", widths.value), this.focus === "value" ? "accent" : "muted");
-    this.body.addChild(new Text(`  ${itemHeader}${sep}${valueHeader}${sep}${this.paint(this.cell("说明", widths.detail), "muted")}`, 0, 0));
-    this.body.addChild(this.tableRule(widths));
+    const valueHeader = this.paint(this.cell(onStatus ? "值" : "当前值", valueWidth), this.focus === "value" ? "accent" : "muted");
+    const header = onStatus
+      ? `  ${itemHeader}${sep}${valueHeader}`
+      : `  ${itemHeader}${sep}${valueHeader}${sep}${this.paint(this.cell("说明", widths.detail), "muted")}`;
+    this.body.addChild(new Text(header, 0, 0));
+    this.body.addChild(
+      onStatus
+        ? new Text(theme.fg("dim", `  ${"─".repeat(widths.item)}─┼─${"─".repeat(valueWidth)}`), 0, 0)
+        : this.tableRule(widths),
+    );
 
     if (this.rows.length === 0) {
-      this.body.addChild(new Text(theme.fg("muted", this.query ? `  （没有匹配 “${this.query}” 的设置项）` : "  （本节没有内容）"), 0, 0));
+      this.body.addChild(
+        new Text(theme.fg("muted", this.query ? `  （没有匹配 “${this.query}” 的设置项）` : "  （本节没有内容）"), 0, 0),
+      );
     }
     for (let i = 0; i < this.rows.length; i += 1) {
       const row = this.rows[i]!;
-      if (row.header) {
-        // A section separator spans the table instead of becoming a cell, so the
-        // grouping survives the table layout without a fourth column.
-        // Measured in display columns, not characters: a CJK section name is two
-        // columns per character, and using `.length` made the rule overflow onto a
-        // second line.
-        const lead = `  ── ${row.label} `;
-        const tail = Math.max(0, widths.item + widths.value + widths.detail + 8 - visibleWidth(lead));
-        this.body.addChild(new Text(theme.fg("accent", `  ── ${row.label} ${"─".repeat(tail)}`), 0, 0));
+      if (row.prose) {
+        // Full width, wrapped by the terminal rather than truncated: the reason a kind
+        // failed to register is the whole point of the line.
+        this.body.addChild(new Text(theme.fg("muted", `  ${row.value || row.label}`), 0, 0));
         continue;
       }
       const selected = i === this.cursor;
       const pointer = selected ? theme.fg("accent", "→ ") : "  ";
-      const label = this.cell(row.label, widths.item);
-      const value = this.cell(row.value, widths.value);
-      const detail = this.cell(row.detail ?? "", widths.detail);
-      // The cursor colour follows the column that owns it, the way the model panel's
-      // header does: which column a keystroke will act on is visible, not implied.
-      const labelCell = this.paint(label, selected && this.focus === "item" ? "accent" : selected ? "text" : null);
-      const valueCell = this.paint(value, row.readOnly ? "muted" : selected && this.focus === "value" ? "accent" : "success");
-      this.body.addChild(new Text(`${pointer}${labelCell}${sep}${valueCell}${sep}${this.paint(detail, "dim")}`, 0, 0));
+      const labelCell = this.paint(
+        this.cell(row.label, widths.item),
+        selected && this.focus === "item" ? "accent" : selected ? "text" : null,
+      );
+      const valueCell = this.paint(
+        this.cell(row.value, valueWidth),
+        row.readOnly ? "muted" : selected && this.focus === "value" ? "accent" : "success",
+      );
+      if (onStatus) {
+        this.body.addChild(new Text(`${pointer}${labelCell}${sep}${valueCell}`, 0, 0));
+      } else {
+        const detail = this.cell(row.detail ?? "", widths.detail);
+        this.body.addChild(new Text(`${pointer}${labelCell}${sep}${valueCell}${sep}${this.paint(detail, "dim")}`, 0, 0));
+      }
     }
     this.statusText.setText(this.status ? theme.fg("success", this.status) : "");
   }
@@ -284,6 +312,18 @@ export class SettingsPanel extends Container {
     this.tui?.requestRender?.();
   }
 
+  private cycleTab(delta: number): void {
+    const names = this.tabNames();
+    if (names.length === 0) return;
+    const position = Math.max(0, names.indexOf(this.tab));
+    this.tab = names[(position + delta + names.length) % names.length]!;
+    this.query = "";
+    this.searchInput.setValue("");
+    this.cursor = 0;
+    this.rebuild();
+    this.refresh();
+  }
+
   private refresh(): void {
     this.updateBody();
     this.tui?.requestRender?.();
@@ -292,7 +332,7 @@ export class SettingsPanel extends Container {
   /** Enter: do what this row's label says, whatever column the cursor is in. */
   private applyRow(): void {
     const row = this.rows[this.cursor];
-    if (!row || row.readOnly) return;
+    if (!row || row.readOnly || row.prose) return;
     const action = row.act ?? row.toggle;
     if (action) this.run(action);
   }
@@ -302,16 +342,8 @@ export class SettingsPanel extends Container {
       this.io.close();
       return;
     }
-    // Tab switches the scope tab (项目 / 状态), from either column.
-    if (matchesKey(data, Key.tab)) {
-      this.tab = this.tab === "project" ? "status" : "project";
-      this.query = "";
-      this.searchInput.setValue("");
-      this.cursor = 0;
-      this.rebuild();
-      this.refresh();
-      return;
-    }
+    if (this.shiftTab(data)) return this.cycleTab(-1);
+    if (matchesKey(data, Key.tab)) return this.cycleTab(1);
     // ←→ switch which column owns the cursor: 设置项 / 当前值. Matched before the
     // search field sees them, because `Input` treats cursorLeft/Right as its own.
     if (matchesKey(data, Key.right) || matchesKey(data, Key.left)) {
@@ -331,7 +363,7 @@ export class SettingsPanel extends Container {
       return this.run(row.toggle);
     }
     // Typing filters, on the same column the model panel filters from.
-    if (this.tab !== "project" || this.focus !== "item") return;
+    if (this.tab === "状态" || this.focus !== "item") return;
     this.searchInput.handleInput(data);
     this.query = this.searchInput.getValue();
     this.rebuild();
@@ -346,14 +378,12 @@ export class SettingsPanel extends Container {
    * or as a row that looks applied but is not.
    *
    * One action at a time. A row gesture is built from the snapshot that rendered
-   * the row, so two gestures delivered inside one tick — a held Space, two quick
-   * Enters — both started from the same stale value and the second silently
-   * overwrote the first: Right,Right on a limit of 3 produced 4, and Space,Space on
-   * a disabled kind left it enabled. A policy editor that appears to work while
-   * doing less is the exact failure this module exists to remove, so an action
-   * arriving while another is in flight is dropped rather than queued: the row is
-   * re-read after every action, so the queued gesture would apply to a value the
-   * user never saw.
+   * the row, so two gestures delivered inside one tick both started from the same
+   * stale value and the second silently overwrote the first. A policy editor that
+   * appears to work while doing less is the exact failure this module exists to
+   * remove, so an action arriving while another is in flight is dropped rather than
+   * queued: the row is re-read after every action, so the queued gesture would apply
+   * to a value the user never saw.
    */
   private run(action: () => string | Promise<string>): void {
     if (this.inflight) return;
@@ -378,7 +408,6 @@ export class SettingsPanel extends Container {
   }
 }
 
-type SettingsTab = "project" | "status";
 type SettingsFocus = "item" | "value";
 
 /**
@@ -442,111 +471,117 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
   const switches = control.switches();
   const initialized = control.initialized();
 
-  rows.push({ label: "模块", value: "", header: true });
+  // ── 模块 ────────────────────────────────────────────────────────────────
+  // One line of "what this layer actually does", because a column of bare `on`s
+  // told a reader nothing about which switch to reach for.
+  const about: Record<string, string> = {
+    trellis: "Trellis 本体与项目记录（已有项目只报告，不重写）",
+    worktree: "任务隔离机制：after_start 钩子建 <前缀><任务> worktree",
+    agents: "AGENTS.md 受管区（主会话）+ 子 agent 工作约定",
+    subagents: "复用已装的 pi-subagents，缺失时才项目级安装",
+    "subagent-context": "子会话按角色注入 Trellis 上下文（唯一注入路径）",
+    "agent-kinds": "把下面选中的 kind 注册成真 agent，并拦截关闭/超限的派单",
+    "lane-worktree": "lane 账目、/Coworkflow:lanes 与任务出口检查",
+    capacity: "本项目并发上限的第二道门（比 kind 上限更粗）",
+    panel: "本面板与 /Comodels（控制面，工作流关闭时也在）",
+  };
   for (const id of control.moduleIds()) {
     const on = switches[id] === true;
     rows.push({
+      section: "模块",
       label: id,
       value: on ? "on" : "off",
-      detail: on ? "" : "关闭时该层不生效",
+      detail: on ? (about[id] ?? "") : `已关闭：${about[id] ?? "该层不生效"}`,
       act: () => control.setSwitch(id, !on),
     });
   }
 
-  rows.push({ label: "会话", value: "", header: true });
+  // ── 会话 ────────────────────────────────────────────────────────────────
   const auto = control.autoEnable();
   rows.push({
+    section: "会话",
     label: "新会话自动加载",
     value: auto ? "on" : "off",
-    detail: auto ? "新会话直接加载 Coworkflow" : `新会话需 /Coworkflow:start`,
+    detail: auto ? "新会话直接加载 Coworkflow" : "新会话需 /Coworkflow:start",
     act: () => control.setAutoEnable(!auto),
   });
   rows.push({
+    section: "会话",
     label: "worktree 前缀",
     value: control.prefix(),
     detail: "任务 worktree 的目录名（../<前缀><任务>）",
     act: () => editPrefix(control, commandCtx),
   });
 
-  // pi-subagents' capacity keys live in its own user-level config file with no
-  // project override, so the project's number is Coworkflow's own setting and is
-  // enforced by the `capacity` module.
-  rows.push({ label: "子 agent 并发", value: "", header: true });
+  // ── 子 agent ────────────────────────────────────────────────────────────
+  // The project ceiling and the per-kind ceilings are one decision seen at two
+  // grains, so they share a tab instead of living three sections apart.
   const limit = control.subagentConcurrency();
   rows.push({
+    section: "子 agent",
     label: "本项目并发上限",
     value: limit === null ? "不限" : String(limit),
-    detail: "同一会话同时活跃的顶层 async run；留空 = 不限（本项目；由 Coworkflow 拦截）",
+    detail: "同一会话同时活跃的顶层 async run；留空 = 不限（由 Coworkflow 拦截）",
     act: () => editProjectLimit(control, commandCtx, limit),
   });
 
-  // Per-kind policy. One row per kind, because the two facts a kind has — is it
-  // usable at all, and how many of it may run — belong to the same decision and a
-  // user changing one is usually looking at the other.
-  rows.push({ label: "子 agent 类型", value: "", header: true });
   const kinds = control.agentKinds();
   const status = control.agentKindStatus();
-  // The layer's own switch, read from the same place the module row above reads it.
-  // The row must not have to infer "is the gate running" from the absence of report
-  // lines: with the module off at load the report is empty, and the row then claimed
-  // "enabled, see the status line below" with no line below and no gate at all.
-  const layerOn = control.switches()["agent-kinds"] !== false;
+  // The layer's own switch, read from the same place the 模块 tab reads it: the row
+  // must not infer "is the gate running" from the absence of report lines, because
+  // with the module off at load the report is empty.
+  const layerOn = switches["agent-kinds"] !== false;
   for (const entry of kinds) {
-    // What this kind's availability actually is, from the module's own report —
-    // never from the project's enablement, which says nothing about the agent list.
     const registered = status.some((line) => line.includes(entry.agent) && line.includes("已注册"));
     const failed = status.some((line) => line.includes(`${entry.kind} 注册失败`));
-    const layerOff = !layerOn || status.some((line) => line.includes("未激活 agent-kinds") || line.includes("本会话未加载或已关闭"));
+    const layerOff =
+      !layerOn || status.some((line) => line.includes("未激活 agent-kinds") || line.includes("本会话未加载或已关闭"));
     rows.push({
+      section: "子 agent",
       label: `${entry.label} ${entry.agent}`,
-      value: `${entry.enabled ? "[x]" : "[ ]"} 开 · 上限 ${entry.maxConcurrent}`,
+      value: `${entry.enabled ? "[x] 开" : "[ ] 关"} · 上限 ${entry.maxConcurrent}`,
       detail: !entry.enabled
         ? "关闭时该 kind 的派单会被拒绝，其他 agent 不受影响"
         : layerOff
           ? layerOn
-            // On in the project but not loaded in this session: the fix is `/Coworkflow:start`,
-            // and pointing at the module switch would send the user to a switch that is already on.
-            ? "agent-kinds 在本项目已开启，但本会话还没加载它：kind 不注册，也不拦截派单（用 /Coworkflow:start）"
-            : "agent-kinds 本层未启用：kind 不注册，也不拦截派单（在上面的模块开关里打开）"
+            // On in the project but not loaded in this session: pointing at the module
+            // switch would send the user to a switch that is already on.
+            ? "本项目已开启 agent-kinds，本会话还没加载：kind 不注册、不拦截（用 /Coworkflow:start）"
+            : "agent-kinds 本层未启用：kind 不注册、不拦截（在 模块 tab 打开）"
           : registered
             ? "已注册到 pi-subagents"
             : failed
-              ? "注册失败（原因见下方状态行）"
-              : "已启用；注册状态见下方状态行",
+              ? "注册失败（原因见 状态 tab）"
+              : "已启用；注册状态见 状态 tab",
       toggle: () => control.setAgentKind(entry.kind, { enabled: !entry.enabled }),
       act: () => editKindLimit(control, commandCtx, entry.kind, entry.maxConcurrent),
     });
   }
   if (kinds.length === 0) {
-    rows.push({ label: "（本构建没有内置 kind）", value: "", readOnly: true });
-  }
-  // The module's own lines, verbatim, on the read-only tab: a kind that did not
-  // register must never be shown as available, and the reason is the only
-  // actionable thing here. The leading status glyph is kept in the label rather
-  // than rendered as a value, because these are sentences, not settings.
-  rows.push({ label: "状态", value: "", header: true });
-  for (const line of status) {
-    rows.push({ label: line.trim(), value: "", readOnly: true });
+    rows.push({ section: "子 agent", label: "（本构建没有内置 kind）", value: "", readOnly: true });
   }
 
-  rows.push({ label: "维护", value: "", header: true });
+  // ── 维护 ────────────────────────────────────────────────────────────────
   rows.push({
+    section: "维护",
     label: "重新初始化",
     value: "运行",
-    detail: "= /Coworkflow:init（刷新受管区与钩子，不重写 Trellis 记录）",
+    detail: "/Coworkflow:init：刷新受管区与钩子，不重写 Trellis 记录",
     act: () => control.init(""),
   });
   rows.push({
+    section: "维护",
     label: "Trellis 范式对齐",
     value: "trellis update -s",
     detail: "升级未被本地改动的 Trellis 文件，保留本地改动与所有任务记录",
     act: () => control.init("--trellis-update"),
   });
 
-  rows.push({ label: "状态", value: "", header: true });
+  // ── 状态 ────────────────────────────────────────────────────────────────
   const trusted = commandCtx?.isProjectTrusted?.();
   if (trusted !== undefined) {
     rows.push({
+      section: "状态",
       label: "项目信任",
       value: trusted ? "已受信任" : "未受信任",
       detail: trusted ? "" : ".pi/ 下的扩展与 agent 不会被加载：角色派单会失败",
@@ -556,15 +591,28 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
   for (const fact of control.facts()) {
     const [label, ...rest] = fact.split(": ");
     rows.push({
+      section: "状态",
       label: label ?? fact,
       value: rest.join(": ") || "",
       readOnly: true,
       ...(initialized ? {} : { detail: "本项目未初始化：先 /Coworkflow:init" }),
     });
   }
+  // The modules' own lines come last, verbatim, as prose. A kind that did not
+  // register must never be shown as available, and the reason is a sentence — putting
+  // it in a narrow cell truncated exactly the part that explains the failure.
+  for (const line of status) {
+    rows.push({ section: "状态", label: "", value: line.trim(), readOnly: true, prose: true });
+  }
   return rows;
 }
 
+/**
+ * Register `/Coworkflow:settings`. Always available: it is how a project gets
+ * configured, and it offers to initialize a project that has not been adopted
+ * yet.
+ */
+/** Ask for a number; empty clears it. Used for the project concurrency limit. */
 /**
  * Register `/Coworkflow:settings`. Always available: it is how a project gets
  * configured, and it offers to initialize a project that has not been adopted
@@ -577,7 +625,7 @@ export function registerSettingsPanel(host: PiRuntimeHost, runtime: RuntimeConte
   settingsPanelRegistered.set(host, registration);
   host.registerCommand?.(`Coworkflow:settings`, {
     description:
-      "Coworkflow 设置面板：模块开关、新会话是否自动加载、worktree 前缀、Trellis 范式对齐；未初始化时可从这里初始化本项目",
+      "Coworkflow 设置面板：模块开关、会话、子 agent 类型与并发上限、维护；分页显示，未初始化时可从这里初始化本项目",
     handler: async (_args: string, commandCtx: any) => {
       const runtime = registration.runtime;
       runtime.refresh();
