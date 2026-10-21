@@ -399,8 +399,19 @@ function compactCount(value: number): string {
  * Elapsed time comes from `startedAt` at render time, so rendering stays
  * cache-only, and a token sum that does not cover every active run is labelled a
  * lower bound instead of being printed as the total.
+ *
+ * `actions` is a run-id-keyed cache of what each child was last seen doing, read
+ * from the tail of its own session log at a refresh boundary. It is deliberately a
+ * lookup, not a read: rendering never touches the filesystem, and a run without an
+ * entry says nothing rather than printing an empty action. The suffix names the
+ * source, because a tail read is not a live event stream.
  */
-export function formatRunSummary(activity: NativeActivity, fleet: FleetWindow, now: number): string[] {
+export function formatRunSummary(
+  activity: NativeActivity,
+  fleet: FleetWindow,
+  now: number,
+  actions: Map<string, string> = new Map(),
+): string[] {
   const lines: string[] = [];
   if (activity.kind === "unknown") {
     lines.push(`子 run 明细: 未知（${activity.reason}）`);
@@ -410,8 +421,10 @@ export function formatRunSummary(activity: NativeActivity, fleet: FleetWindow, n
     lines.push(`子 run 明细: ${activity.runs.length} 个${activity.omitted > 0 ? `（另有 ${activity.omitted} 个不在公开窗口内）` : ""}`);
     const shown = activity.runs.slice(0, MAX_SUMMARY_RUNS);
     for (const run of shown) {
+      const action = actions.get(run.id);
       lines.push(`  · ${run.agent ?? "未知"} [${run.state}] · ${elapsedLabel(run.startedAt, now) ?? "已运行 未知"}${
-        run.model ? ` · ${run.model}` : ""} · run ${run.id.slice(0, 8)}`);
+        run.model ? ` · ${run.model}` : ""} · run ${run.id.slice(0, 8)}${
+        action === undefined ? "" : ` · 正在 ${action}（读自子会话日志尾部）`}`);
     }
     if (activity.runs.length > shown.length) lines.push(`  …… 其余 ${activity.runs.length - shown.length} 个未列出`);
   }

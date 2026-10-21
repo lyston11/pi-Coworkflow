@@ -4,6 +4,7 @@ import { open } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import type { PiRuntimeHost, RuntimeContext } from "./module.ts";
 import { attachSubagents, type NativeCost } from "./subagents-client.ts";
+import { disposeChildTails, refreshChildTails } from "./child-tail.ts";
 import { sessionEnabledSince } from "./trellis.ts";
 
 export interface UsageTotals {
@@ -327,6 +328,9 @@ export function usageSnapshot(host: object, runtime: RuntimeContext): UsageSnaps
 
 export function disposeUsage(host: object): void {
   observations.delete(host);
+  // The child-tail cache is built from the same cost reply at the same boundaries,
+  // so it dies with the snapshot rather than outliving the session that read it.
+  disposeChildTails(host);
 }
 
 interface UsageContext {
@@ -370,6 +374,10 @@ export async function refreshUsage(host: PiRuntimeHost, runtime: RuntimeContext,
       const cost = await bridge.client.cost();
       if (!valid()) return;
       const history = await readChildHistory(cost);
+      if (!valid()) return;
+      // The tail read uses the same reply for attribution and the same boundaries:
+      // no timer, no render-time I/O, and a run that leaves the reply loses its entry.
+      await refreshChildTails(host, runtime, cost);
       if (!valid()) return;
       current.snapshot = { ...current.snapshot, cost,
         childEntries: history.childEntries,

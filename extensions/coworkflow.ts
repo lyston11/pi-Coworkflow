@@ -57,6 +57,7 @@ import {
 } from "../core/config.ts";
 import { sessionFlag, sessionKeys, setSessionFlag } from "../core/trellis.ts";
 import { existingSubagentsBridge, formatRunSummary } from "../core/subagents-client.ts";
+import { childTailActions } from "../core/child-tail.ts";
 import { decodeNativeCompletions, readUserConfig } from "../core/pi-subagents.ts";
 import { disposeUsage, formatNativeCost, refreshUsage, usageSnapshot } from "../core/usage.ts";
 import { nearestTrustDecision, trustFilePath, trustProject } from "../core/trust.ts";
@@ -839,10 +840,14 @@ function createControl(): WorkflowControl {
         `活跃 async run: ${activity?.kind === "known" ? activity.active : `未知（${activity?.reason ?? "尚未读取公开状态"}）`}`,
         // What a "should I interrupt this?" decision can actually be based on:
         // per-run state/agent/elapsed from the attributable snapshot, tokens from
-        // the bounded fleet window with its gaps stated, and nothing invented for
-        // what neither projection carries.
+        // the bounded fleet window with its gaps stated, what each child last wrote
+        // in its own session log, and nothing invented for what no projection
+        // carries.
         ...formatRunSummary(activity ?? { kind: "unknown", reason: "尚未读取公开状态" },
-          bridge?.fleetView() ?? { kind: "unknown", reason: "尚未读取公开 fleet 窗口" }, Date.now()),
+          bridge?.fleetView() ?? { kind: "unknown", reason: "尚未读取公开 fleet 窗口" }, Date.now(),
+          // A cache lookup, never a read: what each run last did, from the bounded
+          // tail of its own session file, refreshed at the same boundaries as usage.
+          runtimeHost ? childTailActions(runtimeHost, runtime) : new Map()),
         formatNativeCost(runtimeHost ? usageSnapshot(runtimeHost, runtime).cost : { kind: "unknown", reason: "会话未就绪" }),
       ];
     },

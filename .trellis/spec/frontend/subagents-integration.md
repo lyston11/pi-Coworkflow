@@ -1,0 +1,95 @@
+# Coworkflow × pi-subagents integration contract
+
+## Ownership and paths
+
+- Trellis owns task requirements, task identity, parent approval, and the task's verified integration worktree.
+- pi-subagents owns execution, native workflow child keys, missions, async attempts, public status/cost, session history attribution when possible, completion delivery, and upstream capacity.
+- Coworkflow owns a bounded public RPC adapter, project-scoped admission at this extension's launch boundaries, role context, module gates, and task-to-native identity/artifact links. It is not a second runner, scheduler, retry queue, or lifecycle ledger.
+- `core/subagents-client.ts` is the single RPC v1 DTO decoder for ping, activity, cost, admission, and correlated replies. `core/pi-subagents.ts` owns structured completion/result/artifact projections. Consumers use these projections; they do not reinterpret raw messages or private runner files.
+- `core/subagents-workflow.ts` registers `coworkflow.implement-review` **and** `coworkflow.fanout` in one pass and stores only verified task/native mission/run IDs, explicitly returned artifact references, and the two timestamps the overlap measurement needs. Existing `.trellis/.runtime/lanes/` pointers remain readable; new observers do not manufacture identities from prose, filenames, array order, or “only pending” assumptions.
+
+## Task validation and native workflow
+
+`/Coworkflow:run [focus]` resolves only the currently prepared Trellis task. Before a pure, I/O-free workflow resolver is called, the host verifies canonical task/main/worktree paths, `task.json`, real Git linked-worktree membership, and the recorded task branch. Main checkout aliases, unrelated repositories, ordinary directories, stale task references and branch mismatch are rejected. Resolver arguments cannot supply arbitrary paths or scripts.
+
+Required child guidance registration succeeds before the workflow becomes executable. The workflow has stable `implement` then `review` steps, fresh contexts, one verified `cwd`, `worktree: false` for both children, and no per-child async. The enclosing spawn is async. Implementation's structured completion/acceptance must be semantically valid before review; review must return a valid pass verdict with no blocking findings. Missing, malformed, negative, or contradictory verdicts fail. Native receipt/run/artifact references go to the parent. A successful workflow run is not final task acceptance, approval to merge, or publication.
+
+The task worktree is mandatory even when a workflow script could execute elsewhere. Unavailable or unsupported host validation is a hard, actionable refusal; do not silently launch through a different runner.
+
+## Independent children (`coworkflow.fanout`) and the serial-dispatch measurement
+
+Independent work runs as one fanout, not as a loop of awaits. `coworkflow.fanout` is the default way to run N independent children: `args.tasks` is 1–8 `{ kind, task }` objects with no other per-task fields (an optional `focus` carries one shared instruction), validation mirrors `resolveImplementReview` (bounded count, non-empty bounded task, unknown fields rejected, no caller-supplied paths, and `agent` specifically rejected), child keys come from the array position (`task-1`…) so two children may be the same kind doing different work, and every child runs `context: "fresh"`, `worktree: false`, with its own `acceptance` and `outputSchema` so no child's verdict can stand in for another's.
+
+A task names a **kind**, never an agent: `executor` / `auditor` / `researcher` are the same kinds `/Coworkflow:settings` exposes, resolved through `agentNameFor` in `modules/agent-kinds/defaults.ts` — one mapping, so a fanout child is exactly the agent a direct kind dispatch would run. A name this package does not ship is rejected with the available kinds listed. The resolver stays pure: the host resolves the project's kind policy in memory (`fanoutPolicyFor`, which reads `resolveKinds` plus the owner's accepted registrations) and passes it in, so a task whose kind is disabled, unregistered, or whose policy could not be read **fails as that task** with the `tool_call` gate's own wording (`disabledKindMessage` / `unregisteredKindMessage` — one vocabulary, not two) and is never started, while its siblings still run.
+
+The script starts every child before awaiting any of them (`runs.run` inside one `map`, then `Promise.all`); that concurrency is the resource's entire reason to exist and a loop of `await`s in its place would be the defect it replaces. A child's rejection becomes that task's outcome rather than cancelling its siblings: the result is `{ status: "completed" | "partial", acceptance: "parent-owned", note, results: [{ key, agent, ok, status, summary, handoff, runId, outputReference, error }] }`. Only *all* tasks failing is fail-closed. A green fanout is completed execution, never accepted work: the parent audits every child, merges, and cleans up.
+
+Both names register in the same function and flow (`registerImplementReviewWorkflow`); one session either has the pair or reports why it has neither, and the returned handle disposes both with the same replace/dispose semantics as before. No second registration path exists, and no workflow path writes a message into the conversation.
+
+Serial dispatch of independent work is a defect this layer *measures*, not one it nags about. Each recorded task↔run link stores `startedAt` (stable across later updates of the same link, which is why `recordedAt` cannot serve) and `settledAt` (written only from an observed structured native completion). `dispatchOverlap` reads one session's links and classifies: crossing intervals are parallel; a complete interval crossing nothing is serial; missing timestamps, still-running runs and backwards clocks are **unresolved** and are never folded into the serial count. `/Coworkflow:status` renders it as one stored line (`派单重叠: 3 次并行、5 次串行（本次会话）`), read at render time, never as a message. `/Coworkflow:lanes` may reuse the same measurement.
+
+The conversation-injected reminder this replaces was removed and must not return: a custom message reaches the model as a **user turn**, so it disrupts and rewrites the very work it describes.
+
+## Public capability floor and failure handling
+
+Use documented `subagents:rpc:v1` with UUID-correlated requests for `ping`, `status`, `spawn`, and `cost`; verify protocol version, advertised method and capability shape, and versioned fleet/status projections. Session-local async completion events provide attribution when supported. Workflow-resource and required-child-extension registration use only their documented package exports, without loading the package main runtime or installing another copy. Capability floor is detected from live public advertisements and exported API availability, not inferred from semver alone.
+
+The control methods `stop`, `steer` and `interrupt` are optional per call rather than part of this floor: each is checked against the live advertisement before use and degrades to an explicit refusal, never to a silent no-op.
+
+RPC waits are bounded and clean reply listeners on completion, failure, timeout, shutdown and session replacement. A spawn timeout can be ambiguous after emission; keep its `rpc-spawn-<requestId>` recovery alias and never reissue the spawn. Do not enable retries, goal mode, watchdogs, reminders, or automatic recovery scheduling. Missing or malformed observations are unknown/incomplete, not a successful zero. Do not scan private temp directories or run artifact names to reconstruct state.
+
+## Cost/history semantics
+
+A valid public `cost` v1 reply supplies parent, per-child totals, aggregate totals, and `unresolvedAsyncChildren`; unresolved child counts make the aggregate a lower bound. The native total is session-scoped and may be shown as a separate panel/settings fact, not attributed to an individual model or day.
+
+For the existing model/day chart, preserve parent Pi session entries, local-day windows, provider/model matching, and the enable-time cutoff. Read child model/day records only from exact absolute `children[].sessionFile` references supplied by native cost. Validate the referenced JSONL records' model, timestamp and usage; never infer dates from file mtimes or infer model attribution from native aggregates. Reads are bounded (128 unique session paths, 8 MiB per file, 32 MiB total). Missing pointers, malformed/partial entries, read errors, unsupported cost and unresolved async children preserve any known lower bound and explicitly mark the display incomplete/unavailable; never render missing data as a complete zero.
+
+Refresh only at session start, `agent_settled`, structured native completion, and panel-open boundaries. Render, selection changes and key input are cache-only; no timers, polling, render-time RPC or filesystem scans. Observations are tied to host/runtime/session/epoch. Disable, shutdown, reload and replacement invalidate state, and stale in-flight results cannot publish into a later session.
+
+## Interrupting a run (`stop` / `steer` / `interrupt`)
+
+The main session must be able to interrupt a child it started, at will, through the owner's public control methods — never by signalling a process or reading runner files. `core/subagents-client.ts` wraps `stop`, `steer` and `interrupt` next to `status`/`cost`, under the same rules: the method is checked against `ping.methods` first and an unadvertised method is refused with a plain reason and **no request emitted**; a malformed reply is a `protocol` failure, not a success; the owner's own error `code` and `message` are preserved.
+
+`stop`'s semantics are modelled honestly in its return type. A successful reply is an acceptance receipt (`{ accepted: true, state: "stopping" }`), never evidence that the run terminated; the type and its doc comment say termination needs a subsequent `status` read plus process-terminal evidence. A failed stop is not reported as a timeout that implies the run died, and it carries no `ambiguous` recovery alias — the spawn retry discipline does not apply. `steer` carries instructions as data in `params.message`; no shell, code or interpolation is involved, and `deliveryStatus: "queued"` is a successful acknowledgement reported as queued rather than delivered.
+
+Every report prints the two facts separately: what was acknowledged, then what a single follow-up public `status` read says. An accepted stop whose run is still `running`/`queued`/`stopping` says the stop has not taken effect; a run no longer listed says termination is still unproven. No command prints "已停止" for an accepted request. `/Coworkflow:lanes stop <runId>` accepts only a run id recorded for the current task in `.trellis/.runtime/native-runs.json` (and rejects a link belonging to another session before emitting); the rest of `/Coworkflow:lanes` stays read-only. When the installed owner advertises no `stop`/`steer`, the command says exactly that and sends nothing.
+
+## Observability before a stop
+
+A stop is only as good as the decision to issue it, so the parent's view before deciding is part of the contract, and so is its ceiling.
+
+Attributable per run, from `status` v1 `asyncSnapshot.runs[]` (whose `id` is a real run id): state, agent, model, `startedAt`. Elapsed time is derived from `startedAt` at render time with a caller-supplied clock — no timer, no polling, no render-time RPC or filesystem scan. The goal of a dispatch is shown only from this package's own dispatch record (the task text observed at `tool_call`, with the `Active task:` routing line dropped, flattened to one line, and truncated with a visible ellipsis); it is never presented as the runner's `goal`.
+
+Fleet-level token totals come from the bounded public fleet window. That window reports `omitted`, and a row may carry no usage or the reply may be cut at the owner's byte limit; in each case the sum is a lower bound and must be labelled incomplete with the specific reason. A window that cannot be read is unknown, never a complete zero.
+
+The fleet DTO's `key` is an opaque display key and the DTO exposes no run, async or tool id. Fleet data therefore enriches display only: no code path joins a fleet key to a run id, and none may start doing so — that join does not exist upstream, and inventing it would attribute one run's work to another.
+
+Live per-tool narration is unavailable: `currentAction`-style detail exists only in the external-runs display API, not in RPC `status`, and `pi.events` is process-local and does not cross into child processes. That gap is documented as a gap; it is not simulated from partial data.
+
+## Project capacity scope
+
+The configured Coworkflow project ceiling remains an additive compatibility policy because upstream does not document a project override. At direct `subagent` async tool and Coworkflow-owned RPC spawn boundaries, admission uses the public native top-level async counter plus local pending launches, after exact public alias correlation. Unknown count with an active configured limit refuses to launch instead of counting unknown as zero. Management operations and foreground non-async calls do not reserve an async slot; upstream remains the owner of workflow child fanout and its own runner limits.
+
+This boundary cannot govern other extensions' RPC calls, other processes, or all launchers. It is not global capacity authority. Release reservations only on proven no-launch/terminal completion or validated native reconciliation; ambiguous emissions remain reserved until reconciled or session end. No TTL, retry or private filesystem scan invents a terminal state.
+
+## Agent kinds (typed subagent families)
+
+A kind is a named agent definition plus two project policies (enabled, max concurrent). It is a *registration and gating* concern, never a new execution path: nothing in this package spawns, schedules, retries, or keeps a per-kind ledger.
+
+Registration uses only the installed owner's documented runtime-agent contract — its public `./agents` export and the process-local `pi-subagents:runtime-agent-register:v1` event. The event is used rather than a direct `registerRuntimeAgent` call because a direct call writes into the owner's registry whether or not any owner is loaded in this process; this package would then report a kind as available while nothing merges it into an agent list. No listener therefore means "pi-subagents is not loaded", which is a fact to report, not a registration to keep. Names are namespace-prefixed (`cw-<kind>`) so they cannot collide with the owner's builtin table or a project agent; a collision is that kind's failure and is reported as such, never retried under another name.
+
+The per-kind gate is a `tool_call` boundary in the parent session only (a child neither registers agents into its own subtree nor polices its own dispatches). It reads the project policy from disk at call time, so a change in `/Coworkflow:settings` governs the next dispatch with no reload, and it never kills a run already admitted. Occupancy comes from the public fleet projection (`status` v1 `fleet.entries[].agent`) through `core/subagents-client.ts`; there is no local mirror of running work. A missing `fleetStatus` capability, an undecodable fleet DTO, an overflowing bounded window, or a reply that lands after the session moved all **refuse** — unknown is not zero, and a limit that cannot be counted must not admit. Dispatches of any other agent (builtins, `trellis-*`, another extension's) return before a single public read.
+
+The project-wide `subagentConcurrency` ceiling remains a second, coarser gate; both must admit and neither replaces the other. `maxConcurrent` is this package's policy, never a claim about the owner's own limits: its `concurrency`/`maxTasks` are not read, mutated, or presented as ours.
+
+Kind→role mapping lives in one table (`modules/agent-kinds/defaults.ts`): `executor → implement`, `auditor → check`. `subagent-context` resolves a kind's agent name through that same table, so a child launched as `cw-executor` receives the existing role injection path — a second injection path keyed on kind is not permitted. The fixed `coworkflow.implement-review` workflow follows the configured kinds (only when a kind is enabled *and* present in the owner's agent list) and otherwise keeps its built-in pair. Lane records store the kind observed on the dispatch itself, for `/Coworkflow:lanes` grouping; a non-kind dispatch stores no kind rather than a guessed one.
+
+Deployment honesty is a gate requirement, not a diagnostic: when the contract is unavailable, nothing is registered, `runtimeStatus` and the settings panel state the exact reason, and a dispatch of a declared kind is refused. A kind is never reported as available on the strength of the project's own enablement.
+
+## Human authority and UI compatibility
+
+Parent/human acceptance and integration remain authoritative. Coworkflow can report a workflow verdict and offer evidence; it never accepts/merges/publishes automatically. Failure is reported; re-dispatch/resume are explicit decisions.
+
+The model panel retains its existing three columns and all supported thinking levels. Tab still switches the session/child tab; Left/Right still switches model/thinking columns. Usage uncertainty is textual within existing areas; this contract does not authorize layout redesign.
+
+The settings panel's existing row builders and key conventions are extended, not replaced: rows gain optional `toggle` (Space) and `adjust` (Left/Right) actions, and every row that declares neither keeps Enter-only behaviour. Per-kind rows sit beside the existing project concurrency row; the global limit and the per-kind limits remain visibly distinct settings.
