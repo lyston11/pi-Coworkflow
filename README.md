@@ -167,6 +167,29 @@ worktree；pi-subagents 负责执行、mission、稳定 child key、原生验收
 
 **流程完成不代表最终验收、合并或发布。**
 
+## 拆分：先定契约，再并行
+
+多段工作时默认并行，串行要给理由。顺序是：
+
+```
+1. 先定接口契约 —— 函数签名 / payload 形状 / 端点 / 状态字段
+2. 各段在各自 worktree 里并行实现（coworkflow.fanout + worktrees: true）
+3. 主会话按序 git apply --3way 集成，再派独立审阅
+```
+
+```js
+subagent({ workflow: "coworkflow.fanout", args: {
+  tasks: [
+    { kind: "executor", task: "按 docs/contract.md 实现后端状态与审核 API" },
+    { kind: "executor", task: "按 docs/contract.md 改 Dashboard（先按契约桩实现）" },
+  ],
+  focus: "契约见 docs/contract.md；两边都按它写，不要等对方",
+  worktrees: true,
+}})
+```
+
+`worktrees: true` 给每个 lane 自己的独立 worktree —— **「共用一个 worktree，不能同时写」是配置问题，不是依赖问题**。真正必须串行的只有一种：后一步要看到前一步**已实现的行为**才能定下自己的接口；那说明契约还没定。
+
 ## 中断一个 run
 
 主会话必须能随时打断自己派出去的 run，三个命令都走 pi-subagents 的公开 RPC：

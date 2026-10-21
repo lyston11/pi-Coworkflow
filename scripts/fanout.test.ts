@@ -601,3 +601,40 @@ test("gate: a fanout dispatch is admitted without a task, while implement-review
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/**
+ * Parallel writers need one worktree each — that is the whole reason a split like
+ * "backend → dashboard" gets serialised: both touch the same tree, so they cannot run at
+ * the same time. `worktrees: true` removes that constraint instead of asking the caller to
+ * remember a launch flag.
+ */
+test("fanout: worktrees gives every lane its own tree and drops the shared cwd", async () => {
+  const script = (worktrees: boolean): string => {
+    const expanded = resolveFanout(
+      { tasks: [{ kind: "executor", task: "a" }, { kind: "executor", task: "b" }], ...(worktrees ? { worktrees } : {}) },
+      { taskRef: ".trellis/tasks/10-20-demo", worktree: TWD, mainCheckout: "/tmp/main" },
+      allKindsDispatchable() as any,
+    );
+    if ("error" in expanded) throw new Error(expanded.error);
+    return expanded.script;
+  };
+
+  const shared = script(false);
+  assert.match(shared, /const WORKTREES = false;/);
+  assert.match(shared, /worktree: WORKTREES === true,/);
+
+  const parallel = script(true);
+  assert.match(parallel, /const WORKTREES = true;/);
+  // No shared directory to point at: each lane gets its own from a clean HEAD, so the
+  // script has no cwd to hand out at all.
+  assert.match(parallel, /const cwd = null;/, "a shared cwd is exactly what would serialise them");
+  assert.doesNotMatch(shared, /const cwd = null;/, "the shared-tree case still points at the task worktree");
+
+  // The flag is validated like every other argument.
+  const bad = resolveFanout(
+    { tasks: [{ kind: "executor", task: "a" }], worktrees: "yes" },
+    { taskRef: ".trellis/tasks/10-20-demo", worktree: TWD, mainCheckout: "/tmp/main" },
+    allKindsDispatchable() as any,
+  );
+  assert.ok("error" in bad && /worktrees must be a boolean/.test(bad.error), JSON.stringify(bad));
+});

@@ -22,7 +22,10 @@
 - 在自己的分支上只允许 commit；禁止 `reset --hard`、`rebase`、`push -f`、切换到非本任务的分支。需要 main 新代码时 `git fetch` 后把 `origin/main` merge 进自己分支。
 - 任何 agent 不得改写 main 或他人分支的历史；历史整理只由人在专门时机做。
 - `task.py` 生命周期命令（current / finish / archive 等）在启动任务的主检出里执行；代码改动和提交都在任务 worktree 里。任务确实不需要隔离时（如纯文档小改），完成后用 `git worktree remove ../{{worktreePrefix}}<任务目录名>` 清理。
-- 只有文件/模块不相交的任务才并行；共享同一批文件、migration 序号、数据库或端口的任务一律串行。
+- **默认并行，串行要给出理由。** 拆分多段工作时的顺序是：先定**接口契约**（函数签名、payload 形状、端点、状态字段），再让各段在**各自 worktree**里并行实现，最后由主会话集成后独立审阅。
+- **「共用一个 worktree，不能同时写」不是串行的理由** —— 那是配置问题不是依赖问题：`coworkflow.fanout` 传 `worktrees: true`，每个 lane 拿自己的独立 worktree，产出 patch 由主会话按顺序 `git apply --3way` 集成。
+- 真正必须串行的只有一种：后一步**必须看到前一步已实现的行为**才能定下自己的接口——那就说明契约还没定，先定契约，再并行。
+- 其余共享同一批**具体行**（同一文件同一段）、migration 序号、数据库或端口的，按契约切分后仍并行；切不开才串行，并在交付说明里写清为什么。
 - 小步提交并尽早 push（或本地 `git branch backup/<任务>` 钉住）；远端是抗本机历史重写的唯一兜底。
 - 发现提交被抹掉时：先停掉所有并行 agent，从 `git reflog` 定位丢失提交，用 `git branch rescue/<名> <sha>` 钉住，核对后 cherry-pick 或取回文件。
 - 分支合并回 main 由人（或单一串行集成通道）执行，集成时检查 migration 序号冲突。
@@ -77,6 +80,6 @@
 - 子会话**不继承**主会话上下文：派单时显式写 `context: "fresh"`（三个 Trellis 角色 agent 也已声明 `defaultContext: fresh`；若你全局配了 `defaultSubagentContext: "fork"`，它会被覆盖，必须显式 `fresh`）。它拿到的 Trellis 上下文由 `pi-Coworkflow` 的 `subagent-context` 模块按角色注入：`trellis-implement` / `trellis-check` / `trellis-research` 分别得到 `implement.jsonl` / `check.jsonl` / spec 目录树，加上 prd.md、design.md、implement.md；字节预算沿用 `.trellis/config.yaml` 的 `context_injection`。 **注入按角色，不按 agent 名**：任何 agent 只要标记成这三个角色之一，就拿到对应那一份；`worker` / `researcher` / `reviewer` 等其它 agent 拿到的是子 agent 约定（不含角色上下文），不是什么都不给。
 - 因此派单提示词**首行必须是 `Active task: <任务目录>`**（Trellis 既有的派单协议）——注入靠它定位任务。角色按两级识别：① **会话名**里的 `trellis-<role>`（`subagent-<agent>-<runId>-<i>` 或 `<agent>: <task>` 都含 agent 名）；② agent 定义或派单提示词里的 `<!-- trellis-agent: <role> -->` 标记。所以想让任意 agent（例如 `worker`）拿到 implement 那份上下文，就在它的定义里加一行 `<!-- trellis-agent: implement -->`，不必把它改名成 `trellis-implement`。
 - 并行派单不要猜 API：`subagent({ workflow: "parallel", args: { tasks: [...] } })` 的每个 task **只接受 `agent` 和 `task`**（带 `output` 会被拒）；多步/带产出的 workflow 必须把 JS 脚本写成文件再用 `workflow: "<路径>"`，`workflow: true` 只在同一回复里写了 ```js 代码块时有效。先 `subagent({ action: "validate", workflow: "<路径>" })` 再 `async: true` 派发。
-- 只派可独立验证的边界工作，且文件/模块不相交才并行（同上一节）。共享文件、migration 序号、数据库或端口的任务一律串行。
-- 需要并行写代码的 lane 用 `worktree: true`（pi-subagents 托管 worktree，从干净 HEAD 分配，要求主检出处干净）。产出是每个 lane 的 patch + handoff manifest，**不会**自动应用。
+- 多段工作优先用 `coworkflow.fanout` 一次派出（内部并发），而不是逐个 `await`；写代码的 lane 传 `worktrees: true`。只派单件时才用单次 `subagent`。
+- 并行写代码的 lane 用 `worktree: true`（`coworkflow.fanout` 里是 `worktrees: true`）。pi-subagents 托管 worktree、从干净 HEAD 分配（要求主检出干净），产出每个 lane 的 patch + handoff manifest，**不会**自动应用。
 - 合并只由主会话做：`/Coworkflow:lanes` 看 lane 状态、patch 路径与合并计划 → `git apply --3way <patch>` 进主会话自己的 worktree → 审计并跑受影响范围的最小充分检查 → commit → `lane.recordMerge` 记录合并证据 → `worktree.cleanup` 清理（需授权）。子 agent 不合并、不 push。

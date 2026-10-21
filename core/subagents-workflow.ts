@@ -150,11 +150,15 @@ export function resolveFanout(
   prepared?: PreparedWorkflowContext | null,
   policy?: FanoutPolicy | null,
 ): Expansion {
-  const allowed = new Set(["tasks", "focus"]);
+  const allowed = new Set(["tasks", "focus", "worktrees"]);
   const unsupported = Object.keys(args).filter((key) => !allowed.has(key));
   if (unsupported.length) return { error: `workflow '${FANOUT_NAME}' args contain unsupported fields: ${unsupported.join(", ")}.` };
   const focus = args.focus === undefined ? undefined : str(args.focus);
   if (args.focus !== undefined && (!focus || focus.length > MAX_FOCUS)) return { error: `args.focus must contain 1–${MAX_FOCUS} characters.` };
+  // Parallel lanes that write code need one worktree each; sharing the task worktree is
+  // the reason a split like "backend → dashboard" gets serialised in the first place.
+  const worktrees = args.worktrees === undefined ? false : args.worktrees;
+  if (typeof worktrees !== "boolean") return { error: "args.worktrees must be a boolean." };
   if (!Array.isArray(args.tasks)) return { error: `args.tasks must be an array of 1–${MAX_FANOUT_TASKS} { kind, task } objects.` };
   if (args.tasks.length < 1 || args.tasks.length > MAX_FANOUT_TASKS) {
     return { error: `args.tasks must contain 1–${MAX_FANOUT_TASKS} tasks (received ${args.tasks.length}).` };
@@ -183,8 +187,16 @@ export function resolveFanout(
       refusal: shipped.dispatchable ? null : (shipped.refusal ?? defaultRefusal(policy, shipped)),
     });
   }
-  return { script: buildFanoutScript({ children,
-    ...(focus ? { focus } : {}), ...(prepared?.worktree ? { cwd: prepared.worktree } : {}) }) };
+  return {
+    script: buildFanoutScript({
+      children,
+      ...(focus ? { focus } : {}),
+      // With per-lane worktrees there is no shared directory to point at: upstream
+      // allocates each lane its own from a clean HEAD.
+      ...(!worktrees && prepared?.worktree ? { cwd: prepared.worktree } : {}),
+      ...(worktrees ? { worktrees: true } : {}),
+    }),
+  };
 }
 
 /** The policy entry for a kind this package ships, or `null` for any other name. */
@@ -293,6 +305,8 @@ interface FanoutScriptInput {
   children: PlannedChild[];
   focus?: string;
   cwd?: string;
+  /** Each lane gets its own upstream-managed worktree instead of sharing one. */
+  worktrees?: boolean;
 }
 
 /**
@@ -308,6 +322,7 @@ function buildFanoutScript(input: FanoutScriptInput): string {
   return `
 const tasks = ${JSON.stringify(input.children)};
 const cwd = ${JSON.stringify(input.cwd ?? null)};
+const WORKTREES = ${input.worktrees === true ? "true" : "false"};
 const FANOUT_SCHEMA = ${JSON.stringify(FANOUT_SCHEMA)};
 const MAX_SUMMARY = 4000;
 
@@ -355,7 +370,7 @@ function paramsFor(task) {
     label: task.key + " " + task.agent,
     agent: task.agent,
     task: task.task + ${JSON.stringify(focus)},
-    worktree: false,
+    worktree: WORKTREES === true,
     context: "fresh",
     acceptance: {
       level: "checked",
@@ -365,7 +380,7 @@ function paramsFor(task) {
     },
     outputSchema: FANOUT_SCHEMA
   };
-  if (cwd !== null) params.cwd = cwd;
+  if (cwd !== null && WORKTREES !== true) params.cwd = cwd;
   return params;
 }
 
