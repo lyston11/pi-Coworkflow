@@ -952,3 +952,42 @@ test("registration: a configured agent with a kind's name fails that kind only, 
     rmSync(project, { recursive: true, force: true });
   }
 });
+
+/**
+ * The operator's own example: three executors and one auditor at the same time,
+ * with each kind's ceiling counted separately.
+ *
+ * A single project-wide number cannot express this, and a shared counter would make
+ * one kind's work consume another kind's budget — which is exactly the distinction
+ * the kinds exist for.
+ */
+test("gate: three executors and one auditor run together, each kind counted on its own", { skip }, async () => {
+  const h = gateHarness({ kinds: { executor: { enabled: true, maxConcurrent: 3 }, auditor: { enabled: true, maxConcurrent: 1 } } });
+  try {
+    await syncAgentKinds(h.host, h.runtime);
+
+    // Three executors occupy executor, and leave auditor untouched.
+    h.live.push("cw-executor", "cw-executor", "cw-executor");
+    const fourthExecutor = await h.call({ agent: "cw-executor", task: "4th" });
+    assert.ok(fourthExecutor, "a 4th executor is refused at a ceiling of 3");
+    assert.match(fourthExecutor.reason ?? "", /并发上限是 3/);
+    assert.match(fourthExecutor.reason ?? "", /当前已有 3 个在运行/);
+
+    // The auditor's single slot is free even though three executors are running.
+    assert.equal(await h.call({ agent: "cw-auditor", task: "audit" }), undefined,
+      "another kind's occupancy is not this kind's occupancy");
+
+    // And it is one: the second auditor is refused while the executors keep their own count.
+    h.live.push("cw-auditor");
+    const secondAuditor = await h.call({ agent: "cw-auditor", task: "audit 2" });
+    assert.ok(secondAuditor, "a 2nd auditor is refused at a ceiling of 1");
+    assert.match(secondAuditor.reason ?? "", /并发上限是 1/);
+
+    // At capacity, another executor is still judged on executors only.
+    const fifthExecutor = await h.call({ agent: "cw-executor", task: "5th" });
+    assert.ok(fifthExecutor);
+    assert.doesNotMatch(fifthExecutor.reason ?? "", /auditor/, "the refusal does not blame another kind");
+  } finally {
+    h.close();
+  }
+});
