@@ -424,19 +424,38 @@ export function registerSettingsPanel(host: PiRuntimeHost, runtime: RuntimeConte
       const runtime = registration.runtime;
       runtime.refresh();
       const epoch = runtime.sessionEpoch;
-      await refreshUsage(host, runtime, commandCtx);
+      // One refresh at panel-open, bounded. Each public RPC has a 10 s timeout, so
+      // awaiting them unbounded made the command take ~20 s to open in a session
+      // whose event bus exists but whose owner never answers — for facts that are
+      // supplementary to the settings it was opened for. Rendering itself stays
+      // cache-only; what is not back in time is labelled as not yet refreshed
+      // rather than shown as if it were current.
+      const openBudgetMs = 1500;
+      let staleNote: string | null = null;
+      const pending: Promise<unknown>[] = [refreshUsage(host, runtime, commandCtx)];
       if (runtime.enabled) {
         // The facts block shows a bounded per-run summary, and the fleet window is
-        // the only public source of per-run tokens. One read at panel-open, like
-        // every other refresh boundary: rendering itself stays cache-only.
+        // the only public source of per-run tokens.
         const bridge = existingSubagentsBridge(host);
-        await bridge?.observe();
-        await bridge?.fleet();
+        pending.push(bridge?.observe() ?? Promise.resolve(), bridge?.fleet() ?? Promise.resolve());
       }
       // The kind section reports whether each kind is really in the owner's agent
-      // list, and that answer arrives from a pass that awaits an import. Awaiting
-      // it here is the difference between "registered" and "not loaded yet".
-      await runtime.control.settleAgentKinds();
+      // list, and that answer arrives from a pass that awaits an import.
+      pending.push(runtime.control.settleAgentKinds());
+      const settledInTime = await Promise.race([
+        Promise.allSettled(pending).then(() => true),
+        new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(false), openBudgetMs);
+          (timer as { unref?: () => void }).unref?.();
+        }),
+      ]);
+      if (!settledInTime) {
+        // The reads keep running and land in the cache the panel renders from on the
+        // next open; saying so is the difference between stale and wrong.
+        staleNote = "公开状态与用量尚未刷新完成（上游未在 1.5 秒内回复），下面的数字可能不是最新的";
+      } else {
+        staleNote = null;
+      }
       if (epoch !== runtime.sessionEpoch || registration.runtime !== runtime) return;
       const control = runtime.control;
       const say = (text: string): void => {
@@ -477,7 +496,12 @@ export function registerSettingsPanel(host: PiRuntimeHost, runtime: RuntimeConte
         (tui: any, theme: PanelTheme, keybindings: PanelKeybindings, done: (value: unknown) => void) => {
           const panel: SettingsPanel = new SettingsPanel(
             {
-              rows: () => buildSettingRows(control, commandCtx),
+              rows: () => [
+                // Said once, at the top, so a number further down is never read as
+                // fresher than it is.
+                ...(staleNote === null ? [] : [{ label: `! ${staleNote}`, value: "", readOnly: true }]),
+                ...buildSettingRows(control, commandCtx),
+              ],
               close: () => done(undefined),
               changed: (status: string) => panel.reload(status),
             },
