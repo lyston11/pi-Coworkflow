@@ -11,7 +11,7 @@ import { resolveChildTask } from "../subagent-context/index.ts";
 import { builtinKind, kindOf } from "../agent-kinds/defaults.ts";
 import { planRun } from "../subagents/index.ts";
 import { requestStop } from "../subagents/run-control.ts";
-import { attachSubagents } from "../../core/subagents-client.ts";
+import { attachSubagents, elapsedLabel } from "../../core/subagents-client.ts";
 import { readRunLink, readTaskLinks, recordLaunchLink, type NativeRunLink } from "../../core/subagents-workflow.ts";
 
 const NS = "Coworkflow";
@@ -24,7 +24,18 @@ const MAX_DISPLAY = 20;
  * afterwards from a session name or `results[]` would be a guess about which of
  * several children was ours.
  */
-interface Target { root: string; taskRef: string; sessionId?: string; kind?: string }
+interface Target { root: string; taskRef: string; sessionId?: string; kind?: string; agent?: string; goal?: string }
+
+/** How much of a dispatch's own task text is kept as its recorded goal. */
+const MAX_GOAL = 120;
+/** A goal long enough to crowd a lane line is cut with a visible ellipsis. */
+function goalText(task: string): string | undefined {
+  // One line, because a lane line is one line: the task text of a real dispatch is
+  // multi-line prose, and pasting it whole would bury every other run.
+  const flat = task.replace(/\s+/g, " ").trim();
+  if (!flat) return undefined;
+  return flat.length > MAX_GOAL ? `${flat.slice(0, MAX_GOAL - 1)}…` : flat;
+}
 interface State {
   runtime: RuntimeContext;
   closed: boolean;
@@ -137,11 +148,18 @@ export const laneWorktreeModule: WorkflowModule = {
         // another extension's, a `cw-` name we do not ship) has no kind, which is
         // a different fact from "kind unknown" and is stored as absence.
         const kind = kindOf(typeof input.agent === "string" ? input.agent : undefined);
+        // The agent name and the goal are what *we* sent: recorded here, at the one
+        // moment the caller's own choice is observable, and never reconstructed from
+        // the runner afterwards.
+        const agent = typeof input.agent === "string" && input.agent.trim() ? input.agent.trim() : undefined;
+        const goal = goalText(task);
         current.calls.set(event.toolCallId, {
           root,
           taskRef,
           sessionId: current.runtime.sessionId ?? undefined,
           ...(kind === null ? {} : { kind }),
+          ...(agent === undefined ? {} : { agent }),
+          ...(goal === undefined ? {} : { goal }),
         });
       }
       // A blocked call from another extension may have no result. This is transient
@@ -159,6 +177,8 @@ export const laneWorktreeModule: WorkflowModule = {
       if (!result) return;
       if (target && event.isError !== true) recordLaunchLink(target.root, { taskRef: target.taskRef, sessionId: target.sessionId, runId: result.runId,
         ...(target.kind ? { kind: target.kind } : {}),
+        ...(target.agent ? { agent: target.agent } : {}),
+        ...(target.goal ? { goal: target.goal } : {}),
         ...(result.missionId ? { missionId: result.missionId } : {}),
         ...(result.handoffPath ? { handoffPath: result.handoffPath } : {}),
         ...(result.workflowReceiptPath ? { workflowReceiptPath: result.workflowReceiptPath } : {}),
@@ -256,15 +276,28 @@ export const laneWorktreeModule: WorkflowModule = {
             .join(" · ")}`);
         }
         if (readTaskLinks(root, taskRef).length > MAX_DISPLAY) lines.push(`仅显示最近 ${MAX_DISPLAY} 个 run。`);
+        const now = Date.now();
         for (const link of links) {
           const observation = state.observations.get(link.runId);
-          const nativeState = link.sessionId === runtime.sessionId && activity?.kind === "known"
-            ? activity.runs.find((run) => run.id === link.runId)?.state : undefined;
+          // Only a run id from the snapshot is attributable; the fleet window has
+          // opaque display keys and is never joined to a run here.
+          const nativeRun = link.sessionId === runtime.sessionId && activity?.kind === "known"
+            ? activity.runs.find((run) => run.id === link.runId) : undefined;
+          const nativeState = nativeRun?.state;
           // The kind is on the line itself, so a run is attributable without
           // cross-referencing anything: `[kind]` is absent for a dispatch that was
           // not one of this package's kinds, which is a fact, not a gap.
-          lines.push("", `- run ${link.runId} [${observation?.status ?? nativeState ?? "未知"}]${
+          //
+          // Agent, elapsed and goal are printed only when they are known, and each
+          // comes from a named source: the runner's own snapshot, or this package's
+          // record of what it dispatched. A field nothing can answer is absent, not
+          // `0s` and not a guess.
+          const agent = nativeRun?.agent ?? link.agent;
+          const elapsed = elapsedLabel(nativeRun?.startedAt, now);
+          lines.push("", `- run ${link.runId}${agent === undefined ? "" : ` · ${agent}${nativeRun?.agent ? "" : "（本包派单记录）"}`} [${
+            observation?.status ?? nativeState ?? "未知"}]${elapsed === undefined ? "" : ` · ${elapsed}`}${
             link.kind ? ` · kind ${kindLabel(link.kind)}` : ""}`,
+            ...(link.goal ? [`  目标（本包派单记录）: ${link.goal}`] : []),
             ...(link.missionId ? [`  mission: ${link.missionId}`] : []),
             ...(link.worktree ? [`  worktree: ${shortPath(root, link.worktree)}`] : []));
           const handoffRef = observation?.handoffPath ?? link.handoffPath;

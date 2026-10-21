@@ -35,14 +35,29 @@
 ```text
 主会话
   ├─ 规划：理解需求 → 建/更新 Trellis 任务 → 拆成可独立验证的子任务
-  ├─ 派单：subagent({ agent, async: true, context: "fresh", task: "Active task: …" })
-  │          一次可派多个（互不冲突的才并行）
+  ├─ 派单：subagent({ agent: "cw-executor" | "cw-auditor" | "cw-researcher", … })
+  │          多件互不依赖的工作：workflow "coworkflow.fanout" 一次并发派出
   ├─ 监听：完成通知 + subagent({ action: "status" })；子 agent 提问走 contact_supervisor
+  ├─ 中断：/Coworkflow:stop <runId>（停止）或 /Coworkflow:steer <runId> <说明>（追加指令）
   ├─ 审计：读 diff / 产物，对照 prd 验收条件，跑受影响范围的最小充分检查
   └─ 决策：合并、重派、调整拆分，或回头改需求
 ```
 
 主会话自己动手的唯一场合：**需要全局判断、或改动小到不值得派单**（一行修复、改个配置、回答一个问题）。除此之外，"我来写"不是理由——派出去、审回来。
+
+### 派单用 kind，不用 `trellis-*` 角色 agent
+
+本项目装了 `agent-kinds` 模块后，**子 agent 的类型就是这三个 kind**，它们与 Trellis 的三个角色一一对应，并额外带上面板可配的开关与并发限制：
+
+| kind | agent | Trellis 角色 | 默认 |
+|---|---|---|---|
+| 执行者 | `cw-executor` | implement | 开，上限 3 |
+| 审计者 | `cw-auditor` | check | 关，上限 1 |
+| 调研者 | `cw-researcher` | research | 关，上限 2 |
+
+派单写 `agent: "cw-executor"`，**不要写** `trellis-implement` / `trellis-check` / `trellis-research`：`cw-*` 拿到的是同一份角色上下文，但会经过本项目的开关与数量限制；`trellis-*` 绕开了这两道闸。
+
+面板（`/Coworkflow:settings` 的「子 agent 类型」）里关掉的 kind，派单会被拒绝并列出当前可用的 kind；超过某 kind 的上限也会被拒绝并给出当前占用。`/Coworkflow:run` 与 `coworkflow.fanout` 都会遵循同一套 kind 策略。
 
 这条界线靠判断，不靠计数：本包不再统计本会话的工具调用次数，也不会因为"改动不少"就插入提醒。反过来，分不清该不该派时按工作量估：能独立验证、输入产物验收方式都说得清的执行工作就该派出去；需要全局判断、跨模块协调、或只有一两处改动的，留在这里自己做完更快。
 
