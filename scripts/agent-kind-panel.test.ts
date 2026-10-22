@@ -373,6 +373,13 @@ interface Loaded {
    * statement about the source rather than about a hand-built fixture.
    */
   control: ReturnType<(typeof import("../extensions/coworkflow.ts"))["controlSurface"]>;
+  /**
+   * The runtime hooks the extension registered, so a test can fire one the way the host would.
+   *
+   * Hot reload is decided inside the `tool_call` gate, so proving it means firing that hook — not
+   * calling a helper the gate happens to use.
+   */
+  handlers: { toolCall(event: { toolName: string; input: unknown }): Promise<unknown> };
   close(): void;
 }
 
@@ -402,9 +409,13 @@ async function loadExtension(root: string, events: FakePi["events"]): Promise<Lo
   delete process.env.PI_SUBAGENT_CHILD;
   delete process.env.PI_SESSION_ID;
   const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();
+  const toolCallHandlers: ((event: unknown) => unknown)[] = [];
   const host = {
     events,
-    on: () => () => {},
+    on: (event: string, handler: (payload: unknown) => unknown) => {
+      if (event === "tool_call") toolCallHandlers.push(handler);
+      return () => {};
+    },
     registerCommand: (name: string, spec: { handler(args: string, ctx: unknown): Promise<void> }) => {
       commands.set(name, spec);
     },
@@ -418,7 +429,17 @@ async function loadExtension(root: string, events: FakePi["events"]): Promise<Lo
     controlSurface(): ReturnType<(typeof import("../extensions/coworkflow.ts"))["controlSurface"]>;
   };
   loaded.default(host);
-  return { commands, control: loaded.controlSurface(), close() { process.chdir(saved); } };
+  return {
+    commands,
+    control: loaded.controlSurface(),
+    handlers: {
+      /** Fire the gate the way the host does, for every registered listener. */
+      async toolCall(event) {
+        for (const handler of toolCallHandlers) await handler(event);
+      },
+    },
+    close() { process.chdir(saved); },
+  };
 }
 
 /** Open `/Comodels` and hand back the panel the command constructed. */
@@ -910,6 +931,75 @@ test("Comodels: a project-defined kind gets its own page, and removing the file 
       registryView?.listRuntimeAgentConfigs(pi).some((entry) => entry.name === "cw-builder"),
       false,
       "the agent is withdrawn with its definition",
+    );
+  } finally {
+    registryView?.clearRuntimeAgentsForPi(pi);
+    listener();
+    loaded?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Hot reload: a definition edited on disk under a live session takes effect on the next dispatch.
+ *
+ * The interesting case is an edit made by something *other* than this package — an editor, another
+ * program, the CLI in another process. Before this, the prompt in the owner's registration only
+ * caught up on `/reload`, while the gate read the new policy immediately: the two halves of one kind
+ * would disagree, and the dispatch would start a child with the old instructions.
+ */
+test("kinds: editing a definition file hot-reloads into the next dispatch, with no reload", { skip }, async () => {
+  const { pi, listener } = fakePi();
+  const root = mkdtempSync(join(tmpdir(), "coworkflow-hot-reload-"));
+  let loaded: Loaded | undefined;
+  try {
+    writeProject(root, {});
+    mkdirSync(join(root, ".pi", "Coworkflow", "agents"), { recursive: true });
+    const file = join(root, ".pi", "Coworkflow", "agents", "builder.md");
+    // `model` is the field this harness can read back off the owner's registry, so it is what proves
+    // the *registration* caught up. The prompt travels the identical path.
+    const definition = (prompt: string, model?: string): string =>
+      [
+        "---",
+        "label: 建造者",
+        "role: implement",
+        ...(model === undefined ? [] : [`model: ${model}`]),
+        "---",
+        "",
+        prompt,
+        "",
+      ].join("\n");
+    writeFileSync(file, definition("第一版提示词。"));
+    loaded = await loadExtension(root, pi.events);
+    await until(() => (registryView?.listRuntimeAgentConfigs(pi).length ?? 0) > 0, "the kinds to register");
+    assert.equal(registeredModel(pi, "cw-builder"), undefined, "it starts inheriting");
+
+    // Somebody edits the file with an editor while the session is live. No command, no reload.
+    writeFileSync(file, definition("第二版提示词，完全换掉。", "p/from-edit"));
+
+    // A kind dispatch is what reaches the gate: it compares the plan on disk with the plan the owner
+    // holds, and reconciles before deciding. Firing a non-kind tool call would return from the gate
+    // earlier and prove nothing, which is why this is a `cw-builder` dispatch.
+    await loaded.handlers.toolCall({ toolName: "subagent", input: { agent: "cw-builder", task: "x" } });
+
+    assert.equal(
+      registeredModel(pi, "cw-builder"),
+      "p/from-edit",
+      "the edit is in the owner's registration before the dispatch it was about to decide",
+    );
+    assert.equal(
+      registryView?.listRuntimeAgentConfigs(pi).filter((entry) => entry.name === "cw-builder").length,
+      1,
+      "and reconciling did not duplicate the agent",
+    );
+
+    // Deleting the file withdraws the agent the same way — the other direction of the same fact.
+    rmSync(file);
+    await loaded.handlers.toolCall({ toolName: "subagent", input: { agent: "cw-builder", task: "x" } });
+    assert.equal(
+      registryView?.listRuntimeAgentConfigs(pi).some((entry) => entry.name === "cw-builder"),
+      false,
+      "a deleted definition is withdrawn without a reload",
     );
   } finally {
     registryView?.clearRuntimeAgentsForPi(pi);

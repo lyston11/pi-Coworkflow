@@ -117,6 +117,15 @@ interface State {
   /** What the last completed pass learned; read by `runtimeStatus` and the gate. */
   snapshot: Snapshot | null;
   /**
+   * The fingerprint of what is registered right now, or `null` when nothing is.
+   *
+   * The gate compares the plan it just built from disk against this: a difference means a
+   * definition changed under a live session, and the registration has to catch up before the
+   * dispatch it is about to decide. That is what makes editing a file hot-reload instead of
+   * "reload Pi".
+   */
+  registeredSignature: string | null;
+  /**
    * Why the last reconcile pass registered nothing on purpose, when it did.
    *
    * `null` means the pass ran. A child session never registers (its kinds would
@@ -149,6 +158,7 @@ function stateFor(host: PiRuntimeHost): State {
   const created: State = {
     generation: 0,
     snapshot: null,
+    registeredSignature: null,
     skipped: null,
     pending: Promise.resolve(),
     listeners: new Map(),
@@ -348,6 +358,39 @@ export function kindRegistrationPlan(
 }
 
 /**
+ * A stable fingerprint of what a registration pass would install.
+ *
+ * Hot reload needs one question answered cheaply: "is what the owner holds still what the files
+ * say?" Comparing the plan itself is the honest comparison — the prompt, the agent name and the
+ * policy are all in it, so an edit to any of them shows up here and nothing else does.
+ */
+export function planSignature(desired: readonly DesiredKind[]): string {
+  // A short, stable hash of the prompt: the text can be kilobytes and a signature is compared on
+  // every dispatch, but comparing only its length would miss a prompt replaced with one of equal
+  // size — exactly the kind of stealth change this is supposed to catch.
+  const hash = (text: string): string => {
+    let value = 2166136261;
+    for (let i = 0; i < text.length; i += 1) {
+      value ^= text.charCodeAt(i);
+      value = Math.imul(value, 16777619);
+    }
+    return (value >>> 0).toString(36);
+  };
+  return desired
+    .map((entry) =>
+      [
+        entry.kind,
+        entry.agent,
+        entry.definition.description,
+        entry.definition.model ?? "-",
+        entry.definition.thinking ?? "-",
+        `${entry.definition.systemPrompt.length}:${hash(entry.definition.systemPrompt)}`,
+      ].join("|"),
+    )
+    .join("\n");
+}
+
+/**
  * Make this host's registrations match the project's kind policy.
  *
  * Both live gates are read here, at call time: the session switch
@@ -362,6 +405,7 @@ function schedule(host: PiRuntimeHost, runtime: RuntimeContext): Promise<void> {
     state.generation += 1;
     registry.dispose();
     state.snapshot = null;
+    state.registeredSignature = null;
     state.skipped = runtime.isChild ? "child" : "off";
     return Promise.resolve();
   }
@@ -394,6 +438,7 @@ function schedule(host: PiRuntimeHost, runtime: RuntimeContext): Promise<void> {
       return;
     }
     const results = registry.reconcile(contract.ok ? contract.contract : null, desired);
+    state.registeredSignature = contract.ok ? planSignature(desired) : null;
     const policyOf = new Map(kinds.map((entry) => [entry.kind, entry]));
     const snapshot: Snapshot = {
       ...(contract.ok ? {} : { contractFailure: contract.reason }),
@@ -485,10 +530,27 @@ async function gate(
     const kinds = resolveKinds(config, readKindDefinitions(root).definitions);
     return { kinds, policy: kinds.find((entry) => entry.agent === decoded.agent) };
   };
+  // Hot reload, before anything else decides: a definition edited on disk (by an editor, another
+  // program, the CLI in another process) has to be what this dispatch actually starts, not something
+  // that takes effect on the *next* one. The comparison is the plan the owner should hold against the
+  // plan it does hold — no polling, no watcher, and it costs a directory read this gate already does.
+  //
+  // Deliberately before the kind lookup: a *deleted* definition leaves no kind to look up, and that
+  // is exactly the case where the owner must be told to withdraw the agent. Behind the lookup, a
+  // deletion would never reconcile and a withdrawn kind would stay dispatchable.
+  const current = policyOf();
+  if (state.registeredSignature !== null) {
+    const planned = kindRegistrationPlan(current.kinds, import.meta.url);
+    if (planSignature(planned.desired) !== state.registeredSignature) {
+      await syncAgentKinds(host, runtime);
+    }
+  }
+
   // A name the project's table does not know is not this gate's business: the dispatch goes
   // through untouched, exactly as it did before kinds existed.
-  const kind = resolveDispatchKind(decoded.agent, policyOf().kinds);
+  const kind = resolveDispatchKind(decoded.agent, current.kinds);
   if (kind === null) return;
+
   const dispatch: KindDispatch = { ...decoded, kind };
   /** Whether the owner accepted this kind in this session (not merely "was asked to"). */
   const registered = (): boolean => {
@@ -676,6 +738,7 @@ export const agentKindsModule: WorkflowModule = {
     if (state) {
       state.generation += 1;
       state.snapshot = null;
+      state.registeredSignature = null;
       state.skipped = "off";
       for (const [name, off] of state.listeners) {
         if (typeof off === "function") off();

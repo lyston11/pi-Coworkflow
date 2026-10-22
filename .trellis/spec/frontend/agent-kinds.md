@@ -216,6 +216,8 @@ fleet 投影的 `key` 是不透明显示键，上游明确禁止当作 run 或 a
 
 解析失败一律**按 kind 隔离**：`readKindDefinitions` 返回 `{ definitions, failures }`，坏的进 `failures`（带原因），好的照常注册。目录不存在或读不了 = 「没有定义」，不是错误。未知 frontmatter 键**直接拒绝**：一个静默无效的拼写比报错更坏，因为用户以为配置生效了。
 
+**热更新不是轮询**：gate 本来就要读定义目录来决定策略，于是它顺手比较「应该注册的」与「已注册的」指纹（`planSignature`：提示词哈希、agent 名、模型、思考、描述）。不同就**在决定之前**先重新注册，所以本次派单用的就是新定义；相同则什么都不做。比较刻意放在 kind 解析**之前**：被删掉的定义查不到 kind，而那正是最需要撤回 agent 的时刻。
+
 写入只有一个实现（`writeKindDefinition`），三个入口都走它：**终端 CLI**（`scripts/cli.ts`，`pi-coworkflow kind …`）、Pi 内命令 `/Coworkflow:kind`、公开请求 `coworkflow:kind:v1`。**先校验再落盘**。
 
 **一个 kind 就是一份 markdown 文档**（`.pi/Coworkflow/agents/<kind>.md`），正文即系统提示词。所以 CLI 的主路是文件而不是参数：`scaffold` 生成骨架 → 用编辑器改 → `set <kind> --from <file>` 校验后**按原样写入**（保留标题、列表、强调、换行与注释）→ `check` 只读校验。`export <kind> --out <file>` 把生效定义（含本包随附的提示词）导出成可编辑文件，避免让人重打一份长提示词。
