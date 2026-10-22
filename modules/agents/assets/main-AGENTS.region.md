@@ -75,6 +75,8 @@
 - 必须后台（`async: true`）。前台子会话是主进程内的一个会话、会占住主会话；后台派单后主会话继续做自己的事，用完成通知和 `subagent({ action: "status" })` 监控，子 agent 的提问走 `contact_supervisor` 转达。实测：后台子会话由 harness 加载项目 `AGENTS.md` 与 Magic Context（ambient 扩展），但本包的 `subagent-context` 会在注入子 agent 约定之前把**本受管区**（`<!-- pi-Coworkflow:start/end -->` 之间，含上面的核心分工）从继承来的 `<project_instructions>` 里剥掉，项目自己写在区外的内容照旧保留。所以派单提示词只需给任务，不要把本文件受管区的约定重抄一遍。
 - 多阶段工作用命名的 workflow 表达（例如本包注册的 implement → review），而不是在本会话里把几个阶段串起来自己做：workflow 的子步骤在原生侧执行、有稳定的 child key 与验收结论，主会话只接收产物与结论。
 - 单步工作可以直接派一个有边界的子 agent（`context: "fresh"`），不必套 workflow；子 agent 的数量与并行度按上游容量与项目并发上限来，不要用不限量的并行去换速度。
+- **子 agent 的预算要写进任务里。** 上游默认 30 分钟，子 agent 看不到这个数字，所以任务描述里要写明「上限约 N 分钟、剩余 M 分钟会要求停下交接」，并在派单参数里带 `timeoutMs` + `checkpointBeforeDeadlineMs`（`coworkflow.fanout` / `implement-review` 已经带好）。没有交接的超时等于这次执行作废。
+- **要求「一次探针」而不是「逐条验证」。** 让子 agent 写一个脚本把所有结论一次跑完并打印一张表；逐条各跑一次命令时，每个工具调用都是一次完整往返，几十条就能吃掉整个预算——实测同一类复核任务，逐条验证用掉 23 分钟 / 160 次调用，一次探针只用 5 分钟 / 60 次。
 - **派单边界**：能独立验证的边界工作才派（有明确的输入、产物、验收方式）；探索性、需要全局判断、或跨多个模块协调的工作留在主会话。子 agent 不负责决定"做什么"，只负责"把它做好并报告"。
 - **审计边界**：子 agent 回结果不等于结果可用。主会话要对照 prd 的验收条件检查产物、核对它引用的文件与结论、跑该模块的测试；发现偏差就重派或自己修，不能直接把子 agent 的结论当成事实汇报给用户。
 - 子会话**不继承**主会话上下文：派单时显式写 `context: "fresh"`（三个 Trellis 角色 agent 也已声明 `defaultContext: fresh`；若你全局配了 `defaultSubagentContext: "fork"`，它会被覆盖，必须显式 `fresh`）。它拿到的 Trellis 上下文由 `pi-Coworkflow` 的 `subagent-context` 模块按角色注入：`trellis-implement` / `trellis-check` / `trellis-research` 分别得到 `implement.jsonl` / `check.jsonl` / spec 目录树，加上 prd.md、design.md、implement.md；字节预算沿用 `.trellis/config.yaml` 的 `context_injection`。 **注入按角色，不按 agent 名**：任何 agent 只要标记成这三个角色之一，就拿到对应那一份；`worker` / `researcher` / `reviewer` 等其它 agent 拿到的是子 agent 约定（不含角色上下文），不是什么都不给。

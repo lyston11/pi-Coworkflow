@@ -63,6 +63,7 @@ import { disposeUsage, formatNativeCost, refreshUsage, usageSnapshot } from "../
 import { nearestTrustDecision, trustFilePath, trustProject } from "../core/trust.ts";
 import { MODULES, findModule, moduleIds } from "../modules/index.ts";
 import { agentKindsModule, syncAgentKinds } from "../modules/agent-kinds/index.ts";
+import { syncSubagentsRuntime } from "../modules/subagents/index.ts";
 import { BUILTIN_KINDS, agentNameFor, builtinKind, resolveKinds } from "../modules/agent-kinds/defaults.ts";
 import { installedPrefix } from "../modules/worktree/index.ts";
 
@@ -221,6 +222,7 @@ let runtime: RuntimeContext = {
     setAgentKind: () => "control 尚未就绪",
     agentKindStatus: () => [],
     settleAgentKinds: () => Promise.resolve(),
+    settleSubagents: () => Promise.resolve(),
     init: () => "control 尚未就绪",
   },
 };
@@ -997,6 +999,10 @@ function createControl(): WorkflowControl {
     },
     agentKindStatus: () => (runtimeHost === null ? [] : agentKindsModule.runtimeStatus?.(runtimeHost) ?? []),
     settleAgentKinds: () => (runtimeHost === null ? Promise.resolve() : syncAgentKinds(runtimeHost, runtime)),
+    // Registration of the workflow resources is asynchronous, so a report built the
+    // instant a session starts said "工作流资源…未注册" about registrations that were
+    // simply still in flight. Awaiting them is what makes the line a fact.
+    settleSubagents: () => (runtimeHost === null ? Promise.resolve() : syncSubagentsRuntime(runtimeHost, runtime)),
     init: (args) => runSetup(args, { cwd: rootOf() ?? runtime.cwd }, false),
   };
 }
@@ -1124,8 +1130,13 @@ export default function coworkflowExtension(pi: PiRuntimeHost): void {
 
   const setupHandler =
     (forceDry: boolean) =>
-    (args: string, ctx: CommandContext): void => {
+    async (args: string, ctx: CommandContext): Promise<void> => {
       runtime.refresh();
+      // Let the asynchronous registrations finish before describing them: a report that
+      // races its own setup is a wrong report, and "未注册" is exactly the kind of wrong
+      // that sends the reader off to fix something that is not broken.
+      await controlSurface().settleSubagents();
+      await controlSurface().settleAgentKinds();
       const text = runSetup(args, ctx, forceDry);
       try {
         pi.sendMessage?.({ customType: "pi-Coworkflow", content: text, display: true });

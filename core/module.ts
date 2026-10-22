@@ -413,6 +413,8 @@ export interface WorkflowControl {
    * Resolves immediately when nothing is pending.
    */
   settleAgentKinds(): Promise<void>;
+  /** Let the subagent-layer registrations settle, so a report describes finished work. */
+  settleSubagents(): Promise<void>;
   /** Why this session is (not) loaded: `off`, `auto`, `started`, or `child`. */
   loadState(): RuntimeContext["loadState"];
   /**

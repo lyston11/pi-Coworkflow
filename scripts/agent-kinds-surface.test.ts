@@ -978,3 +978,29 @@ test("subagents: a configured-but-inactive tool is re-declared; an absent one is
   // Host cannot report: silence rather than a guess.
   assert.equal(reactivateSubagentTool({} as never), null);
 });
+
+/**
+ * A host that throws is a host that cannot answer.
+ *
+ * Pi's action methods are throwing stubs while the extension loads, and a status read can
+ * happen in that window: `/Coworkflow:status` run at startup reported
+ * "x subagents: Extension runtime not initialized. Action methods cannot be called during
+ * extension loading." The probe claims "cannot say, do not guess" — a throw has to land on
+ * that answer instead of escaping into the report as an error.
+ */
+test("subagents: a throwing host reads as 'cannot say', not as an error", async () => {
+  const { subagentToolAvailable, reactivateSubagentTool } = await import("../modules/subagents/index.ts");
+  const throwing = {
+    getActiveTools: () => {
+      throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");
+    },
+    getAllTools: () => {
+      throw new Error("Extension runtime not initialized.");
+    },
+    setActiveTools: () => {
+      throw new Error("Extension runtime not initialized.");
+    },
+  };
+  assert.equal(subagentToolAvailable(throwing as never), null, "unknown, never false");
+  assert.equal(reactivateSubagentTool(throwing as never), null, "and the repair is not attempted");
+});

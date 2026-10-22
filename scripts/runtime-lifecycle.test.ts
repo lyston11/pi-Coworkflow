@@ -77,7 +77,7 @@ interface Harness {
   /** Settle the subagents module's registration work for this host. */
   settled(): Promise<void>;
   /** `/Coworkflow:status` output, which is where a stored failure has to show. */
-  status(): string;
+  status(): Promise<string>;
   close(): void;
 }
 
@@ -155,14 +155,16 @@ async function loadExtension(
       return results;
     },
     settled: () => subagentsRuntimeSettled(host as never),
-    status() {
+    async status() {
       const command = commands.get("Coworkflow:status");
       assert.ok(command, "status is always registered");
       // The command renders through `sendMessage` like every other report, so the
       // entries it adds are taken back out: `messages` then means "messages that
       // were not the answer to an explicit command".
       const before = messages.length;
-      command.handler("", sessionCtx(options.sessionId ?? "session-b1"));
+      // Async by design: the report waits for the session's registrations to settle
+      // rather than describing a half-built one.
+      await command.handler("", sessionCtx(options.sessionId ?? "session-b1"));
       return messages.splice(before).join("\n");
     },
     close() {
@@ -339,7 +341,7 @@ for (const onReturns of ["unsubscribe", "void"] as const) {
 
       // A registration failure is stored, so a working session reports none, and
       // the only messages so far are the command answers above.
-      assert.doesNotMatch(loaded.status(), /^\s*x /m, "no failure is recorded for a clean registration");
+      assert.doesNotMatch(await loaded.status(), /^\s*x /m, "no failure is recorded for a clean registration");
       assert.equal(
         loaded.messages.filter((message: string) => message.includes("[subagents]")).length,
         0,
@@ -393,7 +395,7 @@ for (const onReturns of ["unsubscribe", "void"] as const) {
       });
       await loaded.settled();
       assert.equal(await workflowRegistered("session-b1-second"), true);
-      assert.doesNotMatch(loaded.status(), /^\s*x /m, "a repeated session_start reuses the set instead of re-registering");
+      assert.doesNotMatch(await loaded.status(), /^\s*x /m, "a repeated session_start reuses the set instead of re-registering");
       assert.deepEqual(loaded.messages, []);
     } finally {
       loaded.emit("session_shutdown", { reason: "quit" });
@@ -476,7 +478,7 @@ test("lifecycle: a registration failure is stored for /status, never sent as a m
     loaded.emit("session_start", { reason: "startup" });
     await loaded.settled();
     assert.deepEqual(loaded.messages, [], "a failed registration does not inject a passive message");
-    assert.match(loaded.status(), /x .*工作流资源/, "the failure is stored and shown by /status");
+    assert.match(await loaded.status(), /x .*工作流资源/, "the failure is stored and shown by /status");
   } finally {
     held.registration.dispose();
     loaded.emit("session_shutdown", { reason: "quit" });

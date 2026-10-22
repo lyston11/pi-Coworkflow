@@ -61,6 +61,23 @@ export const FANOUT_VERSION = 1;
 /** The two stable child keys; a rerun reuses nothing, they are identity for the mission ledger. */
 export const IMPLEMENT_KEY = "implement";
 export const REVIEW_KEY = "review";
+/**
+ * The run deadline a workflow gives its children, and how long before it they are told
+ * to stop and hand over.
+ *
+ * Upstream's backstop is thirty minutes and a child has no way to know it: runs that were
+ * making steady progress got killed mid-thought, several of them *while writing their own
+ * handoff*. Measured on this project, a child doing per-claim verification spends ~150
+ * sequential tool calls, and at roughly eight seconds a turn that is the whole budget.
+ *
+ * So the deadline is stated (in the prompt as well as the launch options) and the
+ * checkpoint is armed, which asks the child to finish the current call, report what it has
+ * and start nothing new. A run that stops with a handoff is usable; one that is killed is
+ * not.
+ */
+export const RUN_BUDGET_MS = 25 * 60 * 1000;
+export const RUN_CHECKPOINT_MS = 4 * 60 * 1000;
+
 export const DEFAULT_IMPLEMENT_AGENT = "trellis-implement";
 export const DEFAULT_REVIEW_AGENT = "trellis-check";
 
@@ -324,6 +341,8 @@ const tasks = ${JSON.stringify(input.children)};
 const cwd = ${JSON.stringify(input.cwd ?? null)};
 const WORKTREES = ${input.worktrees === true ? "true" : "false"};
 const FANOUT_SCHEMA = ${JSON.stringify(FANOUT_SCHEMA)};
+const BUDGET_MS = ${RUN_BUDGET_MS};
+const CHECKPOINT_MS = ${RUN_CHECKPOINT_MS};
 const MAX_SUMMARY = 4000;
 
 function textOf(value) {
@@ -369,9 +388,11 @@ function paramsFor(task) {
   const params = {
     label: task.key + " " + task.agent,
     agent: task.agent,
-    task: task.task + ${JSON.stringify(focus)},
+    task: task.task + ${JSON.stringify(focus)} + ${JSON.stringify("\n\n" + budgetLines().join("\n"))},
     worktree: WORKTREES === true,
     context: "fresh",
+    timeoutMs: BUDGET_MS,
+    checkpointBeforeDeadlineMs: CHECKPOINT_MS,
     acceptance: {
       level: "checked",
       report: "on",
@@ -439,6 +460,17 @@ return {
  * interpolation into a prompt is the task reference, the worktree path and an
  * optional review focus, all already length- and shape-bounded above.
  */
+/** What every child is told about its own deadline, so it can plan instead of being cut off. */
+function budgetLines(): string[] {
+  const minutes = Math.round(RUN_BUDGET_MS / 60000);
+  const warning = Math.round(RUN_CHECKPOINT_MS / 60000);
+  return [
+    `- 本次运行上限约 ${minutes} 分钟；剩余 ${warning} 分钟时会收到「停下并交接」的要求，届时不要再开新工作。`,
+    "- 尽早把交接写出来并随时更新：超时最常见的发生点就是「正在写交接」。",
+    "- 验证合并成尽量少的一次探针（一个脚本一次跑完，打印一张表），不要每条结论各跑一次命令：每个工具调用都是一次完整往返，150 次调用就是全部预算。",
+  ];
+}
+
 function buildScript(input: ScriptInput): string {
   const taskLine = `Active task: ${input.taskRef}`;
   const title = input.taskTitle ? `任务标题：${input.taskTitle}\n` : "";
@@ -454,6 +486,7 @@ function buildScript(input: ScriptInput): string {
     "- 只改本任务范围内的代码；不要扩大范围、不要顺手重构无关文件。",
     "- 不要 git commit / push / merge，不要合并或清理 worktree；这些是主会话的职责。",
     "- 跑受影响范围的最小充分检查（typecheck / 聚焦测试），把真实输出写进结论。",
+    ...budgetLines(),
     `- 最后用结构化输出汇报：status（completed / blocked / failed）、summary、changedFiles、residualRisks。${focus}`,
   ].join("\n");
 
@@ -465,7 +498,8 @@ function buildScript(input: ScriptInput): string {
     "要求：",
     "- 对照 prd.md / design.md / implement.md 和受影响范围的 spec 判断这份改动是否满足要求。",
     "- 检查自报的验证结论是否真的支持结论（有没有改到别人正在改的文件、有没有漏掉回归）。",
-    "- 给出结构化输出：verdict（pass / changes_requested / blocked）、summary、findings（仅列阻塞问题，pass 时必须为空数组）。只要还有阻塞问题就必须给 changes_requested 或 blocked，不要为了让流程通过而给 pass。",
+    ...budgetLines(),
+    "- 给出结构化输出：verdict（pass / changes_requested / blocked）、summary、findings（仅列阻塞问题，pass 时必须为空数组）。只要还有阻塞问题就必须给出 changes_requested 或 blocked，不要为了让流程通过而给 pass。",
   ].join("\n");
 
   return `
@@ -513,6 +547,8 @@ const implement = await runs.run(${JSON.stringify(IMPLEMENT_KEY)}, {
   cwd: worktree,
   worktree: false,
   context: "fresh",
+  timeoutMs: ${RUN_BUDGET_MS},
+  checkpointBeforeDeadlineMs: ${RUN_CHECKPOINT_MS},
   acceptance: { level: "checked", report: "on", criteria: ["Fulfil the active task within scope"],
     evidence: ["changed-files", "commands-run", "residual-risks", "no-staged-files"] },
   outputSchema: IMPLEMENT_SCHEMA
@@ -555,6 +591,8 @@ const review = await runs.run(${JSON.stringify(REVIEW_KEY)}, {
   cwd: worktree,
   worktree: false,
   context: "fresh",
+  timeoutMs: ${RUN_BUDGET_MS},
+  checkpointBeforeDeadlineMs: ${RUN_CHECKPOINT_MS},
   acceptance: { level: "attested", report: "on", criteria: ["Independently review the implementation against the active task"],
     evidence: ["review-findings", "residual-risks", "manual-notes"] },
   outputSchema: REVIEW_SCHEMA

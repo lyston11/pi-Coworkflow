@@ -219,7 +219,16 @@ export function declarationFinding(cwd: string): string {
  * missing, so the honest report is the missing tool — not a green "已注册".
  */
 export function subagentToolAvailable(host: { getActiveTools?(): string[] }): boolean | null {
-  const tools = host.getActiveTools?.();
+  // A host that *throws* is as unable to answer as one that returns nothing, and Pi
+  // does throw here: every action method is a stub that rejects calls made while the
+  // extension is still loading. The claim of this function is "cannot say, do not
+  // guess" — a throw must land on that answer rather than escaping into a report.
+  let tools: unknown;
+  try {
+    tools = host.getActiveTools?.();
+  } catch {
+    return null;
+  }
   if (!Array.isArray(tools)) return null; // host cannot say; do not guess either way
   return tools.includes("subagent");
 }
@@ -237,11 +246,17 @@ export function subagentToolAvailable(host: { getActiveTools?(): string[] }): bo
  * *not active*. A tool that is not configured at all is a missing install, not this.
  */
 export function reactivateSubagentTool(host: PiRuntimeHost): string | null {
-  const active = host.getActiveTools?.();
-  if (!Array.isArray(active) || active.includes("subagent")) return null;
-  const configured = host.getAllTools?.()?.some((tool) => tool?.name === "subagent");
-  if (configured !== true || typeof host.setActiveTools !== "function") return null;
-  host.setActiveTools([...active, "subagent"]);
+  try {
+    const active = host.getActiveTools?.();
+    if (!Array.isArray(active) || active.includes("subagent")) return null;
+    const configured = host.getAllTools?.()?.some((tool) => tool?.name === "subagent");
+    if (configured !== true || typeof host.setActiveTools !== "function") return null;
+    host.setActiveTools([...active, "subagent"]);
+  } catch {
+    // Same rule as above: a host that refuses to answer is not a host that needs
+    // fixing, and this repair must never be the reason a session reports an error.
+    return null;
+  }
   return "  ~ subagents: 本会话历史里没有 subagent（恢复旧会话），已重新声明该工具";
 }
 
@@ -253,9 +268,6 @@ export const subagentsModule: WorkflowModule = {
     if (runtime.isChild) return;
     const state = hostState(host);
     state.runtime = runtime;
-    // Remembered so `/status` can say the tool was re-declared rather than silently
-    // having changed the session's tool list.
-    state.revivedTool = reactivateSubagentTool(host) !== null;
     attachObservers(host, state, runtime);
     void syncSubagentsRuntime(host, runtime);
   },
@@ -276,6 +288,12 @@ export const subagentsModule: WorkflowModule = {
     if (runtime.isChild) return;
     registerRunCommand(host, runtime);
     registerControlCommands(host, runtime);
+    // Tool declarations belong to a session, not to loading: `setActiveTools` is an
+    // action method and Pi refuses those while the extension is still being loaded
+    // ("Action methods cannot be called during extension loading"). Doing this here
+    // also means it happens once per session rather than once per process.
+    const state = hostState(host);
+    state.revivedTool = reactivateSubagentTool(host) !== null;
   },
 
   /**

@@ -25,6 +25,8 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import {
   FANOUT_NAME,
+  RUN_BUDGET_MS,
+  RUN_CHECKPOINT_MS,
   WORKFLOW_NAME,
   dispatchOverlap,
   readSessionLinks,
@@ -637,4 +639,36 @@ test("fanout: worktrees gives every lane its own tree and drops the shared cwd",
     allKindsDispatchable() as any,
   );
   assert.ok("error" in bad && /worktrees must be a boolean/.test(bad.error), JSON.stringify(bad));
+});
+
+/**
+ * Every child is given a deadline it can see, and warned before it arrives.
+ *
+ * Upstream's backstop is thirty minutes and the child has no way to know it. Measured on
+ * this project, a child asked to confirm eight claims one command at a time spent ~150
+ * sequential tool calls — at roughly eight seconds a turn that is the entire budget — and
+ * several runs were killed *while writing their handoff*, which makes the work unusable
+ * rather than merely unfinished.
+ */
+test("fanout: children get a stated budget and a pre-deadline checkpoint", async () => {
+  const script = expand([
+    { kind: "executor", task: "a" },
+    { kind: "executor", task: "b" },
+  ]);
+  if (typeof script !== "string") throw new Error(script.error);
+
+  assert.match(script, new RegExp(`const BUDGET_MS = ${RUN_BUDGET_MS};`), "the deadline is stated, not inherited");
+  assert.match(script, new RegExp(`const CHECKPOINT_MS = ${RUN_CHECKPOINT_MS};`), "and it warns before it fires");
+  assert.match(script, /timeoutMs: BUDGET_MS/, "and is passed to every child");
+  assert.match(script, /checkpointBeforeDeadlineMs: CHECKPOINT_MS/, "with the checkpoint armed");
+  assert.ok(
+    RUN_CHECKPOINT_MS < RUN_BUDGET_MS,
+    "a checkpoint at or after the deadline can never land",
+  );
+  assert.ok(RUN_BUDGET_MS <= 30 * 60 * 1000, "the budget does not exceed the backstop it replaces");
+
+  // The child has to be told, because launch options are not visible from inside a run.
+  assert.match(script, /本次运行上限约 25 分钟/);
+  assert.match(script, /正在写交接/);
+  assert.match(script, /验证合并成尽量少的一次探针/);
 });

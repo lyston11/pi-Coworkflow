@@ -135,7 +135,7 @@ interface Harness {
   breakGit(): void;
   control: ReturnType<(typeof import("../extensions/coworkflow.ts"))["controlSurface"]>;
   /** `/Coworkflow:status` output, which is where an unresolved root has to show. */
-  status(): string;
+  status(): Promise<string>;
   /** Restore `PATH`/cwd and drop the fixture. Called from the test's `finally`. */
   close(): void;
 }
@@ -210,11 +210,13 @@ async function loadProduction(repository: string): Promise<Harness> {
     return {
       control: loaded.controlSurface(),
       close: reset,
-      status() {
+      async status() {
         const command = commands.get("Coworkflow:status");
         assert.ok(command, "status is always registered");
         const before = messages.length;
-        command.handler("", { cwd: repository, mode: "tui", sessionManager: { getSessionId: () => "root-session" } });
+        // The handler is async: it awaits the session's registrations before describing
+        // them, so a report cannot race its own setup.
+        await command.handler("", { cwd: repository, mode: "tui", sessionManager: { getSessionId: () => "root-session" } });
         return messages.splice(before).join("\n");
       },
       gitCalls: () => {
@@ -291,7 +293,7 @@ test("config root: a git failure surfaces as unresolved and reads no config, not
     assert.match(broken.control.setSwitch("panel", false), /无法解析/);
     // And the state is what `/Coworkflow:status` reports: an unresolved root is a
     // line of its own, not a project path that was guessed.
-    const status = broken.status();
+    const status = await broken.status();
     assert.match(status, /配置根无法解析/);
     assert.match(status, /unable to read tree/);
     assert.ok(!status.includes(`配置: ${repository}`), "no project path is presented as the config");
