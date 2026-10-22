@@ -74,7 +74,7 @@
 这条界线靠判断，不靠计数：本包不再统计本会话的工具调用次数，也不会因为"改动不少"就插入提醒。反过来，分不清该不该派时按工作量估：能独立验证、输入产物验收方式都说得清的执行工作就该派出去；需要全局判断、跨模块协调、或只有一两处改动的，留在这里自己做完更快。
 
 - 授权：主会话可以主动派发子 agent，不必逐次询问。
-- 必须后台（`async: true`）。前台子会话是主进程内的一个会话、会占住主会话；后台派单后主会话继续做自己的事，用完成通知和 `subagent({ action: "status" })` 监控，子 agent 的提问走 `contact_supervisor` 转达。实测：后台子会话由 harness 加载项目 `AGENTS.md` 与 Magic Context（ambient 扩展），但本包的 `subagent-context` 会在注入子 agent 约定之前把**本受管区**（`<!-- pi-Coworkflow:start/end -->` 之间，含上面的核心分工）从继承来的 `<project_instructions>` 里剥掉，项目自己写在区外的内容照旧保留。所以派单提示词只需给任务，不要把本文件受管区的约定重抄一遍。
+- **后台是默认值，要做的只是别传 `async: false`。** 传了它，主会话这一轮会一直等到那个子 agent 结束（workflow 默认也是后台，不需要额外传 `async`）。而且前台子会话跑在主进程内、拿不到 ambient 扩展，后台才是子 agent 正常拿上下文的样子。后台派单后主会话继续做自己的事，用完成通知和 `subagent({ action: "status" })` 监控，子 agent 的提问走 `contact_supervisor` 转达。实测：后台子会话由 harness 加载项目 `AGENTS.md` 与 Magic Context（ambient 扩展），但本包的 `subagent-context` 会在注入子 agent 约定之前把**本受管区**（`<!-- pi-Coworkflow:start/end -->` 之间，含上面的核心分工）从继承来的 `<project_instructions>` 里剥掉，项目自己写在区外的内容照旧保留。所以派单提示词只需给任务，不要把本文件受管区的约定重抄一遍。
 - 多阶段工作用命名的 workflow 表达（例如本包注册的 implement → review），而不是在本会话里把几个阶段串起来自己做：workflow 的子步骤在原生侧执行、有稳定的 child key 与验收结论，主会话只接收产物与结论。
 - 单步工作可以直接派一个有边界的子 agent（`context: "fresh"`），不必套 workflow；子 agent 的数量与并行度按上游容量与项目并发上限来，不要用不限量的并行去换速度。
 - **子 agent 的预算要写进任务里。** 上游默认 30 分钟，子 agent 看不到这个数字，所以任务描述里要写明「上限约 N 分钟、剩余 M 分钟会要求停下交接」，并在派单参数里带 `timeoutMs` + `checkpointBeforeDeadlineMs`（`coworkflow.fanout` / `implement-review` 已经带好）。没有交接的超时等于这次执行作废。
