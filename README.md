@@ -47,17 +47,18 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 
 | kind | agent | 对应的 Trellis 角色 | 默认 |
 |---|---|---|---|
-| 执行者 | `cw-executor` | implement | **开**，上限 3 |
-| 审计者 | `cw-auditor` | check | 关，上限 1 |
-| 调研者 | `cw-researcher` | research | 关，上限 2 |
+| 执行者 | `cw-executor` | implement | 开，上限 5 |
+| 审计者 | `cw-auditor` | check | 开，上限 5 |
+| 调研者 | `cw-researcher` | research | 开，上限 5 |
 
 **一类一种角色，覆盖 Trellis 原有的三个角色 agent。** `cw-*` 拿到的是同一份角色上下文注入
 （prd / design / implement / 对应 jsonl 或 spec 树），但额外经过本项目的开关与数量限制。
 `trellis-implement` / `trellis-check` / `trellis-research` 在采用本模块后**不再是推荐目标**——
 它们绕开这两道闸。
 
-默认值的理由：执行者默认开，因为它替代的正是项目本来手工在做的事；审计者与调研者默认关，
-因为它们能拒绝自己的工作或无限期花时间，**必须由项目主动选择**，不能凭空出现。
+**默认值不是本包定的上限，是给项目改的起点**：三种 kind 默认都开、都从 **5** 起，具体多少由
+`/Coworkflow:settings` 决定。上限的意义是「别一次铺开太多」，不是「只准有一个审计者」——按 kind 定死
+不同的小数字等于替主会话做了拆分决定，而那是它的判断。要收紧就在面板里改，或直接把某个 kind 关掉。
 
 ### 派单
 
@@ -74,8 +75,8 @@ subagent({ agent: "cw-executor", async: true, context: "fresh",
 
 ```
   子 agent 类型
-  执行者 cw-executor   [x] 开 · 上限 3   已注册到 pi-subagents
-  审计者 cw-auditor    [ ] 开 · 上限 1   关闭时该 kind 的派单会被拒绝，其他 agent 不受影响
+  执行者 cw-executor   [x] 开 · 上限 5   已注册到 pi-subagents
+  审计者 cw-auditor    [x] 开 · 上限 5   已注册到 pi-subagents
 ```
 
 `Space` 开关、`←→` 调上限、`Enter` 输数字。**当场生效，无需重启**；改两次等于没改，

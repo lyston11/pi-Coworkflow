@@ -50,6 +50,16 @@ export interface BuiltinKind {
  * kinds that can *refuse* their own scope or spend unbounded time, and a project
  * must opt into them rather than discover one.
  */
+/**
+ * How many of a kind a project may run at once, until the project says otherwise.
+ *
+ * This is a guard the project owns, not a ceiling this package imposes: every kind starts
+ * at the same number and the panel changes it. A per-kind ceiling below the others made
+ * the split decision for the main session — it read as "you may only have one auditor",
+ * which is a policy nobody chose.
+ */
+export const DEFAULT_MAX_CONCURRENT = 5;
+
 export const BUILTIN_KINDS: readonly BuiltinKind[] = [
   {
     kind: "executor",
@@ -57,7 +67,7 @@ export const BUILTIN_KINDS: readonly BuiltinKind[] = [
     role: "implement",
     description: "Coworkflow 执行者：按派单做完一件已定义的工作并报告事实",
     asset: "./assets/executor.md",
-    defaults: { enabled: true, maxConcurrent: 3 },
+    defaults: { enabled: true, maxConcurrent: DEFAULT_MAX_CONCURRENT },
   },
   {
     kind: "auditor",
@@ -65,7 +75,7 @@ export const BUILTIN_KINDS: readonly BuiltinKind[] = [
     role: "check",
     description: "Coworkflow 审计者：只读复核一处改动，给出可复现的阻断项",
     asset: "./assets/auditor.md",
-    defaults: { enabled: false, maxConcurrent: 1 },
+    defaults: { enabled: true, maxConcurrent: DEFAULT_MAX_CONCURRENT },
   },
   {
     kind: "researcher",
@@ -73,7 +83,7 @@ export const BUILTIN_KINDS: readonly BuiltinKind[] = [
     role: "research",
     description: "Coworkflow 调研者：查清一个问题并给出有出处、可复现的答案",
     asset: "./assets/researcher.md",
-    defaults: { enabled: false, maxConcurrent: 2 },
+    defaults: { enabled: true, maxConcurrent: DEFAULT_MAX_CONCURRENT },
   },
 ];
 

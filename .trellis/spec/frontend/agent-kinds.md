@@ -20,13 +20,13 @@
 
 | kind | agent | Trellis 角色 | 默认 | 默认上限 |
 |---|---|---|---|---|
-| 执行者 | `cw-executor` | implement | 开 | 3 |
-| 审计者 | `cw-auditor` | check | 关 | 1 |
-| 调研者 | `cw-researcher` | research | 关 | 2 |
+| 执行者 | `cw-executor` | implement | 开 | 5 |
+| 审计者 | `cw-auditor` | check | 开 | 5 |
+| 调研者 | `cw-researcher` | research | 开 | 5 |
 
 **这是「覆盖」而非「并列」**：kind 与 Trellis 角色一一对应，`cw-*` 走的是同一份角色上下文注入（prd、design、implement、对应 jsonl 或 spec 树），但额外经过本项目的开关与数量上限。`trellis-implement` / `trellis-check` / `trellis-research` 在采用本模块后**不再是本项目推荐的派单目标**——它们绕开这两道闸。
 
-默认值的选择是有理由的：执行者默认开，因为它替代的正是项目本来手工在做的事；审计者与调研者默认关，因为它们能拒绝自己的工作或无限期花时间，**必须由项目主动选择，而不是凭空出现**。这条也适用于将来新增的 kind：新增能力默认开，新增「能拒绝工作」的默认关。
+默认值是**项目改的起点，不是本包设的上限**：三种 kind 都默认开、都从 5 起，具体数字由 `/Coworkflow:settings` 决定。按 kind 定死不同的小数字（执行者 3、审计者 1）等于替主会话做了拆分决定——它读到的是「只准有一个审计者」，而没有任何人做过这个决定。上限的作用是「别一次铺开太多」，不是分配权限。
 
 Trellis 自己拥有的 `.pi/agents/trellis-*.md` 不删除、不改写（那是 `trellis update` 的地盘），只是不再作为本项目的推荐派单目标。
 

@@ -346,21 +346,23 @@ test("panel: Space toggles a kind and Enter edits its limit, with no restart", {
     // The extension's own activation registered the enabled kinds through the
     // installed owner: this is the loaded-session state a panel opens over.
     await loaded.settled();
-    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name), ["cw-executor"]);
+    const all = ["cw-auditor", "cw-executor", "cw-researcher"];
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(), all);
 
     const panel = panelFor(loaded.control);
     panel.focusOn("cw-auditor");
-    assert.match(panel.selected()?.value ?? "", /\[ \] 关 · 上限 1/, "the panel shows the built-in policy for auditor");
+    // Every kind starts at the same built-in ceiling; the project changes it.
+    assert.match(panel.selected()?.value ?? "", /\[x\] 开 · 上限 5/, "the panel shows the built-in policy for auditor");
 
-    // Space: enabled, registered, and the config says so — all without a reload.
+    // Space: off, and the config says so — all without a reload.
     await panel.press(" ");
     assert.match(
       readFileSync(join(root, ".pi", "Coworkflow.json"), "utf-8"),
-      /"auditor":\s*\{[^}]*"enabled":\s*true/,
+      /"auditor":\s*\{[^}]*"enabled":\s*false/,
       "the toggle is persisted, not just rendered",
     );
-    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(), ["cw-auditor", "cw-executor"]);
-    assert.match(panel.selected()?.value ?? "", /\[x\] 开/, "the row reflects the new state");
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(), ["cw-executor", "cw-researcher"]);
+    assert.match(panel.selected()?.value ?? "", /\[ \] 关/, "the row reflects the new state");
     assert.match(panel.statuses.at(-1) ?? "", /本会话已生效/, panel.statuses.join("\n"));
 
     // ←→ is the column switch now, exactly as in /Comodels: it must not change a
@@ -373,12 +375,17 @@ test("panel: Space toggles a kind and Enter edits its limit, with no restart", {
     await panel.press("\x1b[C");
     assert.deepEqual(panel.viewState().focus, "item", "←→ toggles back to the 设置项 column");
 
-    // Toggling twice lands exactly where it started: one registration, no
-    // collision error, and no duplicate `tool_call` hook.
+    // Toggling twice lands exactly where it started — auditor was switched off above,
+    // so on-then-off returns to off: one registration, no collision error, and no
+    // duplicate `tool_call` hook.
     const hooks = loaded.handlerCount("tool_call");
     await panel.press(" ");
     await panel.press(" ");
-    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(), ["cw-auditor", "cw-executor"]);
+    assert.deepEqual(
+      registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(),
+      ["cw-executor", "cw-researcher"],
+      "two toggles return to the state the project chose",
+    );
     assert.ok(
       !(loaded.control.agentKindStatus().join("\n")).includes("注册失败"),
       loaded.control.agentKindStatus().join("\n"),
@@ -404,15 +411,21 @@ test("status: a colliding kind is reported as failed, and only that kind is affe
   const loaded = await loadExtension(root, pi.events);
   try {
     await loaded.settled();
-    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(), ["cw-auditor", "cw-executor"]);
+    // The squatter holds cw-auditor, so that kind fails while the others register.
+    assert.deepEqual(
+      registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(),
+      ["cw-auditor", "cw-executor", "cw-researcher"],
+      "the squatter's own registration plus the kinds that succeeded",
+    );
 
-    // Enable the colliding kind through the same production path the panel uses.
+    // Re-register the colliding kind through the same production path the panel uses.
     const status = await loaded.control.setAgentKind("auditor", { enabled: true });
     assert.match(status, /注册失败/, status);
     assert.match(status, /collides with runtime agent 'cw-auditor'/, status);
     const lines = loaded.control.agentKindStatus().join("\n");
     assert.match(lines, /auditor 注册失败/, "status names the failed kind");
     assert.match(lines, /cw-executor（kind executor）已注册/, "the other kind is unaffected");
+    assert.match(lines, /cw-researcher（kind researcher）已注册/, "and so is every other kind");
   } finally {
     squatter.dispose();
     registryView?.clearRuntimeAgentsForPi(pi);
@@ -434,8 +447,8 @@ test("workflow agents: a kind stands in for a step only when it is enabled and r
     await syncAgentKinds(host, state.runtime);
     assert.deepEqual(
       kindWorkflowAgents(host, resolveKinds(readConfig(root))),
-      { implementAgent: "cw-executor" },
-      "the registered executor drives the implement step",
+      { implementAgent: "cw-executor", reviewAgent: "cw-auditor" },
+      "each registered kind drives its own step",
     );
 
     // Enabled but not registered: still the built-in pair, because a workflow

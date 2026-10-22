@@ -31,6 +31,7 @@ import { readConfig, createConfigRootResolver, type WorkflowConfig } from "../co
 import { exportEntry } from "../core/subagents-workflow.ts";
 import {
   BUILTIN_KINDS,
+  DEFAULT_MAX_CONCURRENT,
   agentNameFor,
   builtinAgentNames,
   kindOf,
@@ -225,8 +226,8 @@ test("kinds config: unknown kinds and unreadable fields are preserved as the pro
       resolved.map((entry) => [entry.kind, entry.agent, entry.enabled, entry.maxConcurrent]),
       [
         ["executor", "cw-executor", false, 5],
-        ["auditor", "cw-auditor", false, 1],
-        ["researcher", "cw-researcher", false, 2],
+        ["auditor", "cw-auditor", true, 5],
+        ["researcher", "cw-researcher", true, 5],
       ],
       "the built-in defaults fill what the project did not say",
     );
@@ -250,7 +251,7 @@ test("kinds table: names are cw- prefixed, map to Trellis roles, and prompts are
   // A project that declares nothing gets the built-in defaults.
   assert.deepEqual(
     resolveKinds(null).map((entry) => [entry.kind, entry.enabled, entry.maxConcurrent]),
-    [["executor", true, 3], ["auditor", false, 1], ["researcher", false, 2]],
+    [["executor", true, 5], ["auditor", true, 5], ["researcher", true, 5]],
   );
 });
 
@@ -413,7 +414,7 @@ test("module: enabled kinds register with the owner, session end withdraws them,
     await syncAgentKinds(host, state.runtime);
     assert.deepEqual(
       registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(),
-      ["cw-auditor", "cw-executor"],
+      ["cw-auditor", "cw-executor", "cw-researcher"],
       "declared-enabled kinds appear in the owner's agent list",
     );
     const lines = agentKindsModule.runtimeStatus!(host) ?? [];
@@ -428,9 +429,9 @@ test("module: enabled kinds register with the owner, session end withdraws them,
     // And back on restores them, in the same session, with no duplicate.
     state.setEnabled(true);
     await syncAgentKinds(host, state.runtime);
-    assert.equal(registryView?.listRuntimeAgentConfigs(pi).length, 2);
+    assert.equal(registryView?.listRuntimeAgentConfigs(pi).length, 3);
     await syncAgentKinds(host, state.runtime);
-    assert.equal(registryView?.listRuntimeAgentConfigs(pi).length, 2, "repeated reconcile registers nothing twice");
+    assert.equal(registryView?.listRuntimeAgentConfigs(pi).length, 3, "repeated reconcile registers nothing twice");
 
     // Session end: disposal must not throw and must leave nothing that would act
     // on the next session.
@@ -448,13 +449,15 @@ test("module: enabled kinds register with the owner, session end withdraws them,
 
 test("module: a disabled kind is not registered, and the project switch withdraws the rest", { skip }, async () => {
   const { pi, listener } = fakePi();
-  const root = tempProject();
+  // Every kind is on by default now, so "disabled" has to be the project's own choice —
+  // which is exactly the state this test is about.
+  const root = tempProject({ auditor: { enabled: false } });
   const host = { events: pi.events } as unknown as Parameters<typeof syncAgentKinds>[0];
   try {
     const state = runtimeFor(root);
     await syncAgentKinds(host, state.runtime);
-    // Built-in defaults: executor on, auditor off.
-    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name), ["cw-executor"]);
+    const on = ["cw-executor", "cw-researcher"];
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(), on);
     const lines = agentKindsModule.runtimeStatus!(host) ?? [];
     assert.ok(lines.some((line) => line.includes("auditor") && line.includes("已关闭")), lines.join("\n"));
 
@@ -463,7 +466,7 @@ test("module: a disabled kind is not registered, and the project switch withdraw
     assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi), []);
     state.setModule(true);
     await syncAgentKinds(host, state.runtime);
-    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name), ["cw-executor"]);
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(), on);
   } finally {
     disposeKindRegistrations(host);
     registryView?.clearRuntimeAgentsForPi(pi);
@@ -534,7 +537,10 @@ test("module: a declared-but-unshipped kind is preserved and reported, never reg
     const config: WorkflowConfig | null = readConfig(root);
     assert.deepEqual(unshippedKinds(config), ["reviewer"]);
     await syncAgentKinds(host, runtimeFor(root).runtime);
-    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name), ["cw-executor"]);
+    // Every shipped kind registers; the unshipped one is reported and never registered.
+    const names = registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort() ?? [];
+    assert.deepEqual(names, ["cw-auditor", "cw-executor", "cw-researcher"]);
+    assert.ok(!names.includes("reviewer"), "a kind this package does not ship is never registered");
     const lines = agentKindsModule.runtimeStatus!(host) ?? [];
     assert.ok(lines.some((line) => line.includes("reviewer") && line.includes("本包没有这个 kind")), lines.join("\n"));
   } finally {
@@ -724,14 +730,14 @@ test("gate decoder: only a kind dispatch is ours, and only a work-starting call"
 });
 
 test("gate: a disabled kind is refused, and the reason names only kinds that really exist", { skip }, async () => {
-  const h = gateHarness();
+  // Disabled is the project's choice now, so the harness declares it.
+  const h = gateHarness({ kinds: { auditor: { enabled: false } } });
   try {
     await syncAgentKinds(h.host, h.runtime);
-    // Built-in defaults: executor on (and registered), auditor off.
     const refused = await h.call({ agent: "cw-auditor", task: "audit this" });
     assert.ok(refused, "a disabled kind must not be dispatched");
     assert.match(refused.reason ?? "", /关闭了 kind auditor（cw-auditor）/);
-    assert.match(refused.reason ?? "", /当前可用的 kind：cw-executor/);
+    assert.match(refused.reason ?? "", /当前可用的 kind：cw-executor、cw-researcher/);
     assert.match(refused.reason ?? "", /没有启动任何子进程/);
     assert.equal(h.requests.length, 0, "a disabled kind costs no public read: it is refused before counting");
   } finally {
@@ -777,7 +783,7 @@ test("gate: an unreadable or unavailable fleet count refuses instead of assuming
       assert.ok(refused, `unknown count must refuse (${JSON.stringify(options)})`);
       // Never `0`: the refusal says it could not count, and why.
       assert.match(refused.reason ?? "", /无法确认现在有几个在运行/);
-      assert.match(refused.reason ?? "", /上限 3/);
+      assert.match(refused.reason ?? "", /上限 5/);
       assert.doesNotMatch(refused.reason ?? "", /当前已有 0 个/);
     } finally {
       h.close();
@@ -904,7 +910,11 @@ test("gate: session end releases the hook, and re-activation installs exactly on
     agentKindsModule.activate!(h.host, h.runtime);
     assert.equal(h.count("tool_call"), 1, "one hook again, not two");
     await syncAgentKinds(h.host, h.runtime);
-    assert.deepEqual(kindRegistryFor(h.host).registered().map((entry) => entry.agent), ["cw-executor"], "re-registered after the session ended");
+    assert.deepEqual(
+      kindRegistryFor(h.host).registered().map((entry) => entry.agent).sort(),
+      ["cw-auditor", "cw-executor", "cw-researcher"],
+      "re-registered after the session ended",
+    );
     assert.equal(await h.call({ agent: "cw-executor", task: "work" }), undefined, "the reinstated gate does not refuse a free kind");
   } finally {
     h.close();
@@ -990,4 +1000,28 @@ test("gate: three executors and one auditor run together, each kind counted on i
   } finally {
     h.close();
   }
+});
+
+/**
+ * Every kind starts the same, and the number is the project's to change.
+ *
+ * The defaults used to be a policy this package imposed — executor 3, auditor 1,
+ * researcher 2, with the latter two off. A session reading that sees "you may have one
+ * auditor", which is a split decision nobody made, and the per-kind ceilings were below
+ * what an ordinary task needs. The ceiling is a guard the project sets, not a permission
+ * this package allocates.
+ */
+test("kinds: every kind starts enabled with the same ceiling", () => {
+  for (const entry of BUILTIN_KINDS) {
+    assert.equal(entry.defaults.enabled, true, `${entry.kind} is available unless the project says otherwise`);
+    assert.equal(entry.defaults.maxConcurrent, DEFAULT_MAX_CONCURRENT, `${entry.kind} starts at the shared ceiling`);
+  }
+  assert.ok(DEFAULT_MAX_CONCURRENT >= 5, "the starting ceiling is not a bottleneck");
+  // The ceiling is advisory in the sense that it is editable; it is enforced once set.
+  assert.deepEqual(
+    resolveKinds({ version: 1, modules: {}, agentKinds: { executor: { maxConcurrent: 12 } } })
+      .find((entry) => entry.kind === "executor"),
+    { kind: "executor", label: "执行者", agent: "cw-executor", enabled: true, maxConcurrent: 12 },
+    "the project's number wins",
+  );
 });

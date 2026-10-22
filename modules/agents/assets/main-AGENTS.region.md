@@ -55,8 +55,8 @@
 | kind | agent | Trellis 角色 | 默认 |
 |---|---|---|---|
 | 执行者 | `cw-executor` | implement | 开，上限 3 |
-| 审计者 | `cw-auditor` | check | 关，上限 1 |
-| 调研者 | `cw-researcher` | research | 关，上限 2 |
+| 审计者 | `cw-auditor` | check | 开，上限 5 |
+| 调研者 | `cw-researcher` | research | 开，上限 5 |
 
 派单写 `agent: "cw-executor"`，**不要写** `trellis-implement` / `trellis-check` / `trellis-research`：`cw-*` 拿到的是同一份角色上下文，但会经过本项目的开关与数量限制；`trellis-*` 绕开了这两道闸。
 
