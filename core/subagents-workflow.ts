@@ -194,6 +194,27 @@ export function resolveFanout(
   if (args.tasks.length < 1 || args.tasks.length > MAX_FANOUT_TASKS) {
     return { error: `args.tasks must contain 1–${MAX_FANOUT_TASKS} tasks (received ${args.tasks.length}).` };
   }
+  // The batch itself, before anything else: N tasks of one kind is a number this resolver knows
+  // without asking anyone, and it is the case where the limit would be skipped entirely — a fanout
+  // of eight executors against a ceiling of three is over the limit no matter what is running now.
+  const batch = new Map<string, number>();
+  for (const raw of args.tasks as unknown[]) {
+    const entry = raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
+    const named = entry === null ? "" : str(entry.kind);
+    if (named) batch.set(named, (batch.get(named) ?? 0) + 1);
+  }
+  for (const [kind, count] of batch) {
+    const ceiling = fanoutKindOf(policy, kind)?.maxConcurrent;
+    if (ceiling !== undefined && count > ceiling) {
+      return {
+        error:
+          `args.tasks asks for ${count} × kind ${kind}, but this project's ceiling for it is ${ceiling}. ` +
+          `Split the work so no single fanout exceeds it, raise the ceiling in /Coworkflow:settings, or ` +
+          `dispatch the rest once these finish.`,
+      };
+    }
+  }
+
   const children: PlannedChild[] = [];
   for (let index = 0; index < args.tasks.length; index += 1) {
     const raw: unknown = args.tasks[index];

@@ -69,7 +69,7 @@ import {
 } from "./defaults.ts";
 import { readKindDefinitions } from "./definitions.ts";
 import { registerKindPort } from "./port.ts";
-import type { FanoutPolicy } from "../../core/subagents-workflow.ts";
+import { FANOUT_NAME, type FanoutPolicy } from "../../core/subagents-workflow.ts";
 import { KIND_PREFIX } from "../../core/config.ts";
 import {
   kindRegistryFor,
@@ -221,6 +221,30 @@ export function decodeKindDispatch(input: unknown): { agent: string; async: bool
   // `resolveDispatchKind`'s job.
   if (!agent.startsWith(KIND_PREFIX)) return null;
   return { agent, async: call.async !== false };
+}
+
+/**
+ * The per-kind batch of a `coworkflow.fanout` call, or `null` when this is not one.
+ *
+ * A fanout names kinds inside `args.tasks` instead of a top-level `agent`, so the gate has to read
+ * it separately — otherwise the package's own recommended dispatch path is the one path the per-kind
+ * limit never sees.
+ */
+export function decodeFanoutCall(input: unknown): { kind: string; count: number }[] | null {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
+  const call = input as Record<string, unknown>;
+  if (call.workflow !== FANOUT_NAME) return null;
+  const args = call.args;
+  if (args === null || typeof args !== "object" || Array.isArray(args)) return null;
+  const tasks = (args as Record<string, unknown>).tasks;
+  if (!Array.isArray(tasks)) return null;
+  const counts = new Map<string, number>();
+  for (const task of tasks) {
+    if (task === null || typeof task !== "object") continue;
+    const kind = (task as Record<string, unknown>).kind;
+    if (typeof kind === "string" && kind) counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  }
+  return counts.size === 0 ? null : [...counts].map(([kind, count]) => ({ kind, count }));
 }
 
 /**
@@ -512,6 +536,79 @@ function kindModelSuffix(entry: { model?: string; thinking?: string }): string {
  * a cheaper, more specific reason than the next, and an unregistered kind is
  * reported as such rather than as "over the limit" when both could be said.
  */
+/**
+ * The decision for a `coworkflow.fanout` call.
+ *
+ * The workflow resolver already refuses a batch that alone exceeds a kind's ceiling, but a fanout
+ * also has to respect what is *running*: three executors already going against a ceiling of five
+ * leaves room for two, not for a batch of three. That needs the owner's live count, which only the
+ * gate has, so the check lives here rather than in the resolver.
+ *
+ * Order is the same as the single-agent path — disabled, then unregistered, then over the ceiling —
+ * and the whole call is refused rather than part of it: a workflow is all-or-nothing, and starting
+ * four of five lanes would be worse than starting none.
+ */
+async function gateFanout(
+  host: PiRuntimeHost,
+  state: State,
+  runtime: RuntimeContext,
+  batch: { kind: string; count: number }[],
+  kinds: readonly ResolvedAgentKind[],
+): Promise<Refusal | undefined> {
+  const on = (): boolean => !runtime.isChild && runtime.enabled && runtime.control.moduleEnabled("agent-kinds");
+  await state.pending;
+  if (!on()) return;
+
+  const decide = (): Refusal | undefined => {
+    const snapshot = state.snapshot;
+    const live = snapshot === null || snapshot.contractFailure !== undefined
+      ? null
+      : new Set(snapshot.registered.map((entry) => entry.kind));
+    const available = availableKinds(kinds, snapshot);
+    for (const { kind, count } of batch) {
+      const policy = kinds.find((entry) => entry.kind === kind);
+      const agent = policy?.agent ?? agentNameFor(kind);
+      const dispatch = { agent, kind, async: true } satisfies KindDispatch;
+      if (policy === undefined) return unregisteredRefusal(dispatch, snapshot);
+      if (!policy.enabled) return disabledRefusal(dispatch, available);
+      if (live === null || !live.has(kind)) return unregisteredRefusal(dispatch, snapshot);
+      void count;
+    }
+    return undefined;
+  };
+
+  const first = decide();
+  if (first !== undefined) return first;
+
+  const epoch = runtime.sessionEpoch;
+  const bridge = attachSubagents(host, { epoch, events: host.events });
+  state.attached = true;
+  for (const { kind, count } of batch) {
+    const policy = kinds.find((entry) => entry.kind === kind);
+    if (policy === undefined) continue;
+    const observed = await bridge.agentCount(policy.agent);
+    if (!on() || runtime.sessionEpoch !== epoch) {
+      return { block: true, reason: "会话已更换或该层已关闭，未启动子进程。" };
+    }
+    const late = decide();
+    if (late !== undefined) return late;
+    if (observed.kind === "unknown") {
+      return unreadableCountRefusal({ agent: policy.agent, kind, async: true }, policy.maxConcurrent, observed.reason);
+    }
+    if (observed.count + count > policy.maxConcurrent) {
+      return {
+        block: true,
+        reason: [
+          `这个 coworkflow.fanout 要启动 ${count} 个 ${kindLabel(policy.agent, kind)}，但本项目的上限是 ${policy.maxConcurrent}，当前已有 ${observed.count} 个在运行。`,
+          `整批被拦下：workflow 要么全跑要么不跑，只启动一部分比一个都不启动更糟。`,
+          `请减少该 kind 的任务数、等其中一个结束，或在 /Coworkflow:settings 里调高 ${kind} 的上限。`,
+        ].join(""),
+      };
+    }
+  }
+  return;
+}
+
 async function gate(
   host: PiRuntimeHost,
   state: State,
@@ -520,15 +617,19 @@ async function gate(
 ): Promise<Refusal | undefined> {
   const on = (): boolean => !runtime.isChild && runtime.enabled && runtime.control.moduleEnabled("agent-kinds");
   if (event?.toolName !== "subagent" || !on()) return;
+  const fanout = decodeFanoutCall(event.input);
   const decoded = decodeKindDispatch(event.input);
-  if (decoded === null) return;
+  if (decoded === null && fanout === null) return;
 
   /** The live policy for this kind, read from disk on every call. */
   const policyOf = (): { kinds: ResolvedAgentKind[]; policy: ResolvedAgentKind | undefined } => {
     const root = runtime.configRoots.root(runtime.cwd);
     const config = root === null ? null : readConfig(root);
     const kinds = resolveKinds(config, readKindDefinitions(root).definitions);
-    return { kinds, policy: kinds.find((entry) => entry.agent === decoded.agent) };
+    return {
+      kinds,
+      policy: decoded === null ? undefined : kinds.find((entry) => entry.agent === decoded.agent),
+    };
   };
   // Hot reload, before anything else decides: a definition edited on disk (by an editor, another
   // program, the CLI in another process) has to be what this dispatch actually starts, not something
@@ -546,8 +647,11 @@ async function gate(
     }
   }
 
+  if (fanout !== null) return await gateFanout(host, state, runtime, fanout, current.kinds);
+
   // A name the project's table does not know is not this gate's business: the dispatch goes
   // through untouched, exactly as it did before kinds existed.
+  if (decoded === null) return;
   const kind = resolveDispatchKind(decoded.agent, current.kinds);
   if (kind === null) return;
 
@@ -640,7 +744,12 @@ export function fanoutPolicyFor(host: object, runtime: RuntimeContext): FanoutPo
         return { kind: entry.kind, agent: entry.agent, dispatchable: false,
           refusal: unregisteredKindMessage(entry.kind, entry.agent, registrationReason(snapshot, entry.kind)) };
       }
-      return { kind: entry.kind, agent: entry.agent, dispatchable: true };
+      return {
+        kind: entry.kind,
+        agent: entry.agent,
+        dispatchable: true,
+        maxConcurrent: entry.maxConcurrent,
+      };
     }),
   };
 }

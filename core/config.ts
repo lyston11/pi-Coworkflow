@@ -345,6 +345,16 @@ export const MAX_RUN_BUDGET_MS = 4 * 60 * 60 * 1000;
 export const KIND_PREFIX = "cw-";
 
 /** One kind's policy with every default applied, which is what the gate reads. */
+/**
+ * How many of one kind a project may run at once, until the project says otherwise.
+ *
+ * A guard the project owns, not a ceiling this package imposes: every kind starts at the same number
+ * and the panel changes it. It lives here rather than with the shipped kind table because two modules
+ * need it — the instructions this package writes into `AGENTS.md` quote the number, and a module may
+ * not import another module.
+ */
+export const DEFAULT_MAX_CONCURRENT = 5;
+
 export interface ResolvedAgentKind {
   /** The kind as the project spells it, without the name prefix. */
   kind: string;

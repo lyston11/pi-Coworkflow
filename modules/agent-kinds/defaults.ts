@@ -27,7 +27,13 @@
  */
 
 import { moduleAsset } from "../../core/module.ts";
-import { KIND_PREFIX, type AgentKindConfig, type ResolvedAgentKind, type WorkflowConfig } from "../../core/config.ts";
+import {
+  DEFAULT_MAX_CONCURRENT,
+  KIND_PREFIX,
+  type AgentKindConfig,
+  type ResolvedAgentKind,
+  type WorkflowConfig,
+} from "../../core/config.ts";
 import type { SubagentRole } from "../../core/trellis.ts";
 import { definitionDefaults, type KindDefinitionFile } from "./definitions.ts";
 
@@ -60,14 +66,11 @@ export interface BuiltinKind {
  * must opt into them rather than discover one.
  */
 /**
- * How many of a kind a project may run at once, until the project says otherwise.
- *
- * This is a guard the project owns, not a ceiling this package imposes: every kind starts
- * at the same number and the panel changes it. A per-kind ceiling below the others made
- * the split decision for the main session — it read as "you may only have one auditor",
- * which is a policy nobody chose.
+ * Re-exported from `core/config.ts`, where it lives so a module can quote it without importing
+ * another module. A per-kind ceiling below the others made the split decision for the main session —
+ * it read as "you may only have one auditor", which is a policy nobody chose.
  */
-export const DEFAULT_MAX_CONCURRENT = 5;
+export { DEFAULT_MAX_CONCURRENT };
 
 export const BUILTIN_KINDS: readonly BuiltinKind[] = [
   {
@@ -115,6 +118,14 @@ export interface FanoutKindPolicy {
   dispatchable: boolean;
   /** Why it may not, in the gate's own words. Absent when it may. */
   refusal?: string;
+  /**
+   * How many of this kind the project allows at once.
+   *
+   * Carried into the fanout resolver so a batch that alone overshoots the ceiling is refused there,
+   * synchronously. Without it the package's own recommended dispatch path would be the one path the
+   * per-kind limit does not cover.
+   */
+  maxConcurrent?: number;
 }
 
 /**

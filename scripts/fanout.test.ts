@@ -698,3 +698,38 @@ test("fanout: the project's budget is what the children are given", async () => 
   assert.ok(checkpointFor(60_000) < 60_000);
   assert.ok(checkpointFor(60_000) >= 15_000, "but never so short it cannot land");
 });
+
+/**
+ * The per-kind ceiling covers the package's own recommended dispatch path.
+ *
+ * It did not: `maxConcurrent` was enforced for `subagent({ agent: "cw-executor" })` and skipped
+ * entirely for `coworkflow.fanout`, so a batch of eight executors against a ceiling of two was
+ * planned without a word. A limit that the recommended road bypasses is not a limit.
+ */
+test("fanout: a batch larger than the kind's ceiling is refused by the resolver", async () => {
+  const { resolveFanout, FANOUT_NAME } = await import("../core/subagents-workflow.ts");
+  const prepared = { taskRef: ".trellis/tasks/x", worktree: "/tmp/wt", mainCheckout: "/tmp/main" };
+  const policy = { kinds: [{ kind: "executor", agent: "cw-executor", dispatchable: true, maxConcurrent: 2 }] };
+  const batch = (count: number) => ({
+    tasks: Array.from({ length: count }, (_, i) => ({ kind: "executor", task: `task ${i}` })),
+  });
+
+  // Over the ceiling: refused, and the message names the numbers so it is actionable.
+  const refused = resolveFanout(batch(3), prepared as never, policy as never);
+  assert.ok("error" in refused, "3 against a ceiling of 2 must not be planned");
+  assert.match(refused.error, /3 × kind executor/);
+  assert.match(refused.error, /ceiling for it is 2/);
+  assert.match(refused.error, /\/Coworkflow:settings/, "and says where to change it");
+  assert.equal(FANOUT_NAME, "coworkflow.fanout");
+
+  // At the ceiling: allowed. A ceiling nobody may reach is not a ceiling.
+  const allowed = resolveFanout(batch(2), prepared as never, policy as never);
+  assert.ok("script" in allowed, "2 against a ceiling of 2 is exactly the limit");
+
+  // A host that did not state a ceiling is not a licence to ignore one: the check simply has
+  // nothing to compare, and the gate's live occupancy check is the layer that still applies.
+  const unstated = resolveFanout(batch(8), prepared as never, {
+    kinds: [{ kind: "executor", agent: "cw-executor", dispatchable: true }],
+  } as never);
+  assert.ok("script" in unstated, "no ceiling stated, nothing to enforce here");
+});

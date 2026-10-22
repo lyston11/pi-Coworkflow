@@ -38,6 +38,8 @@ import { join } from "node:path";
 import type { ModuleContext, WorkflowModule } from "../../core/module.ts";
 import { moduleAsset } from "../../core/module.ts";
 import { MANAGED_REGION_END, MANAGED_REGION_START } from "../../core/trellis.ts";
+import { DEFAULT_MAX_CONCURRENT } from "../../core/config.ts";
+
 
 const REGION_START = MANAGED_REGION_START;
 const REGION_END = MANAGED_REGION_END;
@@ -55,7 +57,13 @@ function regionText(ctx: ModuleContext): string | null {
   }
   return [
     REGION_START,
-    template.replaceAll("{{worktreePrefix}}", ctx.prefix).trim(),
+    template
+      .replaceAll("{{worktreePrefix}}", ctx.prefix)
+      // The ceiling is a project setting the panel owns, so the region must not carry a number of
+      // its own: it said 3 while the shipped default was 5, which is exactly the kind of drift that
+      // makes a reader distrust every other number in the file.
+      .replaceAll("{{kindLimit}}", String(DEFAULT_MAX_CONCURRENT))
+      .trim(),
     REGION_END,
   ].join("\n");
 }

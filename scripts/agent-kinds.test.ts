@@ -1050,3 +1050,48 @@ test("kinds: every kind starts enabled with the same ceiling", () => {
     "the identity of a shipped kind is unchanged",
   );
 });
+
+/**
+ * A fanout is checked against what is running, not only against its own size.
+ *
+ * The resolver refuses a batch that alone overshoots the ceiling; only the gate can see the owner's
+ * live count, so the occupancy-aware half lives there. Both halves matter: three in flight against a
+ * ceiling of five leaves room for two, and a fanout of three would overshoot even though three is
+ * under five.
+ */
+test("gate: a fanout respects the kind ceiling including what is already running", { skip }, async () => {
+  const harness = gateHarness({ kinds: { executor: { maxConcurrent: 5 } } });
+  try {
+    const fanout = (count: number) => ({
+      workflow: "coworkflow.fanout",
+      args: { tasks: Array.from({ length: count }, (_, i) => ({ kind: "executor", task: `t${i}` })) },
+    });
+
+    // Room: three in flight against a ceiling of five, a batch of two fits.
+    harness.live.push("cw-executor", "cw-executor", "cw-executor");
+    assert.equal(await harness.call(fanout(2)), undefined, "within the ceiling, the gate stays out of it");
+
+    // Four in flight: a batch of two would reach six, so the whole call is refused.
+    harness.live.push("cw-executor");
+    const over = await harness.call(fanout(2));
+    assert.ok(over, "the call must be refused");
+    const reason = String(over.reason ?? "");
+    assert.match(reason, /要启动 2 个/);
+    assert.match(reason, /上限是 5/);
+    assert.match(reason, /当前已有 4 个在运行/);
+    assert.match(reason, /整批被拦下/, "a workflow is all-or-nothing");
+    assert.match(reason, /\/Coworkflow:settings/, "and says where to change it");
+
+    // A disabled kind is refused for the fanout too, with the batch never starting.
+    const off = gateHarness({ kinds: { auditor: { enabled: false } } });
+    try {
+      const refused = await off.call({ workflow: "coworkflow.fanout", args: { tasks: [{ kind: "auditor", task: "x" }] } });
+      assert.ok(refused, "a disabled kind inside a fanout is refused");
+      assert.match(String(refused.reason ?? ""), /关闭了 kind auditor/);
+    } finally {
+      off.close();
+    }
+  } finally {
+    harness.close();
+  }
+});

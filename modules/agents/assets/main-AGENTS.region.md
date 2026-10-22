@@ -54,13 +54,15 @@
 
 | kind | agent | Trellis 角色 | 默认 |
 |---|---|---|---|
-| 执行者 | `cw-executor` | implement | 开，上限 3 |
-| 审计者 | `cw-auditor` | check | 开，上限 5 |
-| 调研者 | `cw-researcher` | research | 开，上限 5 |
+| 执行者 | `cw-executor` | implement | 开，上限 {{kindLimit}} |
+| 审计者 | `cw-auditor` | check | 开，上限 {{kindLimit}} |
+| 调研者 | `cw-researcher` | research | 开，上限 {{kindLimit}} |
+
+这三个只是本包随附的默认值。**一个 kind 就是一份 markdown**：`<项目>/.pi/Coworkflow/agents/<kind>.md`，frontmatter 声明它是什么（label / agent / role / description / model / thinking / maxConcurrent / enabled），正文就是它的系统提示词（职能）。所以你可以改这三个的职能与名字，也可以新增自己的 kind；改完下一次派单就生效，不用重启。用 `pi-coworkflow kind scaffold|export|set --from|check` 操作它，或在面板/`/Coworkflow:kind` 里改。
 
 派单写 `agent: "cw-executor"`，**不要写** `trellis-implement` / `trellis-check` / `trellis-research`：`cw-*` 拿到的是同一份角色上下文，但会经过本项目的开关与数量限制；`trellis-*` 绕开了这两道闸。
 
-面板（`/Coworkflow:settings` 的「子 agent 类型」）里关掉的 kind，派单会被拒绝并列出当前可用的 kind；超过某 kind 的上限也会被拒绝并给出当前占用。`/Coworkflow:run` 与 `coworkflow.fanout` 都会遵循同一套 kind 策略。
+面板（`/Coworkflow:settings` 的「子 agent 类型」）里关掉的 kind，派单会被拒绝并列出当前可用的 kind；超过某 kind 的上限也会被拒绝并给出当前占用。**这条上限对直接派单和 `coworkflow.fanout` 同样有效**：fanout 里某个 kind 的任务数加上正在运行的数量超过上限时，**整批**被拒（workflow 要么全跑要么不跑），并在拒绝理由里给出批大小、上限与当前占用。
 
 **先确认 `subagent` 工具存在再用它。** 派单靠的是 pi-subagents 提供的 `subagent` 工具；它没加载时（新项目还没 `/Coworkflow:init`、项目未受信任、刚装完还没重开 Pi），本会话里根本没有这个工具。这种情况下：
 
@@ -79,8 +81,8 @@
 - **要求「一次探针」而不是「逐条验证」。** 让子 agent 写一个脚本把所有结论一次跑完并打印一张表；逐条各跑一次命令时，每个工具调用都是一次完整往返，几十条就能吃掉整个预算——实测同一类复核任务，逐条验证用掉 23 分钟 / 160 次调用，一次探针只用 5 分钟 / 60 次。
 - **派单边界**：能独立验证的边界工作才派（有明确的输入、产物、验收方式）；探索性、需要全局判断、或跨多个模块协调的工作留在主会话。子 agent 不负责决定"做什么"，只负责"把它做好并报告"。
 - **审计边界**：子 agent 回结果不等于结果可用。主会话要对照 prd 的验收条件检查产物、核对它引用的文件与结论、跑该模块的测试；发现偏差就重派或自己修，不能直接把子 agent 的结论当成事实汇报给用户。
-- 子会话**不继承**主会话上下文：派单时显式写 `context: "fresh"`（三个 Trellis 角色 agent 也已声明 `defaultContext: fresh`；若你全局配了 `defaultSubagentContext: "fork"`，它会被覆盖，必须显式 `fresh`）。它拿到的 Trellis 上下文由 `pi-Coworkflow` 的 `subagent-context` 模块按角色注入：`trellis-implement` / `trellis-check` / `trellis-research` 分别得到 `implement.jsonl` / `check.jsonl` / spec 目录树，加上 prd.md、design.md、implement.md；字节预算沿用 `.trellis/config.yaml` 的 `context_injection`。 **注入按角色，不按 agent 名**：任何 agent 只要标记成这三个角色之一，就拿到对应那一份；`worker` / `researcher` / `reviewer` 等其它 agent 拿到的是子 agent 约定（不含角色上下文），不是什么都不给。
-- 因此派单提示词**首行必须是 `Active task: <任务目录>`**（Trellis 既有的派单协议）——注入靠它定位任务。角色按两级识别：① **会话名**里的 `trellis-<role>`（`subagent-<agent>-<runId>-<i>` 或 `<agent>: <task>` 都含 agent 名）；② agent 定义或派单提示词里的 `<!-- trellis-agent: <role> -->` 标记。所以想让任意 agent（例如 `worker`）拿到 implement 那份上下文，就在它的定义里加一行 `<!-- trellis-agent: implement -->`，不必把它改名成 `trellis-implement`。
+- 子会话**不继承**主会话上下文：派单时显式写 `context: "fresh"`（三个 Trellis 角色 agent 也已声明 `defaultContext: fresh`；若你全局配了 `defaultSubagentContext: "fork"`，它会被覆盖，必须显式 `fresh`）。它拿到的 Trellis 上下文由 `pi-Coworkflow` 的 `subagent-context` 模块按**角色**注入：`implement` 拿到 `implement.jsonl` / `check` 拿到 `check.jsonl` / `research` 拿到 spec 目录树，加上 prd.md、design.md、implement.md；字节预算沿用 `.trellis/config.yaml` 的 `context_injection`。 **注入按角色，不按 agent 名**：`cw-executor` → implement、`cw-auditor` → check、`cw-researcher` → research 来自 kind 表；任何其它 agent 只要标记成这三个角色之一（`<!-- trellis-agent: <role> -->`）也拿到对应那一份；`role: none` 的 kind 与未标记的 agent 拿到的是子 agent 约定（不含角色上下文），不是什么都不给。
+- 因此派单提示词**首行必须是 `Active task: <任务目录>`**（Trellis 既有的派单协议）——注入靠它定位任务。角色按两级识别：① **会话名里的 agent 名**（`subagent-<agent>-<runId>-<i>` 或 `<agent>: <task>` 都含 agent 名）按 kind 表解析成角色，改名后的 kind 也一样；② agent 定义或派单提示词里的 `<!-- trellis-agent: <role> -->` 标记。所以想让任意 agent（例如 `worker`）拿到 implement 那份上下文，就在它的定义里加一行 `<!-- trellis-agent: implement -->`。
 - 并行派单不要猜 API：`subagent({ workflow: "parallel", args: { tasks: [...] } })` 的每个 task **只接受 `agent` 和 `task`**（带 `output` 会被拒）；多步/带产出的 workflow 必须把 JS 脚本写成文件再用 `workflow: "<路径>"`，`workflow: true` 只在同一回复里写了 ```js 代码块时有效。先 `subagent({ action: "validate", workflow: "<路径>" })` 再 `async: true` 派发。
 - 多段工作优先用 `coworkflow.fanout` 一次派出（内部并发），而不是逐个 `await`；写代码的 lane 传 `worktrees: true`。只派单件时才用单次 `subagent`。
 - 并行写代码的 lane 用 `worktree: true`（`coworkflow.fanout` 里是 `worktrees: true`）。pi-subagents 托管 worktree、从干净 HEAD 分配（要求主检出干净），产出每个 lane 的 patch + handoff manifest，**不会**自动应用。
