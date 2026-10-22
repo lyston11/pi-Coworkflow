@@ -27,6 +27,7 @@ import {
   FANOUT_NAME,
   RUN_BUDGET_MS,
   RUN_CHECKPOINT_MS,
+  checkpointFor,
   WORKFLOW_NAME,
   dispatchOverlap,
   readSessionLinks,
@@ -671,4 +672,29 @@ test("fanout: children get a stated budget and a pre-deadline checkpoint", async
   assert.match(script, /本次运行上限约 25 分钟/);
   assert.match(script, /正在写交接/);
   assert.match(script, /验证合并成尽量少的一次探针/);
+});
+
+/**
+ * A project's budget reaches the children, and the checkpoint scales with it.
+ *
+ * The two numbers describe one policy, so the checkpoint is derived: a project that sets a
+ * long budget gets a proportionally earlier warning, and one that sets a short budget still
+ * gets a warning it can act on rather than one that cannot land inside a tool call.
+ */
+test("fanout: the project's budget is what the children are given", async () => {
+  const budget = 90 * 60 * 1000;
+  const expanded = resolveFanout(
+    { tasks: [{ kind: "executor", task: "a" }] },
+    { taskRef: ".trellis/tasks/10-20-demo", worktree: TWD, mainCheckout: "/tmp/main", runBudgetMs: budget },
+    allKindsDispatchable() as any,
+  );
+  if ("error" in expanded) throw new Error(expanded.error);
+
+  assert.match(expanded.script, new RegExp(`const BUDGET_MS = ${budget};`));
+  assert.match(expanded.script, new RegExp(`const CHECKPOINT_MS = ${checkpointFor(budget)};`));
+  assert.match(expanded.script, /本次运行上限约 90 分钟/, "the child is told the project's number");
+  assert.ok(checkpointFor(budget) < budget, "the warning still precedes the deadline");
+  // Short budgets cannot have a checkpoint that outlives them.
+  assert.ok(checkpointFor(60_000) < 60_000);
+  assert.ok(checkpointFor(60_000) >= 15_000, "but never so short it cannot land");
 });

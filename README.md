@@ -145,6 +145,8 @@ subagent({ workflow: "coworkflow.fanout", args: {
 
 **不是空转**：这些运行的命令各不相同、结论在推进，是「很多个小步骤串行」把预算花光的。
 
+**这个上限在面板里可改**：`/Coworkflow:settings` 的「子 agent 运行上限」，单位分钟，留空回到内置默认（25 分钟）。设置后写进 `.pi/Coworkflow.json` 的 `subagentRunBudgetMs`，**下一次派单生效**；「停下交接」的提前量按上限自动推算（上限的 1/6，最少 15 秒、最多 4 分钟），不需要第二个数字。
+
 两处已改（`coworkflow.fanout` / `implement-review` 都带上了）：
 
 - **写明预算**：任务描述里写「上限约 25 分钟、剩余 4 分钟会要求停下交接」，并用 `timeoutMs` + `checkpointBeforeDeadlineMs` 把上限与「停下交接」的提醒真正交给上游；

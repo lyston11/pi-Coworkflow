@@ -68,6 +68,31 @@ async function editProjectLimit(
   return control.setSubagentConcurrency(parsed);
 }
 
+/**
+ * Ask for the wall-clock budget one child run gets.
+ *
+ * Minutes, not milliseconds: this is a number a person reasons about, and the unit is what
+ * makes "25" and "1500" different answers rather than the same one twice.
+ */
+async function editRunBudget(
+  control: WorkflowControl,
+  commandCtx: any,
+  current: number | null,
+): Promise<string> {
+  const value = await commandCtx?.ui?.input?.(
+    "子 agent 运行上限（分钟，1–240；留空 = 内置默认 25 分钟）",
+    current === null ? "" : String(current),
+  );
+  if (value === undefined) return "未修改";
+  const trimmed = value.trim();
+  if (!trimmed) return control.setRunBudgetMinutes(null);
+  const parsed = Number(trimmed);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 240) {
+    return `运行上限需要 1–240 的整数分钟（留空 = 内置默认）：${trimmed}`;
+  }
+  return control.setRunBudgetMinutes(parsed);
+}
+
 /** Ask for one kind's limit; an empty answer restores the built-in default. */
 async function editKindLimit(
   control: WorkflowControl,
@@ -156,6 +181,15 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
     value: limit === null ? "不限" : String(limit),
     detail: "同一会话同时活跃的顶层 async run；留空 = 不限（由 Coworkflow 拦截）",
     act: () => editProjectLimit(control, commandCtx, limit),
+  });
+
+  const budget = control.runBudgetMinutes();
+  rows.push({
+    section: "子 agent",
+    label: "子 agent 运行上限",
+    value: budget === null ? "25 分钟（默认）" : `${budget} 分钟`,
+    detail: "一次派单的墙上时间上限；接近上限前会要求子 agent 停下交接（留空 = 默认）",
+    act: () => editRunBudget(control, commandCtx, budget),
   });
 
   const kinds = control.agentKinds();

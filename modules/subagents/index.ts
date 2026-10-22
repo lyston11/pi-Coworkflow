@@ -540,7 +540,15 @@ function withKindAgents(
   root: string,
   plan: RunPlan,
 ): PreparedWorkflowContext {
-  return { ...plan, ...kindWorkflowAgents(host, resolveKinds(readConfig(root))) };
+  const config = readConfig(root);
+  const budget = config?.subagentRunBudgetMs;
+  return {
+    ...plan,
+    ...kindWorkflowAgents(host, resolveKinds(config)),
+    // The project's run budget travels with the prepared context, so both workflows hand
+    // upstream the number the project chose instead of the built-in default.
+    ...(budget === undefined ? {} : { runBudgetMs: budget }),
+  };
 }
 
 /** Withdraw the set we wanted: the registration goes, the generation moves. */

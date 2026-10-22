@@ -76,7 +76,19 @@ export const REVIEW_KEY = "review";
  * not.
  */
 export const RUN_BUDGET_MS = 25 * 60 * 1000;
-export const RUN_CHECKPOINT_MS = 4 * 60 * 1000;
+
+/**
+ * How long before the deadline a child is asked to stop and hand over.
+ *
+ * Derived rather than a second setting: the two numbers describe one policy ("finish what
+ * you are doing and report"), and a project that sets a budget wants the warning scaled to
+ * it. Never longer than the default, never so short that a tool call cannot finish.
+ */
+export function checkpointFor(budgetMs: number): number {
+  return Math.max(15_000, Math.min(4 * 60 * 1000, Math.floor(budgetMs / 6)));
+}
+
+export const RUN_CHECKPOINT_MS = checkpointFor(RUN_BUDGET_MS);
 
 export const DEFAULT_IMPLEMENT_AGENT = "trellis-implement";
 export const DEFAULT_REVIEW_AGENT = "trellis-check";
@@ -111,6 +123,8 @@ export interface PreparedWorkflowContext {
    * `subagent-context` resolves `cw-executor` to `implement`.
    */
   implementAgent?: string;
+  /** The project's run budget, when it set one; absent means the built-in default. */
+  runBudgetMs?: number;
   /** A registered kind standing in for the `review` step (`cw-auditor`). */
   reviewAgent?: string;
 }
@@ -212,6 +226,7 @@ export function resolveFanout(
       // allocates each lane its own from a clean HEAD.
       ...(!worktrees && prepared?.worktree ? { cwd: prepared.worktree } : {}),
       ...(worktrees ? { worktrees: true } : {}),
+      ...(budgetOf(prepared) !== RUN_BUDGET_MS ? { budgetMs: budgetOf(prepared) } : {}),
     }),
   };
 }
@@ -262,7 +277,8 @@ export function resolveImplementReview(args: Readonly<Record<string, unknown>>, 
   }
   if (implementAgent === reviewAgent) return { error: "args.implementAgent and args.reviewAgent must differ." };
   return { script: buildScript({ taskRef: prepared.taskRef, worktree: prepared.worktree,
-    taskTitle: prepared.title?.slice(0, MAX_TITLE), focus, implementAgent: implementAgent!, reviewAgent: reviewAgent! }) };
+    taskTitle: prepared.title?.slice(0, MAX_TITLE), focus, implementAgent: implementAgent!, reviewAgent: reviewAgent!,
+    ...(prepared.runBudgetMs === undefined ? {} : { budgetMs: prepared.runBudgetMs }) }) };
 }
 
 interface ScriptInput {
@@ -272,6 +288,8 @@ interface ScriptInput {
   focus?: string;
   implementAgent: string;
   reviewAgent: string;
+  /** The project's run budget, when it set one; absent means the built-in default. */
+  budgetMs?: number;
 }
 
 const IMPLEMENT_SCHEMA = {
@@ -324,6 +342,8 @@ interface FanoutScriptInput {
   cwd?: string;
   /** Each lane gets its own upstream-managed worktree instead of sharing one. */
   worktrees?: boolean;
+  /** The project's run budget, when it differs from the default. */
+  budgetMs?: number;
 }
 
 /**
@@ -341,8 +361,9 @@ const tasks = ${JSON.stringify(input.children)};
 const cwd = ${JSON.stringify(input.cwd ?? null)};
 const WORKTREES = ${input.worktrees === true ? "true" : "false"};
 const FANOUT_SCHEMA = ${JSON.stringify(FANOUT_SCHEMA)};
-const BUDGET_MS = ${RUN_BUDGET_MS};
-const CHECKPOINT_MS = ${RUN_CHECKPOINT_MS};
+const BUDGET_MS = ${input.budgetMs ?? RUN_BUDGET_MS};
+const CHECKPOINT_MS = ${checkpointFor(input.budgetMs ?? RUN_BUDGET_MS)};
+const BUDGET_TEXT = ${JSON.stringify(budgetLines(input.budgetMs ?? RUN_BUDGET_MS).join("\n"))};
 const MAX_SUMMARY = 4000;
 
 function textOf(value) {
@@ -388,7 +409,7 @@ function paramsFor(task) {
   const params = {
     label: task.key + " " + task.agent,
     agent: task.agent,
-    task: task.task + ${JSON.stringify(focus)} + ${JSON.stringify("\n\n" + budgetLines().join("\n"))},
+    task: task.task + ${JSON.stringify(focus)} + "\\n\\n" + BUDGET_TEXT,
     worktree: WORKTREES === true,
     context: "fresh",
     timeoutMs: BUDGET_MS,
@@ -460,10 +481,16 @@ return {
  * interpolation into a prompt is the task reference, the worktree path and an
  * optional review focus, all already length- and shape-bounded above.
  */
+/** The budget in force for this dispatch: the project's, or the built-in default. */
+function budgetOf(prepared?: PreparedWorkflowContext | null): number {
+  const stored = prepared?.runBudgetMs;
+  return typeof stored === "number" && Number.isFinite(stored) && stored > 0 ? stored : RUN_BUDGET_MS;
+}
+
 /** What every child is told about its own deadline, so it can plan instead of being cut off. */
-function budgetLines(): string[] {
-  const minutes = Math.round(RUN_BUDGET_MS / 60000);
-  const warning = Math.round(RUN_CHECKPOINT_MS / 60000);
+function budgetLines(budgetMs: number = RUN_BUDGET_MS): string[] {
+  const minutes = Math.round(budgetMs / 60000);
+  const warning = Math.max(1, Math.round(checkpointFor(budgetMs) / 60000));
   return [
     `- 本次运行上限约 ${minutes} 分钟；剩余 ${warning} 分钟时会收到「停下并交接」的要求，届时不要再开新工作。`,
     "- 尽早把交接写出来并随时更新：超时最常见的发生点就是「正在写交接」。",
@@ -472,6 +499,7 @@ function budgetLines(): string[] {
 }
 
 function buildScript(input: ScriptInput): string {
+  const budget = input.budgetMs ?? RUN_BUDGET_MS;
   const taskLine = `Active task: ${input.taskRef}`;
   const title = input.taskTitle ? `任务标题：${input.taskTitle}\n` : "";
   const focus = input.focus ? `\n复核重点（来自主会话）：${input.focus}\n` : "";
@@ -486,7 +514,7 @@ function buildScript(input: ScriptInput): string {
     "- 只改本任务范围内的代码；不要扩大范围、不要顺手重构无关文件。",
     "- 不要 git commit / push / merge，不要合并或清理 worktree；这些是主会话的职责。",
     "- 跑受影响范围的最小充分检查（typecheck / 聚焦测试），把真实输出写进结论。",
-    ...budgetLines(),
+    ...budgetLines(budget),
     `- 最后用结构化输出汇报：status（completed / blocked / failed）、summary、changedFiles、residualRisks。${focus}`,
   ].join("\n");
 
@@ -498,7 +526,7 @@ function buildScript(input: ScriptInput): string {
     "要求：",
     "- 对照 prd.md / design.md / implement.md 和受影响范围的 spec 判断这份改动是否满足要求。",
     "- 检查自报的验证结论是否真的支持结论（有没有改到别人正在改的文件、有没有漏掉回归）。",
-    ...budgetLines(),
+    ...budgetLines(budget),
     "- 给出结构化输出：verdict（pass / changes_requested / blocked）、summary、findings（仅列阻塞问题，pass 时必须为空数组）。只要还有阻塞问题就必须给出 changes_requested 或 blocked，不要为了让流程通过而给 pass。",
   ].join("\n");
 
@@ -547,8 +575,8 @@ const implement = await runs.run(${JSON.stringify(IMPLEMENT_KEY)}, {
   cwd: worktree,
   worktree: false,
   context: "fresh",
-  timeoutMs: ${RUN_BUDGET_MS},
-  checkpointBeforeDeadlineMs: ${RUN_CHECKPOINT_MS},
+  timeoutMs: ${budget},
+  checkpointBeforeDeadlineMs: ${checkpointFor(budget)},
   acceptance: { level: "checked", report: "on", criteria: ["Fulfil the active task within scope"],
     evidence: ["changed-files", "commands-run", "residual-risks", "no-staged-files"] },
   outputSchema: IMPLEMENT_SCHEMA
@@ -591,8 +619,8 @@ const review = await runs.run(${JSON.stringify(REVIEW_KEY)}, {
   cwd: worktree,
   worktree: false,
   context: "fresh",
-  timeoutMs: ${RUN_BUDGET_MS},
-  checkpointBeforeDeadlineMs: ${RUN_CHECKPOINT_MS},
+  timeoutMs: ${budget},
+  checkpointBeforeDeadlineMs: ${checkpointFor(budget)},
   acceptance: { level: "attested", report: "on", criteria: ["Independently review the implementation against the active task"],
     evidence: ["review-findings", "residual-risks", "manual-notes"] },
   outputSchema: REVIEW_SCHEMA

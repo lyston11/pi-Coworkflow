@@ -73,7 +73,7 @@ function fixture() {
       configRoot: () => root, configRootNote: () => null,
       autoEnable: () => true, prefix: () => "wt-", facts: () => [], setSwitch: () => "", setAutoEnable: () => "",
       setPrefix: () => "", subagentConcurrency: () => null, setSubagentConcurrency: () => "", loadState: () => "auto",
-      agentKinds: () => [], setAgentKind: () => "", agentKindStatus: () => [], settleAgentKinds: () => Promise.resolve(), settleSubagents: () => Promise.resolve(),
+      agentKinds: () => [], setAgentKind: () => "", agentKindStatus: () => [], settleAgentKinds: () => Promise.resolve(), settleSubagents: () => Promise.resolve(), runBudgetMinutes: () => null, setRunBudgetMinutes: () => "",
       init: () => "" }, refresh() {} } as RuntimeContext;
   const ctx = { sessionManager: { getSessionId: () => runtime.sessionId!, getEntries: () => [entry(20)] } };
   return { root, events, host, runtime, ctx, moduleEnabled(value: boolean) { enabled = value; },

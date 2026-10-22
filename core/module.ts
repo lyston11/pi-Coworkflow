@@ -374,6 +374,9 @@ export interface WorkflowControl {
    * so this number is enforced by the `capacity` module.
    */
   subagentConcurrency(): number | null;
+  /** Minutes one dispatched child run gets; `null` means the built-in default. */
+  runBudgetMinutes(): number | null;
+  setRunBudgetMinutes(value: number | null): string;
   setSubagentConcurrency(value: number | null): string;
   /**
    * The project's subagent kinds with every default applied, read from disk.

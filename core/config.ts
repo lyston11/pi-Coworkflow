@@ -41,6 +41,15 @@ export interface WorkflowConfig {
    */
   subagentConcurrency?: number;
   /**
+   * Wall-clock budget one dispatched child run gets, in milliseconds.
+   *
+   * Upstream's backstop is 30 minutes and a child cannot see it, so a run that was making
+   * progress gets killed mid-thought — often while writing its own handoff, which makes the
+   * work unusable rather than merely unfinished. This is the number the workflows hand to
+   * upstream and state in the child's task text. Absent means the built-in default.
+   */
+  subagentRunBudgetMs?: number;
+  /**
    * Module id → enabled. An explicit value here always wins; an absent id is a
    * module added after this map was written, and its own declared
    * `newSwitchDefault` decides (see `resolveSwitch`).
@@ -267,6 +276,7 @@ function parseConfig(raw: string): WorkflowConfig | null {
       autoEnable?: unknown;
       subagentConcurrency?: unknown;
       agentKinds?: unknown;
+      subagentRunBudgetMs?: unknown;
     };
     const agentKinds = parseAgentKinds(record.agentKinds);
     const modules: Record<string, boolean> = {};
@@ -280,6 +290,7 @@ function parseConfig(raw: string): WorkflowConfig | null {
       ...(typeof record.installedAt === "string" ? { installedAt: record.installedAt } : {}),
       ...(typeof record.worktreePrefix === "string" ? { worktreePrefix: record.worktreePrefix } : {}),
       ...(record.autoEnable === true ? { autoEnable: true } : {}),
+      ...(isRunBudget(record.subagentRunBudgetMs) ? { subagentRunBudgetMs: record.subagentRunBudgetMs } : {}),
       ...(typeof record.subagentConcurrency === "number" &&
       Number.isInteger(record.subagentConcurrency) &&
       record.subagentConcurrency > 0
@@ -292,6 +303,20 @@ function parseConfig(raw: string): WorkflowConfig | null {
     return null;
   }
 }
+
+/**
+ * Whether a stored budget is usable.
+ *
+ * Bounded rather than merely positive: a value below a minute cannot fit even one tool call
+ * and a value above a few hours is indistinguishable from "no deadline", and both would be
+ * silently accepted by upstream as a real number.
+ */
+export function isRunBudget(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= MIN_RUN_BUDGET_MS && value <= MAX_RUN_BUDGET_MS;
+}
+
+export const MIN_RUN_BUDGET_MS = 60_000;
+export const MAX_RUN_BUDGET_MS = 4 * 60 * 60 * 1000;
 
 /** `cw-<kind>`: the namespace that keeps a kind away from builtins and project agents. */
 export const KIND_PREFIX = "cw-";

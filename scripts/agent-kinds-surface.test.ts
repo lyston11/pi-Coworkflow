@@ -1004,3 +1004,63 @@ test("subagents: a throwing host reads as 'cannot say', not as an error", async 
   assert.equal(subagentToolAvailable(throwing as never), null, "unknown, never false");
   assert.equal(reactivateSubagentTool(throwing as never), null, "and the repair is not attempted");
 });
+
+/**
+ * The run budget is a project setting, and the panel is where it is set.
+ *
+ * Upstream's 30-minute backstop was invisible to the child and unchangeable from this
+ * layer, so a project whose work genuinely needs longer had no way to say so — and one
+ * whose work needs less could not tighten it either.
+ */
+test("panel: the run budget is editable and reaches the workflow", async () => {
+  const { buildSettingRows } = await import("../modules/panel/settings.ts");
+  const written: Record<string, unknown> = {};
+  const control: any = {
+    initialized: () => true,
+    switches: () => ({}),
+    moduleIds: () => [],
+    configRoot: () => "/tmp/project",
+    configRootNote: () => null,
+    autoEnable: () => false,
+    moduleEnabled: () => true,
+    subagentConcurrency: () => null,
+    runBudgetMinutes: () => 40,
+    agentKinds: () => [],
+    agentKindStatus: () => [],
+    facts: () => [],
+    prefix: () => "wt-",
+    setRunBudgetMinutes: (value: number | null) => {
+      written.value = value;
+      return "ok";
+    },
+  };
+  const row = buildSettingRows(control, { mode: "print" }).find((entry) => entry.label === "子 agent 运行上限");
+  assert.ok(row, "the budget has a row of its own");
+  assert.equal(row!.value, "40 分钟");
+  assert.match(String(row!.detail), /停下交接/, "and says what happens near the limit");
+
+  // Minutes in, milliseconds out: the stored value is what upstream reads.
+  const { readConfig } = await import("../core/config.ts");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cw-budget-"));
+  try {
+    fs.mkdirSync(path.join(root, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, ".pi", "Coworkflow.json"),
+      JSON.stringify({ version: 1, modules: {}, subagentRunBudgetMs: 40 * 60000 }),
+    );
+    assert.equal(readConfig(root)?.subagentRunBudgetMs, 40 * 60000);
+    // A budget outside the usable range is dropped rather than passed to upstream.
+    for (const bad of [0, -1, 1.5, 30_000, 5 * 60 * 60 * 1000, "45"]) {
+      fs.writeFileSync(
+        path.join(root, ".pi", "Coworkflow.json"),
+        JSON.stringify({ version: 1, modules: {}, subagentRunBudgetMs: bad }),
+      );
+      assert.equal(readConfig(root)?.subagentRunBudgetMs, undefined, `${JSON.stringify(bad)} is not a budget`);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -64,6 +64,7 @@ import { nearestTrustDecision, trustFilePath, trustProject } from "../core/trust
 import { MODULES, findModule, moduleIds } from "../modules/index.ts";
 import { agentKindsModule, syncAgentKinds } from "../modules/agent-kinds/index.ts";
 import { syncSubagentsRuntime } from "../modules/subagents/index.ts";
+import { RUN_BUDGET_MS } from "../core/subagents-workflow.ts";
 import { BUILTIN_KINDS, agentNameFor, builtinKind, resolveKinds } from "../modules/agent-kinds/defaults.ts";
 import { installedPrefix } from "../modules/worktree/index.ts";
 
@@ -217,6 +218,8 @@ let runtime: RuntimeContext = {
     moduleEnabled: () => false,
     setPrefix: () => "control 尚未就绪",
     subagentConcurrency: () => null,
+    runBudgetMinutes: () => null,
+    setRunBudgetMinutes: () => "control 尚未就绪",
     setSubagentConcurrency: () => "control 尚未就绪",
     agentKinds: () => [],
     setAgentKind: () => "control 尚未就绪",
@@ -951,6 +954,24 @@ function createControl(): WorkflowControl {
       return value === null
         ? "子 agent 并发上限 → 不限（本项目；不再拦截派单）"
         : `子 agent 并发上限 → ${value}（本项目；由 Coworkflow 在派单时拦截）`;
+    },
+    runBudgetMinutes: () => {
+      const root = rootOf();
+      const stored = root === null ? undefined : readConfig(root)?.subagentRunBudgetMs;
+      return stored === undefined ? null : Math.round(stored / 60000);
+    },
+    setRunBudgetMinutes: (value) => {
+      const root = rootOf();
+      if (root === null) return unresolved();
+      const config = readConfig(root);
+      if (config === null) return `本项目未初始化：先 /${NS}:init`;
+      const next: WorkflowConfig = { ...config };
+      if (value === null) delete next.subagentRunBudgetMs;
+      else next.subagentRunBudgetMs = value * 60000;
+      writeConfig(root, next);
+      return value === null
+        ? `子 agent 运行上限 → 内置默认（${Math.round(RUN_BUDGET_MS / 60000)} 分钟）`
+        : `子 agent 运行上限 → ${value} 分钟（本项目；下一次派单生效）`;
     },
     agentKinds: () => {
       const root = rootOf();
