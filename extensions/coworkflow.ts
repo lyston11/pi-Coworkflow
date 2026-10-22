@@ -33,7 +33,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join, sep } from "node:path";
 import type {
   ModuleContext,
@@ -69,7 +69,7 @@ import { agentKindsModule, syncAgentKinds } from "../modules/agent-kinds/index.t
 import { syncSubagentsRuntime } from "../modules/subagents/index.ts";
 import { RUN_BUDGET_MS } from "../core/subagents-workflow.ts";
 import { BUILTIN_KINDS, agentNameFor, builtinKind, resolveKinds } from "../modules/agent-kinds/defaults.ts";
-import { DEFINITIONS_REL, definitionsDir, readKindDefinitions, writeKindDefinition } from "../modules/agent-kinds/definitions.ts";
+import { DEFINITIONS_REL, definitionsDir, readKindDefinitions, writeDefinitionFile, writeKindDefinition } from "../modules/agent-kinds/definitions.ts";
 import { THINKING_LEVELS } from "../modules/panel/shared.ts";
 import { installedPrefix } from "../modules/worktree/index.ts";
 
@@ -779,6 +779,15 @@ async function runKindCommand(args: string, ctx: CommandContext): Promise<string
 
   if (sub === "set") {
     if (kind === undefined) return `用法：/${NS}:kind set <kind> key=value…（可用键：label agent role description model thinking maxConcurrent enabled prompt）`;
+    // `--from <file>` first: the definition IS a markdown document, and a slash command that can
+    // only take `k=v` would push people into quoting a prompt on one line.
+    const fromAt = parts.indexOf("--from", 2);
+    if (fromAt !== -1) {
+      const path = parts[fromAt + 1];
+      if (path === undefined) return `用法：/${NS}:kind set ${kind} --from <file.md>`;
+      const written = control.defineKind(kind, { __from: path });
+      return await written;
+    }
     const patch: Record<string, unknown> = {};
     for (const pair of parts.slice(2)) {
       const at = pair.indexOf("=");
@@ -1156,6 +1165,25 @@ function createControl(): WorkflowControl {
     defineKind: async (kind, patch) => {
       const root = rootOf();
       if (root === null) return unresolved();
+      // A whole file hands over its own bytes: the definition is a markdown document, and a
+      // re-render would drop the author's headings, comments and spacing.
+      const from = patch.__from;
+      if (typeof from === "string") {
+        let text: string;
+        try {
+          text = readFileSync(from, "utf-8");
+        } catch (error) {
+          return `${kind} 未写入：无法读取 ${from}（${error instanceof Error ? error.message : String(error)}）`;
+        }
+        const verbatim = writeDefinitionFile(root, kind, text);
+        if (!verbatim.ok) return `${kind} 未写入：${verbatim.reason}`;
+        if (runtimeHost !== null) await syncAgentKinds(runtimeHost, runtime);
+        const resolvedEntry = resolveKinds(readConfig(root), readKindDefinitions(root).definitions)
+          .find((entry) => entry.kind === kind);
+        return `${kind} 已按 ${from} 写入 ${verbatim.path}（${
+          resolvedEntry === undefined ? "但当前无法解析" : `agent ${resolvedEntry.agent}，${resolvedEntry.enabled ? "on" : "off"}`
+        }）`;
+      }
       const existing = readKindDefinitions(root).definitions.get(kind);
       const written = writeKindDefinition(root, kind, patch, existing);
       if (!written.ok) return `${kind} 未写入：${written.reason}`;

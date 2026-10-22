@@ -218,6 +218,8 @@ fleet 投影的 `key` 是不透明显示键，上游明确禁止当作 run 或 a
 
 写入只有一个实现（`writeKindDefinition`），三个入口都走它：**终端 CLI**（`scripts/cli.ts`，`pi-coworkflow kind …`）、Pi 内命令 `/Coworkflow:kind`、公开请求 `coworkflow:kind:v1`。**先校验再落盘**。
 
+**一个 kind 就是一份 markdown 文档**（`.pi/Coworkflow/agents/<kind>.md`），正文即系统提示词。所以 CLI 的主路是文件而不是参数：`scaffold` 生成骨架 → 用编辑器改 → `set <kind> --from <file>` 校验后**按原样写入**（保留标题、列表、强调、换行与注释）→ `check` 只读校验。`export <kind> --out <file>` 把生效定义（含本包随附的提示词）导出成可编辑文件，避免让人重打一份长提示词。
+
 CLI 是给**外部 agent** 的入口：不依赖 Pi 会话、扩展宿主或任何常驻进程，任何能跑 shell 的 agent 都能用。两条约定不可动摇——**退出码是结论**（0 成功 / 1 被拒绝且文件未改动 / 2 用法或找不到 / 3 内部错误），`--json` 让机器读结果而不用解析散文。它用 `mainCheckout` 解析项目根：在 task worktree 里执行会写到主检出，因为 worktree 只有已提交文件，写在里面没有 gate 会读到。不做「只在内存里注册」的通路——那种 kind 在 `/reload` 后会消失，正好违背这个端口的承诺；也**不做目录监听**：刷新点是 `/reload` 与命令本身，轮询是另一种成本。
 
 `subagent-context` 的角色解析也读这张表：定义可以改名（`agent: cw-reviewer`）或改 role（`role: none`），靠名字猜会注入错上下文或什么都不注入。

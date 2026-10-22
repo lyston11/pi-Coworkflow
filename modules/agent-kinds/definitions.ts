@@ -292,6 +292,36 @@ export function writeKindDefinition(
   return { ok: true, path };
 }
 
+/**
+ * Write a definition file verbatim, after validating it.
+ *
+ * The authoring path: an agent writes or edits a real markdown file with its normal tools and hands
+ * it over, so comments, key order and formatting survive. Validating the exact bytes that land (and
+ * not a re-render of them) is the point — a definition the reader would refuse must not be written,
+ * and a definition that is written must be the one the author wrote.
+ */
+export function writeDefinitionFile(
+  root: string,
+  kind: string,
+  text: string,
+): { ok: true; path: string } | { ok: false; reason: string } {
+  if (!KIND_ID.test(kind)) return { ok: false, reason: `kind 名必须是 [a-z0-9-]：${kind}` };
+  if (text.length > MAX_DEFINITION_BYTES) {
+    return { ok: false, reason: `文件超过 ${MAX_DEFINITION_BYTES} 字节` };
+  }
+  const parsed = parseDefinition(kind, text);
+  if ("reason" in parsed) return { ok: false, reason: parsed.reason };
+  const dir = definitionsDir(root);
+  const path = join(dir, `${kind}.md`);
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path, text);
+  } catch (error) {
+    return { ok: false, reason: `无法写入：${error instanceof Error ? error.message : String(error)}` };
+  }
+  return { ok: true, path };
+}
+
 /** Render a definition back to its file form. */
 export function renderDefinition(definition: KindDefinitionFile): string {
   const lines = ["---"];

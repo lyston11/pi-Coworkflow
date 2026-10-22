@@ -165,37 +165,64 @@ enabled: true                     # 可选默认值
 
 **出错只坏一个**：文件格式错、agent 名不合法或撞名、`model`/`thinking`/`maxConcurrent` 不可用、正文为空——**只有那个 kind 失败**，原因出现在 `/Coworkflow:status` 和设置面板里，其它 kind 照常工作。失败的 kind **不会被注册，派单会被拒绝**，不会出现「看起来可用、实际起不来」。
 
-### 入口：终端 CLI（给别的 agent 用）、Pi 内命令、公开请求
+### 一个 kind 就是一个 markdown 文件
+
+每种 kind 的提示词是它自己的一份文档——frontmatter 声明它是什么，正文就是它的系统提示词。这就是它的「subagents.md」：
+
+```
+.pi/Coworkflow/agents/<kind>.md
+```
+
+**推荐的 DIY 流程**（文件是主角，不是 shell 参数）：
+
+```bash
+# 1) 生成一个带注释骨架的文件
+pi-coworkflow kind scaffold builder
+
+# 2) 用你自己的编辑器改它（这才是写提示词的方式：标题、列表、强调、换行都保留）
+$EDITOR .pi/Coworkflow/agents/builder.md
+
+# 3) 交回去：先校验，通过后按你写的原样写入
+pi-coworkflow kind set builder --from .pi/Coworkflow/agents/builder.md
+
+# 4) 随时校验全部定义（只读，不写任何东西）
+pi-coworkflow kind check
+```
+
+想改本包随附的三个 kind？把它们的提示词**导出成文件**再改，不用重打：
+
+```bash
+pi-coworkflow kind export auditor --out auditor.md   # 拿到它完整的提示词原文
+$EDITOR auditor.md
+pi-coworkflow kind set auditor --from auditor.md     # 覆盖本包的定义
+pi-coworkflow kind remove auditor                    # 删掉覆盖，回到本包定义
+```
+
+### 终端 CLI（给别的 agent 用）、Pi 内命令、公开请求
 
 **`pi-coworkflow` 是终端入口**——不需要 Pi 会话、不需要扩展宿主、不需要任何进程在跑。任何能执行 shell 的 agent（Claude Code、Codex、你自己的脚本）都能用它 DIY 本项目的子 agent：
 
 ```bash
-# 直接跑仓库里的入口（无需安装）
 node --experimental-strip-types /path/to/pi-Coworkflow/scripts/cli.ts kind list
-
-# 或者装成 bin 之后
-npx pi-coworkflow kind list
 pi-coworkflow kind list --project /path/to/project
-
 pi-coworkflow kind show builder
-pi-coworkflow kind set builder label=建造者 role=implement prompt="按派单实现，报告事实"
-pi-coworkflow kind set builder maxConcurrent=3 thinking=high
-pi-coworkflow kind remove builder
-pi-coworkflow kind path          # 定义目录在哪
+pi-coworkflow kind path builder
 ```
 
 给 agent 用的两条约定：
 
 - **退出码是结论**：`0` 成功；`1` 值被拒绝（**文件未改动**）；`2` 用法/找不到；`3` 内部错误。拒绝原因在 stderr。
-- **`--json` 给机器读**：`list` / `show` / `set` / `remove` 都支持，成功与失败都输出结构化结果，不用解析中文散文。
+- **`--json` 给机器读**：`list` / `show` / `set` / `check` 都支持，成功与失败都输出结构化结果，不用解析中文散文。
 
 ```bash
-$ pi-coworkflow kind set builder role=nope --json; echo "exit=$?"
-{"ok":false,"error":{"code":"rejected","message":"role 只能是 implement / check / research 或 none：nope"}}
+$ pi-coworkflow kind check --json; echo "exit=$?"
+{"ok":false,"checked":["auditor"],"failures":[{"kind":"broken","reason":"role 只能是 implement / check / research 或 none：nope"}]}
 exit=1
 ```
 
 `--project <dir>` 指定作用于哪个项目；**在 task worktree 里执行会自动写到主检出**——worktree 只有已提交文件，写在里面没有任何 gate 会读到（CLI 用的是扩展同一套解析）。
+
+`set <kind> key=value…` 仍然可用，适合改一两个字段；传 `prompt=` 时它会提醒你改用文件，因为把长提示词塞进 shell 字符串会丢掉换行与格式。
 
 另外两个入口，同一个写入者：
 
@@ -208,7 +235,7 @@ exit=1
 # 方法 list / show / define / remove；version 必须是 1
 ```
 
-**三者都走同一个写入者**：先校验，再落盘。所以 CLI 不可能接受一个会话会拒绝的值，被拒绝的值也不会留下半个文件。也**没有「只活在内存里」的 kind**——那种 kind 在 `/reload` 后会消失，正好把这个端口的核心承诺反过来；同理不做目录监听：刷新点是 `/reload` 与命令本身。
+**三者都走同一个写入者**：先校验，再落盘。`set --from` 校验的是**将要落盘的那些字节**并原样写入，所以 CLI 不可能接受一个会话会拒绝的定义，被拒绝的文件也不会被写坏。也**没有「只活在内存里」的 kind**——那种 kind 在 `/reload` 后会消失，正好把这个端口的核心承诺反过来；同理不做目录监听：刷新点是 `/reload` 与命令本身。
 
 ## 一次并发派出多件事：`coworkflow.fanout`
 

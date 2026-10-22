@@ -172,3 +172,138 @@ test("cli: --help and --version answer without touching a project", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/**
+ * The file is the artifact.
+ *
+ * A kind's prompt is its own markdown document, so the CLI's main road is scaffold → edit →
+ * `set --from` → check. These cases hold that road to its promises: the bytes the author wrote are
+ * the bytes that land, a file the reader would refuse is never written, and `export` can hand back
+ * a shipped kind's prompt so it can be edited rather than retyped.
+ */
+test("cli: scaffold leaves an editable file, and set --from applies it byte for byte", () => {
+  const root = project();
+  try {
+    const scaffolded = cli(["kind", "scaffold", "builder"], root);
+    assert.equal(scaffolded.code, 0, scaffolded.stderr);
+    const file = join(root, ".pi", "Coworkflow", "agents", "builder.md");
+    assert.ok(readFileSync(file, "utf-8").includes("这个 kind 的「subagents.md」"), "it explains itself");
+
+    // A second scaffold refuses rather than clobbering; --force is the explicit way.
+    assert.equal(cli(["kind", "scaffold", "builder"], root).code, 2);
+    assert.equal(cli(["kind", "scaffold", "builder", "--force"], root).code, 0);
+
+    // Edit it as a person (or an agent's editor) would, with formatting that matters.
+    const edited = [
+      "---",
+      "label: 建造者",
+      "role: implement",
+      "description: 按派单实现一处改动",
+      "maxConcurrent: 2",
+      "---",
+      "",
+      "# 你负责什么",
+      "",
+      "按派单做完**一件**已定义的工作。",
+      "",
+      "- 交付物：改动的文件清单 + 跑过的命令；",
+      "- 范围外的问题写进报告，不要顺手改。",
+      "",
+    ].join("\n");
+    writeFileSync(file, edited);
+
+    const applied = cli(["kind", "set", "builder", "--from", file], root);
+    assert.equal(applied.code, 0, applied.stderr);
+    // Byte for byte: headings, blank lines and emphasis must survive the round trip.
+    assert.equal(readFileSync(file, "utf-8"), edited, "the authored bytes are what landed");
+
+    const view = JSON.parse(cli(["kind", "show", "builder", "--json"], root).stdout) as {
+      label: string;
+      maxConcurrent: number;
+      prompt: string;
+    };
+    assert.equal(view.label, "建造者");
+    assert.equal(view.maxConcurrent, 2);
+    assert.match(view.prompt, /按派单做完\*\*一件\*\*已定义的工作/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cli: export hands back a shipped kind's own prompt, and set --from rejects a bad file untouched", () => {
+  const root = project();
+  try {
+    const out = join(root, "auditor.md");
+    const exported = cli(["kind", "export", "auditor", "--out", out], root);
+    assert.equal(exported.code, 0, exported.stderr);
+    const text = readFileSync(out, "utf-8");
+    // The shipped asset is a real document, not a one-liner: this is the thing that was too crude
+    // to pass as `prompt="…"`.
+    assert.ok(text.split("\n").length > 20, "the exported prompt is a document");
+    assert.match(text, /^---\n/, "with frontmatter, so it can be edited and handed back");
+
+    // Hand it back edited: the label changes, the prompt body is kept.
+    writeFileSync(out, text.replace("label: 审计者", "label: 项目审计者"));
+    assert.equal(cli(["kind", "set", "auditor", "--from", out], root).code, 0);
+    assert.match(cli(["kind", "show", "auditor"], root).stdout, /项目审计者/);
+
+    // A bad file is refused, and the existing definition is byte-identical afterwards.
+    const target = join(root, ".pi", "Coworkflow", "agents", "auditor.md");
+    const before = readFileSync(target, "utf-8");
+    const bad = join(root, "bad.md");
+    writeFileSync(bad, "---\nrole: nope\n---\n\nx\n");
+    const refused = cli(["kind", "set", "auditor", "--from", bad], root);
+    assert.equal(refused.code, 1);
+    assert.match(refused.stderr, /role 只能是/);
+    assert.equal(readFileSync(target, "utf-8"), before, "a refusal changes nothing");
+
+    // `--from` and `k=v` in one call is a usage error, not a silent precedence rule.
+    assert.equal(cli(["kind", "set", "auditor", "--from", out, "label=x"], root).code, 2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cli: check validates without writing and names what is wrong", () => {
+  const root = project();
+  try {
+    assert.equal(cli(["kind", "scaffold", "builder"], root).code, 0);
+    const checked = cli(["kind", "check"], root);
+    assert.equal(checked.code, 0, checked.stderr);
+    assert.match(checked.stdout, /定义文件全部可用/);
+
+    // One broken file: check fails, names it, and writes nothing.
+    const broken = join(root, ".pi", "Coworkflow", "agents", "broken.md");
+    writeFileSync(broken, "---\nrole: nope\n---\n\nx\n");
+    const before = readFileSync(broken, "utf-8");
+    const failed = cli(["kind", "check"], root);
+    assert.equal(failed.code, 1);
+    assert.match(failed.stdout, /broken：role 只能是/);
+    assert.equal(readFileSync(broken, "utf-8"), before, "check never writes");
+
+    // JSON form: an agent gets the failure rows, not a paragraph.
+    const json = JSON.parse(cli(["kind", "check", "--json"], root).stdout) as {
+      ok: boolean;
+      failures: { kind: string; reason: string }[];
+    };
+    assert.equal(json.ok, false);
+    assert.equal(json.failures[0]?.kind, "broken");
+
+    // A kind with no definition file is a usage answer, not a validation failure.
+    assert.equal(cli(["kind", "check", "nothing-here"], root).code, 2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cli: prompt= warns that a shell string is the wrong tool for a system prompt", () => {
+  const root = project();
+  try {
+    const result = cli(["kind", "set", "builder", "role=implement", "prompt=一行"], root);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stderr, /丢掉换行与格式/);
+    assert.match(result.stderr, /--from/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
