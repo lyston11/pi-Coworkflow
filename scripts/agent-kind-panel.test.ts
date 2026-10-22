@@ -869,3 +869,52 @@ test("Comodels: an untouched Enter on the thinking column keeps a level the page
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/**
+ * A project-defined kind gets its own page.
+ *
+ * This is the whole point of the port from the panel's side: the page list is computed from the
+ * resolved kind table, so a definition file adds a page with no panel change — and the panel holds
+ * no kind list of its own.
+ */
+test("Comodels: a project-defined kind gets its own page, and removing the file removes it", { skip }, async () => {
+  const { pi, listener } = fakePi();
+  const root = mkdtempSync(join(tmpdir(), "coworkflow-panel-port-"));
+  let loaded: Loaded | undefined;
+  try {
+    writeProject(root, {});
+    mkdirSync(join(root, ".pi", "Coworkflow", "agents"), { recursive: true });
+    const file = join(root, ".pi", "Coworkflow", "agents", "builder.md");
+    writeFileSync(file, "---\nlabel: 建造者\nrole: implement\n---\n\n按派单实现一处改动。\n");
+
+    loaded = await loadExtension(root, pi.events);
+    await until(() => (registryView?.listRuntimeAgentConfigs(pi).length ?? 0) > 0, "the kinds to register");
+    const panel = await openPanel(loaded, root);
+
+    const pages = panel.pages().map((page) => page.label);
+    assert.ok(
+      pages.some((page) => page.includes("建造者")),
+      `the definition's kind has a page: ${pages.join(" | ")}`,
+    );
+    // The owner holds the agent the definition names. (Its prompt is asserted in
+    // scripts/kind-port.test.ts against the registration plan; this suite is about the panel.)
+    assert.ok(
+      registryView?.listRuntimeAgentConfigs(pi).some((entry) => entry.name === "cw-builder"),
+      "and the owner holds the agent",
+    );
+
+    // Removing the file removes the page and the agent.
+    rmSync(file);
+    await loaded.control.settleAgentKinds();
+    assert.equal(
+      registryView?.listRuntimeAgentConfigs(pi).some((entry) => entry.name === "cw-builder"),
+      false,
+      "the agent is withdrawn with its definition",
+    );
+  } finally {
+    registryView?.clearRuntimeAgentsForPi(pi);
+    listener();
+    loaded?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

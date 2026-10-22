@@ -65,7 +65,10 @@ import {
   taskRefForDisplay,
   type SubagentRole,
 } from "../../core/trellis.ts";
-import { BUILTIN_KINDS, kindRole } from "../agent-kinds/defaults.ts";
+import { BUILTIN_KINDS, kindRole, resolveKinds } from "../agent-kinds/defaults.ts";
+import { readKindDefinitions } from "../agent-kinds/definitions.ts";
+import { readConfig } from "../../core/config.ts";
+import type { ResolvedAgentKind } from "../../core/config.ts";
 
 const ROLES: SubagentRole[] = ["implement", "check", "research"];
 /**
@@ -127,19 +130,33 @@ function asRole(value: string | undefined): SubagentRole | null {
  * a change to what a kind means reaches both the registration and this match
  * instead of leaving two tables to disagree.
  */
-function roleOfKind(agent: string): SubagentRole | null {
+function roleOfKind(agent: string, kinds?: readonly ResolvedAgentKind[]): SubagentRole | null {
+  // Through the project's table when the caller has one: a definition may rename the agent
+  // (`agent: cw-builder`) or declare a different role, and a name-shaped guess would then
+  // inject the wrong context — or none, silently.
+  if (kinds !== undefined) {
+    const entry = kinds.find((candidate) => candidate.agent === agent);
+    if (entry !== undefined) return entry.role ?? null;
+  }
   const kind = KIND_AGENT_RE.exec(agent)?.[1];
   return kind === undefined ? null : kindRole(kind);
 }
 
-/** The role this child was dispatched as, or null when it is not a Trellis role. */
+/**
+ * The role this child was dispatched as, or null when it is not a Trellis role.
+ *
+ * `kinds` is the project's resolved kind table when the caller has read it. Without it the
+ * shipped table is the only evidence, which is what a caller that has no root (a unit test,
+ * or a name that is plainly `trellis-check`) still gets.
+ */
 export function detectRole(
   sessionName: string | undefined,
+  kinds?: readonly ResolvedAgentKind[],
   ...texts: (string | undefined)[]
 ): SubagentRole | null {
   const agent = sessionName?.split(":")[0]?.trim();
   const fromAgent =
-    asRole(agent) ?? asRole(AGENT_RE.exec(agent ?? "")?.[1]) ?? roleOfKind(agent ?? "");
+    asRole(agent) ?? asRole(AGENT_RE.exec(agent ?? "")?.[1]) ?? roleOfKind(agent ?? "", kinds);
   if (fromAgent) return fromAgent;
 
   for (const text of texts) {
@@ -271,7 +288,9 @@ function readChildPrompt(
   runtime: RuntimeContext,
 ): ChildPrompt {
   const inherited = inheritedPrompt(event);
-  const role = detectRole(sessionName, event?.prompt, inherited);
+  // The project's table, so a custom or renamed kind resolves to the role it declared.
+  const kinds = resolveKinds(readConfig(root), readKindDefinitions(root).definitions);
+  const role = detectRole(sessionName, kinds, event?.prompt, inherited);
   let task = resolveChildTask(root, sessionName, event?.prompt, inherited);
 
   if (task.kind === "none" && role && role !== "research") {

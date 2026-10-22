@@ -29,6 +29,10 @@
 import { moduleAsset } from "../../core/module.ts";
 import { KIND_PREFIX, type AgentKindConfig, type ResolvedAgentKind, type WorkflowConfig } from "../../core/config.ts";
 import type { SubagentRole } from "../../core/trellis.ts";
+import { definitionDefaults, type KindDefinitionFile } from "./definitions.ts";
+
+/** The project's definitions, as `readKindDefinitions` returns them. */
+export type KindDefinitions = ReadonlyMap<string, KindDefinitionFile>;
 
 /** One kind this package ships. */
 export interface BuiltinKind {
@@ -140,9 +144,20 @@ export function agentNameFor(kind: string): string {
   return kind.startsWith(KIND_PREFIX) ? kind : `${KIND_PREFIX}${kind}`;
 }
 
-/** The kind a registered agent name belongs to, or `null` for any other agent. */
-export function kindOf(agent: string | undefined): string | null {
+/**
+ * The kind a registered agent name belongs to, or `null` for any other agent.
+ *
+ * `known` is the resolved kind table when the caller has it: a project definition may
+ * rename its agent (`agent: cw-builder`), so "which kind is this" cannot be answered from
+ * the shipped table alone. Without a table the prefix is still the only evidence, and a
+ * name that is not a shipped kind is answered as `null` rather than guessed.
+ */
+export function kindOf(agent: string | undefined, known?: readonly { kind: string; agent: string }[]): string | null {
   if (!agent?.startsWith(KIND_PREFIX)) return null;
+  if (known !== undefined) {
+    const hit = known.find((entry) => entry.agent === agent);
+    if (hit !== undefined) return hit.kind;
+  }
   const kind = agent.slice(KIND_PREFIX.length);
   return kind && builtinKind(kind) !== null ? kind : null;
 }
@@ -159,7 +174,9 @@ export function builtinKind(kind: string): BuiltinKind | null {
  * of keeping a second table keyed on the agent name, which is what would let the
  * two disagree about what `cw-executor` receives.
  */
-export function kindRole(kind: string): SubagentRole | null {
+export function kindRole(kind: string, definitions?: KindDefinitions): SubagentRole | null {
+  const declared = definitions?.get(kind)?.role;
+  if (declared !== undefined) return declared === "none" ? null : declared;
   return builtinKind(kind)?.role ?? null;
 }
 
@@ -179,21 +196,58 @@ function positiveInteger(value: unknown): number | null {
  * built-in default — the same rule `/Coworkflow:init` uses for module switches,
  * and for the same reason: a value that cannot be read is not a decision.
  */
-export function resolveKinds(config: WorkflowConfig | null): ResolvedAgentKind[] {
+export function resolveKinds(config: WorkflowConfig | null, definitions?: KindDefinitions): ResolvedAgentKind[] {
   const declared = config?.agentKinds ?? {};
-  return BUILTIN_KINDS.map((entry) => {
-    const policy = declared[entry.kind];
+  // Shipped kinds first, in table order, then anything the project defined that this
+  // package does not ship — the order the panels and the reports present them in.
+  const ids = [
+    ...BUILTIN_KINDS.map((entry) => entry.kind),
+    ...[...(definitions?.keys() ?? [])].filter((kind) => builtinKind(kind) === null),
+  ];
+  return ids.map((kind) => {
+    const shipped = builtinKind(kind);
+    const definition = definitions?.get(kind);
+    const policy = declared[kind];
+    // Three layers, and the project's own choice always wins: what the project chose in
+    // the config, then what the definition declares as a default, then the shipped default.
+    const fromDefinition = definitionDefaults(definition);
+    const fallback = shipped?.defaults ?? { enabled: true, maxConcurrent: DEFAULT_MAX_CONCURRENT };
+    const pick = <K extends "enabled" | "maxConcurrent" | "model" | "thinking">(field: K) => {
+      const chosen = policy?.[field];
+      if (chosen !== undefined) return { value: chosen, chosen: true };
+      const declaredDefault = fromDefinition[field];
+      if (declaredDefault !== undefined) return { value: declaredDefault, chosen: false };
+      const shippedDefault =
+        field === "enabled" || field === "maxConcurrent"
+          ? (fallback as Record<string, unknown>)[field]
+          : undefined;
+      return { value: shippedDefault, chosen: false };
+    };
+    const enabled = pick("enabled");
+    const maxConcurrent = pick("maxConcurrent");
+    const model = pick("model");
+    const thinking = pick("thinking");
     return {
-      kind: entry.kind,
-      label: entry.label,
-      agent: agentNameFor(entry.kind),
-      enabled: policy?.enabled ?? entry.defaults.enabled,
-      maxConcurrent: positiveInteger(policy?.maxConcurrent) ?? entry.defaults.maxConcurrent,
-      // Passed through unchanged, and never defaulted: an absent model means inherit,
-      // and `parseAgentKinds` has already dropped anything unusable, so there is
-      // nothing left here for a second validation to disagree about.
-      ...(policy?.model === undefined ? {} : { model: policy.model }),
-      ...(policy?.thinking === undefined ? {} : { thinking: policy.thinking }),
+      kind,
+      label: definition?.label ?? shipped?.label ?? kind,
+      agent: definition?.agent ?? agentNameFor(kind),
+      enabled: enabled.value === true,
+      maxConcurrent: positiveInteger(maxConcurrent.value) ?? DEFAULT_MAX_CONCURRENT,
+      role: kindRole(kind, definitions),
+      description: definition?.description ?? shipped?.description ?? "",
+      source: definition === undefined ? "shipped" : "file",
+      ...(definition === undefined ? {} : { promptFromFile: definition.prompt }),
+      // Passed through unchanged, and never defaulted beyond the layers above: an absent
+      // model means inherit, and `parseAgentKinds` has already dropped anything unusable,
+      // so there is nothing left here for a second validation to disagree about.
+      ...(model.value === undefined ? {} : { model: String(model.value) }),
+      ...(thinking.value === undefined ? {} : { thinking: String(thinking.value) }),
+      chosen: {
+        enabled: enabled.chosen,
+        maxConcurrent: maxConcurrent.chosen,
+        model: model.chosen,
+        thinking: thinking.chosen,
+      },
     };
   });
 }
@@ -206,8 +260,10 @@ export function resolveKinds(config: WorkflowConfig | null): ResolvedAgentKind[]
  * panel and `/Coworkflow:status` can say "declared, not shipped" instead of
  * silently omitting a decision the user made.
  */
-export function unshippedKinds(config: WorkflowConfig | null): string[] {
-  return Object.keys(config?.agentKinds ?? {}).filter((kind) => builtinKind(kind) === null);
+export function unshippedKinds(config: WorkflowConfig | null, definitions?: KindDefinitions): string[] {
+  return Object.keys(config?.agentKinds ?? {}).filter(
+    (kind) => builtinKind(kind) === null && definitions?.get(kind) === undefined,
+  );
 }
 
 /** The kind's system prompt, or `null` when the asset is missing from the package. */

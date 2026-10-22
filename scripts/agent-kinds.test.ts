@@ -46,7 +46,7 @@ import {
   loadRuntimeAgentContract,
   type DesiredKind,
 } from "../modules/agent-kinds/registration.ts";
-import { agentKindsModule, decodeKindDispatch, kindRegistrationPlan, syncAgentKinds } from "../modules/agent-kinds/index.ts";
+import { agentKindsModule, decodeKindDispatch, kindRegistrationPlan, resolveDispatchKind, syncAgentKinds } from "../modules/agent-kinds/index.ts";
 import { capacityModule } from "../modules/capacity/index.ts";
 
 const here = (rel: string): string => new URL(rel, import.meta.url).pathname;
@@ -703,17 +703,30 @@ function gateHarness(options: {
   };
 }
 
-test("gate decoder: only a kind dispatch is ours, and only a work-starting call", () => {
-  assert.deepEqual(decodeKindDispatch({ agent: "cw-executor", task: "x" }), { agent: "cw-executor", kind: "executor", async: true });
-  assert.deepEqual(decodeKindDispatch({ agent: " cw-auditor ", task: "x", async: false }), { agent: "cw-auditor", kind: "auditor", async: false });
+test("gate decoder: only a work-starting call is ours; the kind comes from the table", () => {
+  // The decoder is a shape check: which kind a name belongs to needs the project's table,
+  // because a definition may rename the agent.
+  assert.deepEqual(decodeKindDispatch({ agent: "cw-executor", task: "x" }), { agent: "cw-executor", async: true });
+  assert.deepEqual(decodeKindDispatch({ agent: " cw-auditor ", task: "x", async: false }), { agent: "cw-auditor", async: false });
   // `resume`/`append-step` start work on a run that was already admitted.
-  assert.equal(decodeKindDispatch({ agent: "cw-executor", action: "resume", message: "go" })?.kind, "executor");
-  assert.equal(decodeKindDispatch({ agent: "cw-executor", action: "append-step" })?.kind, "executor");
+  assert.equal(decodeKindDispatch({ agent: "cw-executor", action: "resume", message: "go" })?.agent, "cw-executor");
+  assert.equal(decodeKindDispatch({ agent: "cw-executor", action: "append-step" })?.agent, "cw-executor");
+  const shipped = resolveKinds(null);
+  assert.equal(resolveDispatchKind("cw-executor", shipped), "executor");
+  assert.equal(resolveDispatchKind("cw-builder", shipped), null, "a name the table does not know is not ours");
+  assert.equal(
+    resolveDispatchKind("cw-builder", [
+      ...shipped,
+      { kind: "builder", agent: "cw-builder" } as (typeof shipped)[number],
+    ]),
+    "builder",
+    "but a renamed kind resolves through the table",
+  );
   for (const input of [
-    // Not ours: the builtin table and other extensions keep their own agents.
+    // Not ours: the builtin table and other extensions keep their own agents. The prefix is
+    // what the shape check can decide; whether the table knows the name is the next step.
     { agent: "worker", task: "x" },
     { agent: "trellis-implement", task: "x" },
-    { agent: "cw-unknown", task: "x" },
     // Not a dispatch: management actions use `agent` as a target, not a child.
     { action: "status" },
     { action: "stop", agent: "cw-executor" },
@@ -727,6 +740,11 @@ test("gate decoder: only a kind dispatch is ours, and only a work-starting call"
   ]) {
     assert.equal(decodeKindDispatch(input), null, JSON.stringify(input) ?? "undefined");
   }
+  // A `cw-` name in the namespace but not in the table passes the shape check and is then
+  // refused by the table: the gate reads both, and neither step alone is the decision.
+  const unknown = decodeKindDispatch({ agent: "cw-unknown", task: "x" });
+  assert.ok(unknown, "the prefix is in this package's namespace");
+  assert.equal(resolveDispatchKind(unknown!.agent, resolveKinds(null)), null, "but no kind claims it");
 });
 
 test("gate: a disabled kind is refused, and the reason names only kinds that really exist", { skip }, async () => {
@@ -1018,10 +1036,17 @@ test("kinds: every kind starts enabled with the same ceiling", () => {
   }
   assert.ok(DEFAULT_MAX_CONCURRENT >= 5, "the starting ceiling is not a bottleneck");
   // The ceiling is advisory in the sense that it is editable; it is enforced once set.
+  // The resolved kind carries more than the policy now — its role, description, where it
+  // came from and which fields the project chose — so assert the fields this test is about
+  // rather than the whole object: a shape change should not read as a policy change.
+  const resolved = resolveKinds({ version: 1, modules: {}, agentKinds: { executor: { maxConcurrent: 12 } } })
+    .find((entry) => entry.kind === "executor");
+  assert.equal(resolved?.maxConcurrent, 12, "the project's number wins");
+  assert.equal(resolved?.enabled, true, "and an unrelated field keeps its default");
+  assert.equal(resolved?.chosen?.maxConcurrent, true, "and is reported as chosen, not defaulted");
   assert.deepEqual(
-    resolveKinds({ version: 1, modules: {}, agentKinds: { executor: { maxConcurrent: 12 } } })
-      .find((entry) => entry.kind === "executor"),
-    { kind: "executor", label: "执行者", agent: "cw-executor", enabled: true, maxConcurrent: 12 },
-    "the project's number wins",
+    { kind: resolved?.kind, label: resolved?.label, agent: resolved?.agent, source: resolved?.source },
+    { kind: "executor", label: "执行者", agent: "cw-executor", source: "shipped" },
+    "the identity of a shipped kind is unchanged",
   );
 });

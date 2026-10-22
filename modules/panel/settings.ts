@@ -183,7 +183,7 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
   const layerOn = switches["agent-kinds"] !== false;
   for (const entry of kinds) {
     const registered = status.some((line) => line.includes(entry.agent) && line.includes("已注册"));
-    const failed = status.some((line) => line.includes(`${entry.kind} 注册失败`));
+    const failed = status.some((line) => line.includes(`${entry.kind} 无法使用`));
     const layerOff =
       !layerOn || status.some((line) => line.includes("未激活 agent-kinds") || line.includes("本会话未加载或已关闭"));
     rows.push({
@@ -199,9 +199,9 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
             ? "本项目已开启 agent-kinds，本会话还没加载：kind 不注册、不拦截（用 /Coworkflow:start）"
             : "agent-kinds 本层未启用：kind 不注册、不拦截（在 模块 tab 打开）"
           : registered
-            ? "已注册到 pi-subagents"
+            ? `已注册到 pi-subagents${entry.source === "file" ? " · 来自项目定义文件" : ""}`
             : failed
-              ? "注册失败（原因见 状态 tab）"
+              ? "无法使用（原因见 状态 tab）"
               : "已启用；注册状态见 状态 tab",
       toggle: () => control.setAgentKind(entry.kind, { enabled: !entry.enabled }),
       editor: {

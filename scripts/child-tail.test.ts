@@ -380,7 +380,7 @@ test("boundaries: the existing usage refresh is what populates the cache", async
       configRoot: () => root, configRootNote: () => null, autoEnable: () => true, prefix: () => "wt-",
       facts: () => [], setSwitch: () => "", setAutoEnable: () => "", setPrefix: () => "",
       subagentConcurrency: () => null, setSubagentConcurrency: () => "", loadState: () => "auto",
-      agentKinds: () => [], setAgentKind: () => "", agentKindStatus: () => [], settleAgentKinds: () => Promise.resolve(), settleSubagents: () => Promise.resolve(), runBudgetMinutes: () => null, setRunBudgetMinutes: () => "",
+      agentKinds: () => [], setAgentKind: () => "", agentKindStatus: () => [], settleAgentKinds: () => Promise.resolve(), settleSubagents: () => Promise.resolve(), runBudgetMinutes: () => null, setRunBudgetMinutes: () => "", defineKind: () => "", removeKind: () => "",
       init: () => "" }, refresh() {} } as unknown as RuntimeContext;
   try {
     await refreshUsage(host, runtime, { sessionManager: { getSessionId: () => "s1", getEntries: () => [] } });

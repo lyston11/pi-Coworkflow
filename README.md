@@ -130,6 +130,60 @@ subagent({ agent: "cw-executor", async: true, context: "fresh",
 
 一个数不准的上限比没有上限更糟——它让项目以为被保护着。
 
+## 自定义子 agent 类型（kind 端口）
+
+kind 集合是**项目自己的决定**。在 `.pi/Coworkflow/agents/<kind>.md` 里写一个文件即可——frontmatter 声明这个 kind 是什么，正文就是它的系统提示词（职能）：
+
+```markdown
+---
+label: 建造者                     # 面板里显示的名字
+agent: cw-builder                 # agent 名，必须形如 cw-<slug>；默认 cw-<kind>
+role: implement                   # Trellis 角色：implement | check | research | none
+description: 按派单实现一处改动
+model: provider/id                # 可选默认值
+thinking: high                    # 可选默认值
+maxConcurrent: 5                  # 可选默认值
+enabled: true                     # 可选默认值
+---
+
+你是这个项目自己的执行者：按派单做完一件已定义的工作，然后报告事实。
+```
+
+文件名的 `<kind>` 就是 kind 名。能做的事：
+
+| 想要 | 怎么做 |
+|---|---|
+| 改本包随附 kind 的职能 | 用同名文件覆盖它：正文替换提示词，frontmatter 覆盖 label / role / description |
+| 新增一个 kind | 写一个用新名字的文件 |
+| 改 agent 名 | `agent:`（必须 `cw-` 开头；撞到项目已有的 agent 时只有该 kind 失败并说明原因） |
+| 改默认配置 | `model` / `thinking` / `maxConcurrent` / `enabled` |
+| 删掉 | `/Coworkflow:kind remove <kind>`；随附的 kind 只能关掉（回到随附定义） |
+
+**两层，谁说了算不含糊**：定义文件说的是这个 kind **是什么**；`.pi/Coworkflow.json` 的 `agentKinds.<kind>` 说的是项目**选了什么**（面板写的），**永远优先**。所以定义里的 `model:` 是默认值，一旦在 `/Comodels` 里选过模型，配置赢，`/Coworkflow:kind show` 会标出哪些是「项目选择」、哪些是「默认」。
+
+**热更新**：定义在每次解析时从磁盘读，所以 `/reload` 就会生效；`/Coworkflow:kind set` 写完之后当场生效，不用重启。
+
+**出错只坏一个**：文件格式错、agent 名不合法或撞名、`model`/`thinking`/`maxConcurrent` 不可用、正文为空——**只有那个 kind 失败**，原因出现在 `/Coworkflow:status` 和设置面板里，其它 kind 照常工作。失败的 kind **不会被注册，派单会被拒绝**，不会出现「看起来可用、实际起不来」。
+
+### 三个入口，一个写入者
+
+```bash
+# 1) 手写文件（上面那个格式）
+# 2) 命令，任何人（包括 agent）都能用
+/Coworkflow:kind list
+/Coworkflow:kind show builder
+/Coworkflow:kind set builder label=建造者 role=implement prompt="按派单实现，报告事实"
+/Coworkflow:kind set builder maxConcurrent=3 thinking=high
+/Coworkflow:kind remove builder
+
+# 3) 公开请求（其它扩展/程序用），信封与 pi-subagents 的 RPC 一致
+#    频道 coworkflow:kind:v1:request，回复在 coworkflow:kind:v1:reply:<requestId>
+#    方法：list / show / define / remove；version 必须是 1
+```
+
+三者都走同一个写入者：**先校验，再落盘**。所以被拒绝的值不会留下半个文件，也不存在「只活在内存里、`/reload` 就消失」的 kind——那种 kind 会让这个端口的核心承诺反过来。
+
+
 ## 一次并发派出多件事：`coworkflow.fanout`
 
 独立的工作要一次派完。写脚本时最容易犯的错就是：

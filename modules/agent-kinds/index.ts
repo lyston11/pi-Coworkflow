@@ -65,8 +65,12 @@ import {
   unregisteredKindMessage,
   unshippedKinds,
   type FanoutKindPolicy,
+  type KindDefinitions,
 } from "./defaults.ts";
+import { readKindDefinitions } from "./definitions.ts";
+import { registerKindPort } from "./port.ts";
 import type { FanoutPolicy } from "../../core/subagents-workflow.ts";
+import { KIND_PREFIX } from "../../core/config.ts";
 import {
   kindRegistryFor,
   loadRuntimeAgentContract,
@@ -90,6 +94,8 @@ interface Snapshot {
   failures: { kind: string; reason: string }[];
   /** Kinds the project declared that this package has no agent for. */
   unshipped: string[];
+  /** Kinds a project definition file provides, with the agent name it registered. */
+  definitions: { kind: string; agent: string }[];
   /**
    * Kinds the project switched off: declared, shipped, intentionally absent.
    *
@@ -165,7 +171,12 @@ function stateFor(host: PiRuntimeHost): State {
 export interface KindDispatch {
   /** The agent name the caller asked for, e.g. `cw-executor`. */
   agent: string;
-  /** The kind it belongs to, e.g. `executor`. */
+  /**
+   * The kind it belongs to, e.g. `executor`.
+   *
+   * Filled in by `resolveDispatchKind` against the project's table: a definition may rename
+   * its agent, so the name alone does not say which kind it is.
+   */
   kind: string;
   /** Whether the call asks for a background run. Wording only; both occupy a kind slot. */
   async: boolean;
@@ -182,20 +193,39 @@ export interface KindDispatch {
  *     block a `stop` — refusing the operation that would free the slot.
  *   - an agent that is not a `cw-` name is not ours: the builtin table and every
  *     other extension keep behaving exactly as they did.
- *   - a `cw-` name this package does not ship is not a kind either; the owner, not
- *     this gate, is the authority on whether it exists.
+ *   - a `cw-` name the project's table does not resolve is not a kind either; the
+ *     owner, not this gate, is the authority on whether it exists.
+ *
+ * The result carries no kind: which kind a name belongs to needs the project's table, and
+ * that read belongs to `resolveDispatchKind` rather than to a payload shape check.
  */
-export function decodeKindDispatch(input: unknown): KindDispatch | null {
+export function decodeKindDispatch(input: unknown): { agent: string; async: boolean } | null {
   if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
   const call = input as Record<string, unknown>;
   const action = typeof call.action === "string" ? call.action.trim() : "";
   // `resume` and `append-step` start work; every other action manages it.
   if (action && action !== "resume" && action !== "append-step") return null;
   const agent = typeof call.agent === "string" ? call.agent.trim() : "";
-  if (!agent) return null;
-  const kind = kindOf(agent);
-  if (kind === null) return null;
-  return { agent, kind, async: call.async !== false };
+  // The prefix is the only thing a shape check can decide: a `cw-` name belongs to this
+  // package's namespace, and whether the project's table resolves it is
+  // `resolveDispatchKind`'s job.
+  if (!agent.startsWith(KIND_PREFIX)) return null;
+  return { agent, async: call.async !== false };
+}
+
+/**
+ * Which kind a dispatch names, resolved against the project's own table.
+ *
+ * Separate from `decodeKindDispatch` because the table needs a root and a read, and decoding
+ * a payload should stay a pure shape check. A renamed kind (`agent: cw-builder`) is only
+ * recognisable through the table, so this is the step that makes a project definition
+ * dispatchable at all.
+ */
+export function resolveDispatchKind(
+  agent: string,
+  kinds: readonly ResolvedAgentKind[],
+): string | null {
+  return kindOf(agent, kinds);
 }
 
 function kindLabel(agent: string, kind: string): string {
@@ -291,17 +321,20 @@ export function kindRegistrationPlan(
   const missingAssets: string[] = [];
   for (const entry of kinds) {
     if (!entry.enabled) continue;
-    const builtin = builtinKind(entry.kind);
-    const prompt = kindSystemPrompt(moduleUrl, entry.kind);
-    if (builtin === null || prompt === null) {
+    // A project definition carries its own prompt; the shipped asset is the fallback. Only a
+    // kind with neither is unusable, and that is a per-kind failure rather than a silent skip.
+    const prompt = entry.promptFromFile ?? kindSystemPrompt(moduleUrl, entry.kind);
+    if (prompt === null) {
       missingAssets.push(entry.kind);
       continue;
     }
     desired.push({
       kind: entry.kind,
-      agent: agentNameFor(entry.kind),
+      agent: entry.agent,
       definition: {
-        description: builtin.description,
+        // A definition's own description wins; the shipped one is the fallback, and an
+        // empty description is refused by the owner, so it is never what we hand over.
+        description: entry.description || builtinKind(entry.kind)?.description || `Coworkflow kind ${entry.kind}`,
         systemPrompt: prompt,
         // `parseAgentKinds` has already dropped anything unusable, so a value that
         // reaches here is one upstream will accept at registration. Absent stays
@@ -342,7 +375,10 @@ function schedule(host: PiRuntimeHost, runtime: RuntimeContext): Promise<void> {
     await previous;
     const root = runtime.configRoots.root(runtime.cwd);
     const config: WorkflowConfig | null = root === null ? null : readConfig(root);
-    const kinds = resolveKinds(config);
+    // Read at every pass, not cached across sessions: an edited definition is picked up by
+    // re-activation, which is what makes `/reload` the hot-reload boundary.
+    const read = readKindDefinitions(root);
+    const kinds = resolveKinds(config, read.definitions);
     const { desired, missingAssets } = kindRegistrationPlan(kinds, import.meta.url);
     const contract = await loadRuntimeAgentContract({
       events: host.events,
@@ -373,9 +409,16 @@ function schedule(host: PiRuntimeHost, runtime: RuntimeContext): Promise<void> {
       }),
       failures: [
         ...results.flatMap((entry) => (entry.ok ? [] : [{ kind: entry.kind, reason: entry.reason }])),
-        ...missingAssets.map((kind) => ({ kind, reason: "本包缺少该 kind 的系统提示资产（modules/agent-kinds/assets/）" })),
+        ...missingAssets.map((kind) => ({
+          kind,
+          reason: "既没有项目定义文件，也没有本包的系统提示资产（modules/agent-kinds/assets/）",
+        })),
+        ...read.failures,
       ],
-      unshipped: unshippedKinds(config),
+      unshipped: unshippedKinds(config, read.definitions),
+      definitions: kinds.flatMap((entry) =>
+        entry.source === "file" ? [{ kind: entry.kind, agent: entry.agent }] : []
+      ),
       disabled: kinds.flatMap((entry) => entry.enabled ? [] : [{
         kind: entry.kind,
         ...(entry.model === undefined ? {} : { model: entry.model }),
@@ -389,6 +432,7 @@ function schedule(host: PiRuntimeHost, runtime: RuntimeContext): Promise<void> {
       registered: [],
       failures: [],
       unshipped: [],
+      definitions: [],
       disabled: [],
     };
   });
@@ -431,15 +475,21 @@ async function gate(
 ): Promise<Refusal | undefined> {
   const on = (): boolean => !runtime.isChild && runtime.enabled && runtime.control.moduleEnabled("agent-kinds");
   if (event?.toolName !== "subagent" || !on()) return;
-  const dispatch = decodeKindDispatch(event.input);
-  if (dispatch === null) return;
+  const decoded = decodeKindDispatch(event.input);
+  if (decoded === null) return;
 
   /** The live policy for this kind, read from disk on every call. */
   const policyOf = (): { kinds: ResolvedAgentKind[]; policy: ResolvedAgentKind | undefined } => {
     const root = runtime.configRoots.root(runtime.cwd);
-    const kinds = resolveKinds(root === null ? null : readConfig(root));
-    return { kinds, policy: kinds.find((entry) => entry.kind === dispatch.kind) };
+    const config = root === null ? null : readConfig(root);
+    const kinds = resolveKinds(config, readKindDefinitions(root).definitions);
+    return { kinds, policy: kinds.find((entry) => entry.agent === decoded.agent) };
   };
+  // A name the project's table does not know is not this gate's business: the dispatch goes
+  // through untouched, exactly as it did before kinds existed.
+  const kind = resolveDispatchKind(decoded.agent, policyOf().kinds);
+  if (kind === null) return;
+  const dispatch: KindDispatch = { ...decoded, kind };
   /** Whether the owner accepted this kind in this session (not merely "was asked to"). */
   const registered = (): boolean => {
     const snapshot = state.snapshot;
@@ -512,7 +562,7 @@ export function fanoutPolicyFor(host: object, runtime: RuntimeContext): FanoutPo
   // A root git could not resolve reads as "no config", which is the same answer
   // the panel gives: absent policy means the built-in defaults, not a guess.
   const root = runtime.configRoots.root(runtime.cwd);
-  const kinds = resolveKinds(root === null ? null : readConfig(root));
+  const kinds = resolveKinds(root === null ? null : readConfig(root), readKindDefinitions(root).definitions);
   const snapshot = STATES.get(host as PiRuntimeHost)?.snapshot ?? null;
   const live = snapshot === null || snapshot.contractFailure !== undefined
     ? null
@@ -608,6 +658,11 @@ export const agentKindsModule: WorkflowModule = {
     if (host.on && !state.listeners.has("tool_call")) {
       state.listeners.set("tool_call", host.on("tool_call", (event: any) => gate(host, state, runtime, event)));
     }
+    // The DIY port, registered once per host: the command writes through the same control
+    // surface, and this is the programmatic door onto it.
+    if (!state.listeners.has("kind-port")) {
+      state.listeners.set("kind-port", registerKindPort(host, runtime, runtime.control));
+    }
     void syncAgentKinds(host, runtime);
   },
 
@@ -675,8 +730,14 @@ export const agentKindsModule: WorkflowModule = {
         `  - agent-kinds: 未注册任何 kind；声明过的 kind 派单会被拒绝，而不是被当成可用`,
       ];
     }
+    // Where a kind came from is part of the fact: a project definition overrides what the
+    // package ships, and a reader comparing the panel with the file needs to know which
+    // layer decided what they are looking at.
+    const fromFile = new Set(snapshot.definitions.map((entry) => entry.kind));
     const lines = snapshot.registered.map((entry) =>
-      `  = agent-kinds: ${entry.agent}（kind ${entry.kind}）已注册${kindModelSuffix(entry)}`,
+      `  = agent-kinds: ${entry.agent}（kind ${entry.kind}）已注册${kindModelSuffix(entry)}${
+        fromFile.has(entry.kind) ? " · 来自项目定义文件" : ""
+      }`,
     );
     // "Nothing enabled" and "everything failed" are different facts, and the
     // second one must never read as the first: a reader who sees "没有启用的 kind"
@@ -689,7 +750,7 @@ export const agentKindsModule: WorkflowModule = {
     for (const entry of snapshot.disabled) {
       lines.push(`  - agent-kinds: ${entry.kind} 已关闭（不注册；派单会被拒绝）${kindModelSuffix(entry)}`);
     }
-    for (const entry of snapshot.failures) lines.push(`  x agent-kinds: ${entry.kind} 注册失败：${entry.reason}`);
+    for (const entry of snapshot.failures) lines.push(`  x agent-kinds: ${entry.kind} 无法使用：${entry.reason}`);
     for (const kind of snapshot.unshipped) {
       lines.push(`  ! agent-kinds: 项目声明了 kind ${kind}，但本包没有这个 kind 的定义，未注册`);
     }

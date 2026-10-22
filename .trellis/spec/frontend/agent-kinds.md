@@ -201,6 +201,25 @@ fleet 投影的 `key` 是不透明显示键，上游明确禁止当作 run 或 a
 
 最后一条尤其重要：这个包已经出现过两次「自称在拦、实际没拦」——那是比没有功能更坏的状态。
 
+## kind 端口：项目定义文件
+
+`.pi/Coworkflow/agents/<kind>.md` 是 kind 的**来源**，不是配置的替代品。frontmatter 声明 kind 是什么（label / agent / role / description / model / thinking / maxConcurrent / enabled），正文是它的系统提示词。
+
+两层与优先级：
+
+| 层 | 决定 | 谁赢 |
+|---|---|---|
+| 定义文件（否则本包随附的资产） | 这个 kind **是什么**：提示词、label、role、agent 名、以及各项默认值 | 低 |
+| `.pi/Coworkflow.json` 的 `agentKinds.<kind>`（面板写的） | 项目**选了什么**：enabled / maxConcurrent / model / thinking | **高，永远** |
+
+`resolveKinds(config, definitions)` 是唯一的合成点，`ResolvedAgentKind` 因此带上 `source`（`file` / `shipped`）与 `chosen`（每个策略字段是项目选的还是定义默认的）——报告要能说出「默认」和「选过」的区别，这是模块开关早就确立的规矩。
+
+解析失败一律**按 kind 隔离**：`readKindDefinitions` 返回 `{ definitions, failures }`，坏的进 `failures`（带原因），好的照常注册。目录不存在或读不了 = 「没有定义」，不是错误。未知 frontmatter 键**直接拒绝**：一个静默无效的拼写比报错更坏，因为用户以为配置生效了。
+
+写入只有一个实现（`writeKindDefinition`）：命令 `/Coworkflow:kind` 和公开请求 `coworkflow:kind:v1` 都走它，**先校验再落盘**。不做「只在内存里注册」的通路——那种 kind 在 `/reload` 后会消失，正好违背这个端口的承诺；也**不做目录监听**：刷新点是 `/reload` 与命令本身，轮询是另一种成本。
+
+`subagent-context` 的角色解析也读这张表：定义可以改名（`agent: cw-reviewer`）或改 role（`role: none`），靠名字猜会注入错上下文或什么都不注入。
+
 ## 面板的一条硬规则：不动光标按 Enter 必须写回原值
 
 模型列和思考等级列都要满足：**光标落点就是当前生效值**。

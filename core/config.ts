@@ -18,6 +18,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
+import type { SubagentRole } from "./trellis.ts";
 // The one list of thinking levels this package knows, taken from the module that
 // already owns it instead of restated here: a second copy would let the panel offer
 // a level this decoder drops, or drop one the panel offers. That module's only
@@ -363,6 +364,30 @@ export interface ResolvedAgentKind {
   model?: string;
   /** The thinking level this kind pins, or absent for inherit. */
   thinking?: string;
+  /**
+   * The Trellis role this kind's children get, or `null` for a kind that declared
+   * `role: none` — a kind that is not one of the roles.
+   */
+  role?: SubagentRole | null;
+  /** What the owner shows in the agent list. */
+  description?: string;
+  /** Where this kind came from: a project definition file, or the shipped table. */
+  source?: "file" | "shipped";
+  /**
+   * The system prompt a project definition supplied.
+   *
+   * Carried on the resolved kind because it is data the resolver already read; the
+   * shipped asset is looked up later, where the module URL is known.
+   */
+  promptFromFile?: string;
+  /**
+   * Which layer decided each policy field.
+   *
+   * A single value cannot express "on because the project chose it" vs "on because the
+   * definition defaults it", and the reports have to say which — the same distinction the
+   * module switches draw between 默认 and 选过.
+   */
+  chosen?: { enabled?: boolean; maxConcurrent?: boolean; model?: boolean; thinking?: boolean };
 }
 
 /**

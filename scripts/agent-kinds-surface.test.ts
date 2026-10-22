@@ -387,7 +387,7 @@ test("panel: Space toggles a kind and Enter edits its limit, with no restart", {
       "two toggles return to the state the project chose",
     );
     assert.ok(
-      !(loaded.control.agentKindStatus().join("\n")).includes("注册失败"),
+      !(loaded.control.agentKindStatus().join("\n")).includes("无法使用"),
       loaded.control.agentKindStatus().join("\n"),
     );
     assert.equal(loaded.handlerCount("tool_call"), hooks, "toggling does not add a second gate hook");
@@ -420,10 +420,10 @@ test("status: a colliding kind is reported as failed, and only that kind is affe
 
     // Re-register the colliding kind through the same production path the panel uses.
     const status = await loaded.control.setAgentKind("auditor", { enabled: true });
-    assert.match(status, /注册失败/, status);
+    assert.match(status, /无法使用/, status);
     assert.match(status, /collides with runtime agent 'cw-auditor'/, status);
     const lines = loaded.control.agentKindStatus().join("\n");
-    assert.match(lines, /auditor 注册失败/, "status names the failed kind");
+    assert.match(lines, /auditor 无法使用/, "status names the kind that cannot be used");
     assert.match(lines, /cw-executor（kind executor）已注册/, "the other kind is unaffected");
     assert.match(lines, /cw-researcher（kind researcher）已注册/, "and so is every other kind");
   } finally {

@@ -410,6 +410,16 @@ export interface WorkflowControl {
     },
   ): string | Promise<string>;
   /**
+   * Write or update one project kind definition, validating before touching the file.
+   *
+   * The DIY port's single writer: the command and the public request both come through here,
+   * so "what a definition is" has one implementation and a rejected value cannot leave a
+   * half-written file behind.
+   */
+  defineKind(kind: string, patch: Record<string, unknown>): string | Promise<string>;
+  /** Delete a project definition file; refuses anything outside the definitions directory. */
+  removeKind(kind: string): string | Promise<string>;
+  /**
    * The `agent-kinds` module's own status lines: which kinds registered, or the
    * exact reason none did. Empty when the module is not active in this session.
    *

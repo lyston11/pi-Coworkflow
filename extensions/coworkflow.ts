@@ -33,8 +33,8 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, rmSync } from "node:fs";
+import { join, sep } from "node:path";
 import type {
   ModuleContext,
   PiRuntimeHost,
@@ -69,6 +69,7 @@ import { agentKindsModule, syncAgentKinds } from "../modules/agent-kinds/index.t
 import { syncSubagentsRuntime } from "../modules/subagents/index.ts";
 import { RUN_BUDGET_MS } from "../core/subagents-workflow.ts";
 import { BUILTIN_KINDS, agentNameFor, builtinKind, resolveKinds } from "../modules/agent-kinds/defaults.ts";
+import { DEFINITIONS_REL, definitionsDir, readKindDefinitions, writeKindDefinition } from "../modules/agent-kinds/definitions.ts";
 import { THINKING_LEVELS } from "../modules/panel/shared.ts";
 import { installedPrefix } from "../modules/worktree/index.ts";
 
@@ -224,6 +225,8 @@ let runtime: RuntimeContext = {
     subagentConcurrency: () => null,
     runBudgetMinutes: () => null,
     setRunBudgetMinutes: () => "control 尚未就绪",
+    defineKind: () => "control 尚未就绪",
+    removeKind: () => "control 尚未就绪",
     setSubagentConcurrency: () => "control 尚未就绪",
     agentKinds: () => [],
     setAgentKind: () => "control 尚未就绪",
@@ -708,6 +711,93 @@ function runSetup(args: string, ctx: CommandContext, forceDry: boolean): string 
   return text;
 }
 
+/**
+ * `/Coworkflow:kind` — list, inspect, define and remove subagent kinds.
+ *
+ * Every write goes through `control.defineKind`, which validates before touching the file and
+ * re-syncs the session, so a rejected value is a sentence rather than a broken kind. `list`
+ * and `show` read the resolved table, so they report what the session is actually using —
+ * including which layer (project file or shipped) decided it.
+ */
+async function runKindCommand(args: string, ctx: CommandContext): Promise<string> {
+  const control = controlSurface();
+  const parts = args.trim().split(/\s+/).filter(Boolean);
+  const sub = parts[0] ?? "list";
+  const kind = parts[1];
+  const root = control.configRoot();
+  const definitions = root === null ? new Map() : readKindDefinitions(root).definitions;
+  const failures = root === null ? [] : readKindDefinitions(root).failures;
+  const kinds = control.agentKinds();
+
+  if (sub === "list") {
+    if (kinds.length === 0) return `本项目还没有可用的 kind；用 /${NS}:init 安装后可用，或在 ${DEFINITIONS_REL}/<kind>.md 里定义。`;
+    const lines = [`kind 一览（${DEFINITIONS_REL}/<kind>.md 可自定义）：`];
+    for (const entry of kinds) {
+      const chosen = entry.chosen ?? {};
+      const limit = `${entry.maxConcurrent}${chosen.maxConcurrent === true ? "" : "（默认）"}`;
+      const model = entry.model === undefined ? "继承" : entry.model;
+      lines.push(
+        `  - ${entry.kind} → ${entry.agent} · ${entry.label} · ${entry.enabled ? "on" : "off"} · 上限 ${limit} · 模型 ${model} · 角色 ${
+          entry.role ?? "none"
+        } · ${entry.source === "file" ? "项目定义" : "本包随附"}`,
+      );
+    }
+    for (const failure of failures) lines.push(`  ! ${failure.kind}：${failure.reason}`);
+    lines.push("", `用法：/${NS}:kind set <kind> label=… role=implement|check|research|none prompt=… model=… thinking=… maxConcurrent=… enabled=true|false`);
+    return lines.join("\n");
+  }
+
+  if (sub === "show") {
+    if (kind === undefined) return `用法：/${NS}:kind show <kind>`;
+    const entry = kinds.find((candidate) => candidate.kind === kind);
+    if (entry === undefined) {
+      const failure = failures.find((candidate) => candidate.kind === kind);
+      return failure === undefined
+        ? `没有 kind ${kind}（/${NS}:kind list 看全部）`
+        : `kind ${kind} 的定义无法使用：${failure.reason}`;
+    }
+    const definition = definitions.get(kind);
+    return [
+      `kind ${kind}`,
+      `  agent: ${entry.agent}`,
+      `  label: ${entry.label}`,
+      `  role: ${entry.role ?? "none"}`,
+      `  enabled: ${entry.enabled}${entry.chosen?.enabled === true ? "（项目选择）" : "（默认）"}`,
+      `  maxConcurrent: ${entry.maxConcurrent}${entry.chosen?.maxConcurrent === true ? "（项目选择）" : "（默认）"}`,
+      `  model: ${entry.model ?? "继承"}${entry.chosen?.model === true ? "（项目选择）" : ""}`,
+      `  thinking: ${entry.thinking ?? "继承"}${entry.chosen?.thinking === true ? "（项目选择）" : ""}`,
+      `  来源: ${entry.source === "file" ? `${DEFINITIONS_REL}/${kind}.md` : "本包随附"}`,
+      "",
+      definition === undefined ? "（没有项目定义文件；用 set 写一个即可覆盖本包的定义）" : `提示词（前 3 行）：\n${definition.prompt.split("\n").slice(0, 3).join("\n")}`,
+    ].join("\n");
+  }
+
+  if (sub === "remove") {
+    if (kind === undefined) return `用法：/${NS}:kind remove <kind>`;
+    return await control.removeKind(kind);
+  }
+
+  if (sub === "set") {
+    if (kind === undefined) return `用法：/${NS}:kind set <kind> key=value…（可用键：label agent role description model thinking maxConcurrent enabled prompt）`;
+    const patch: Record<string, unknown> = {};
+    for (const pair of parts.slice(2)) {
+      const at = pair.indexOf("=");
+      if (at <= 0) return `无法解析 ${JSON.stringify(pair)}：需要 key=value`;
+      const key = pair.slice(0, at);
+      const value = pair.slice(at + 1);
+      if (key === "maxConcurrent") patch[key] = Number(value);
+      else if (key === "enabled") patch[key] = value === "true";
+      else patch[key] = value;
+    }
+    if (Object.keys(patch).length === 0) {
+      return `没有要改的字段：/${NS}:kind set ${kind} label=… role=… prompt=…`;
+    }
+    return await control.defineKind(kind, patch);
+  }
+
+  return `未知子命令 ${sub}；可用：list / show <kind> / set <kind> key=value… / remove <kind>`;
+}
+
 function runStart(args: string, ctx: CommandContext): string {
   const cwd = ctx.cwd ?? process.cwd();
   const resolved = runtime.configRoots.resolve(cwd);
@@ -993,12 +1083,20 @@ function createControl(): WorkflowControl {
     },
     agentKinds: () => {
       const root = rootOf();
-      return resolveKinds(root === null ? null : readConfig(root));
+      // Through the project's definitions: a custom or renamed kind has to reach both
+      // panels, and this is the one place they read the table from.
+      return resolveKinds(root === null ? null : readConfig(root), readKindDefinitions(root).definitions);
     },
     setAgentKind: async (kind, patch) => {
       const root = rootOf();
       if (root === null) return unresolved();
-      if (builtinKind(kind) === null) return `未知 kind：${kind}（本包只有 ${BUILTIN_KINDS.map((entry) => entry.kind).join("、")}）`;
+      // Known means "shipped or defined by this project": the config may name a kind a
+      // definition file provides, and refusing it would make the panel unable to configure
+      // the very kinds this port exists for.
+      const defined = readKindDefinitions(root).definitions;
+      if (builtinKind(kind) === null && defined.get(kind) === undefined) {
+        return `未知 kind：${kind}（本包随附 ${BUILTIN_KINDS.map((entry) => entry.kind).join("、")}；其它 kind 需要先在 ${DEFINITIONS_REL} 里定义）`;
+      }
       const config = readConfig(root);
       if (config === null) return `本项目未初始化：先 /${NS}:init`;
       if (patch.maxConcurrent !== undefined && patch.maxConcurrent !== null &&
@@ -1037,19 +1135,57 @@ function createControl(): WorkflowControl {
       // in flight — no restart, and no "applied but only for the next session".
       if (runtimeHost !== null) await syncAgentKinds(runtimeHost, runtime);
       const lines = runtimeHost === null ? [] : agentKindsModule.runtimeStatus?.(runtimeHost) ?? [];
-      const resolved = resolveKinds(readConfig(root)).find((entry) => entry.kind === kind);
+      const resolved = resolveKinds(readConfig(root), readKindDefinitions(root).definitions)
+        .find((entry) => entry.kind === kind);
       const state = `${kind}（${agentNameFor(kind)}）→ ${resolved?.enabled ? "on" : "off"}${
         resolved === undefined ? "" : `，上限 ${resolved.maxConcurrent}`
       }${kindModelLine(resolved)}`;
       // The registration outcome, not just the policy: "on" and "available in the
       // agent list" are two different facts and the panel shows both.
-      const failure = lines.find((line) => line.includes(`${kind} 注册失败`));
+      // One vocabulary with the status line: a kind that cannot be used is reported as
+      // 无法使用 there, and a panel that answered with a different phrase for the same fact
+      // is how two surfaces start disagreeing about what happened.
+      const failure = lines.find((line) => line.includes(`${kind} 无法使用`));
       const registered = lines.some((line) => line.includes(agentNameFor(kind)) && line.includes("已注册"));
       return failure !== undefined
-        ? `${state}；但注册失败：${failure.replace(/^\s*[x!=-]\s*agent-kinds:\s*/, "")}`
+        ? `${state}；但无法使用：${failure.replace(/^\s*[x!=-]\s*agent-kinds:\s*/, "")}`
         : resolved?.enabled === true && !registered
-          ? `${state}；未注册（原因见「子 agent 类型」下的状态行）`
+          ? `${state}；无法使用（原因见「子 agent 类型」下的状态行）`
           : `${state}（本会话已生效，无需重启）`;
+    },
+    defineKind: async (kind, patch) => {
+      const root = rootOf();
+      if (root === null) return unresolved();
+      const existing = readKindDefinitions(root).definitions.get(kind);
+      const written = writeKindDefinition(root, kind, patch, existing);
+      if (!written.ok) return `${kind} 未写入：${written.reason}`;
+      if (runtimeHost !== null) await syncAgentKinds(runtimeHost, runtime);
+      const kinds = resolveKinds(readConfig(root), readKindDefinitions(root).definitions);
+      const entry = kinds.find((candidate) => candidate.kind === kind);
+      return entry === undefined
+        ? `${kind} 已写入 ${DEFINITIONS_REL}/${kind}.md，但当前无法解析（检查 frontmatter）`
+        : `${kind}（${entry.agent}）已写入 ${DEFINITIONS_REL}/${kind}.md：${
+            entry.enabled ? "on" : "off"
+          }，上限 ${entry.maxConcurrent}${kindModelLine(entry)}（本会话已生效，无需重启）`;
+    },
+    removeKind: async (kind) => {
+      const root = rootOf();
+      if (root === null) return unresolved();
+      const path = join(definitionsDir(root), `${kind}.md`);
+      // Only inside the definitions directory, and only a file: this command deletes, and a
+      // path built from user input is exactly where that goes wrong.
+      if (!path.startsWith(definitionsDir(root) + sep) || !existsSync(path)) {
+        return `${kind} 没有项目定义文件（随附的 kind 只能关掉，不能删除）`;
+      }
+      try {
+        rmSync(path);
+      } catch (error) {
+        return `${kind} 未能删除：${error instanceof Error ? error.message : String(error)}`;
+      }
+      if (runtimeHost !== null) await syncAgentKinds(runtimeHost, runtime);
+      return builtinKind(kind) === null
+        ? `${kind} 的项目定义已删除，该 kind 不再存在（本会话已生效）`
+        : `${kind} 的项目定义已删除，回到本包随附的定义（本会话已生效）`;
     },
     agentKindStatus: () => (runtimeHost === null ? [] : agentKindsModule.runtimeStatus?.(runtimeHost) ?? []),
     settleAgentKinds: () => (runtimeHost === null ? Promise.resolve() : syncAgentKinds(runtimeHost, runtime)),
@@ -1213,6 +1349,27 @@ export default function coworkflowExtension(pi: PiRuntimeHost): void {
     description:
       "查看本项目是否已初始化、模块开关、自动加载、安装产物与本会话是否已加载 Coworkflow（不改动任何文件）",
     handler: setupHandler(true),
+  });
+
+  /**
+   * `/Coworkflow:kind` — the DIY surface for subagent kinds.
+   *
+   * Deliberately a command and not only a file format: an agent that wants to define a kind
+   * has to be able to do it through something that validates first and says what it changed.
+   * Hand-writing frontmatter works too, and both go through the same writer.
+   */
+  pi.registerCommand?.(`${NS}:kind`, {
+    description:
+      `子 agent 类型（kind）的 DIY 端口：list / show <kind> / set <kind> key=value… / remove <kind>；定义写在 ${DEFINITIONS_REL}/<kind>.md，改完本会话立即生效`,
+    handler: async (args: string, ctx: CommandContext) => {
+      const text = await runKindCommand(args, ctx);
+      try {
+        pi.sendMessage?.({ customType: "pi-Coworkflow", content: text, display: true });
+      } catch {
+        // Same as the other commands: a host without sendMessage still gets the report below.
+      }
+      if (ctx?.mode !== "tui") report(text);
+    },
   });
 
   pi.registerCommand?.(`${NS}:start`, {
