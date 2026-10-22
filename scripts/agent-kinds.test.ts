@@ -1095,3 +1095,49 @@ test("gate: a fanout respects the kind ceiling including what is already running
     harness.close();
   }
 });
+
+/**
+ * A dispatch never occupies the main session.
+ *
+ * `async` defaults to on, so a blocking child only happens when the caller asks for one — and this
+ * project does not allow that. The gate rewrites the request rather than refusing it: the child still
+ * runs, the caller still gets a run id to wait on, so nothing is lost but the block.
+ */
+test("gate: a foreground dispatch is put in the background, and the rewrite is reported", { skip }, async () => {
+  const harness = gateHarness();
+  try {
+    // A kind dispatch that asked to block.
+    const foreground = { agent: "cw-executor", task: "x", async: false };
+    assert.equal(await harness.call(foreground), undefined, "it is admitted, not refused");
+    assert.equal(foreground.async, true, "but the request the host runs is a background one");
+
+    // The fanout path is the same rule, on the same object.
+    const fanout = {
+      workflow: "coworkflow.fanout",
+      async: false,
+      args: { tasks: [{ kind: "executor", task: "a" }] },
+    };
+    assert.equal(await harness.call(fanout), undefined);
+    assert.equal(fanout.async, true, "a fanout cannot block the main session either");
+
+    // A call that is already background is left alone, and nothing is counted for it.
+    const background = { agent: "cw-executor", task: "x" };
+    assert.equal(await harness.call(background), undefined);
+    assert.equal("async" in background, false, "no redundant field is added");
+
+    // Reported as a fact, so "why did my child not block?" has an answer.
+    const status = agentKindsModule.runtimeStatus!(harness.host) ?? [];
+    assert.ok(
+      status.some((line) => line.includes("已把 2 次") && line.includes("改为后台")),
+      status.join("\n"),
+    );
+
+    // A refused dispatch is not counted: nothing was admitted, so nothing was rewritten.
+    harness.setModule(false);
+    const refused = { agent: "cw-executor", task: "x", async: false };
+    assert.equal(await harness.call(refused), undefined, "the layer is off, so the gate stays out of it");
+    assert.equal(refused.async, false, "and a disabled layer does not rewrite other people's calls");
+  } finally {
+    harness.close();
+  }
+});

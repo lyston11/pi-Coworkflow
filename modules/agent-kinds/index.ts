@@ -117,6 +117,14 @@ interface State {
   /** What the last completed pass learned; read by `runtimeStatus` and the gate. */
   snapshot: Snapshot | null;
   /**
+   * How many dispatches this session asked to block the main session, and were put in the background.
+   *
+   * Counted rather than silently corrected: the rewrite is visible in `/Coworkflow:status` as a fact.
+   * A project rule that changes what a call does should be answerable when someone asks why the
+   * child did not block.
+   */
+  forcedBackground: number;
+  /**
    * The fingerprint of what is registered right now, or `null` when nothing is.
    *
    * The gate compares the plan it just built from disk against this: a difference means a
@@ -158,6 +166,7 @@ function stateFor(host: PiRuntimeHost): State {
   const created: State = {
     generation: 0,
     snapshot: null,
+    forcedBackground: 0,
     registeredSignature: null,
     skipped: null,
     pending: Promise.resolve(),
@@ -221,6 +230,27 @@ export function decodeKindDispatch(input: unknown): { agent: string; async: bool
   // `resolveDispatchKind`'s job.
   if (!agent.startsWith(KIND_PREFIX)) return null;
   return { agent, async: call.async !== false };
+}
+
+/**
+ * Put a dispatch in the background, and say whether it had to be changed.
+ *
+ * Project policy is that a dispatch never occupies the main session: `async` defaults to on, so the
+ * only way to get a blocking child is to ask for one, and this rewrites that request instead of
+ * refusing it. Rewriting is the better of the two here — the child still runs, the caller still gets
+ * its receipt with a run id, and a caller that genuinely needs the result can wait for it explicitly
+ * with `bg_wait`. Refusing would cost a round trip to correct a parameter that has exactly one
+ * correct value in this project.
+ *
+ * Mutating `input` in place is the documented mechanism (`tool_call` handlers may modify the call);
+ * the host runs the tool with what the handler left behind.
+ */
+export function forceBackground(input: unknown): boolean {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return false;
+  const call = input as Record<string, unknown>;
+  if (call.async !== false) return false;
+  call.async = true;
+  return true;
 }
 
 /**
@@ -554,6 +584,7 @@ async function gateFanout(
   runtime: RuntimeContext,
   batch: { kind: string; count: number }[],
   kinds: readonly ResolvedAgentKind[],
+  input: unknown,
 ): Promise<Refusal | undefined> {
   const on = (): boolean => !runtime.isChild && runtime.enabled && runtime.control.moduleEnabled("agent-kinds");
   await state.pending;
@@ -606,6 +637,8 @@ async function gateFanout(
       };
     }
   }
+  // Admitted: it must not block the main session.
+  if (forceBackground(input)) state.forcedBackground += 1;
   return;
 }
 
@@ -647,7 +680,7 @@ async function gate(
     }
   }
 
-  if (fanout !== null) return await gateFanout(host, state, runtime, fanout, current.kinds);
+  if (fanout !== null) return await gateFanout(host, state, runtime, fanout, current.kinds, event.input);
 
   // A name the project's table does not know is not this gate's business: the dispatch goes
   // through untouched, exactly as it did before kinds existed.
@@ -703,6 +736,10 @@ async function gate(
   if (observed.kind === "unknown") return unreadableCountRefusal(dispatch, limit, observed.reason);
   // `>=`: at the limit there is no room for one more, which is what the limit means.
   if (observed.count >= limit) return overLimitRefusal(dispatch, limit, observed.count);
+
+  // Admitted: it must not block the main session. Same rewrite as the fanout path — one rule, one
+  // implementation, so a future dispatch shape cannot accidentally keep the old behaviour.
+  if (forceBackground(event.input)) state.forcedBackground += 1;
   return;
 }
 
@@ -921,6 +958,11 @@ export const agentKindsModule: WorkflowModule = {
     }
     for (const entry of snapshot.disabled) {
       lines.push(`  - agent-kinds: ${entry.kind} 已关闭（不注册；派单会被拒绝）${kindModelSuffix(entry)}`);
+    }
+    if (state.forcedBackground > 0) {
+      lines.push(
+        `  ~ agent-kinds: 已把 ${state.forcedBackground} 次「前台」派单改为后台（本项目要求子 agent 不占住主会话；需要结果就用 bg_wait 等它）`,
+      );
     }
     for (const entry of snapshot.failures) lines.push(`  x agent-kinds: ${entry.kind} 无法使用：${entry.reason}`);
     for (const kind of snapshot.unshipped) {
