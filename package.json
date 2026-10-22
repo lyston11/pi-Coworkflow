@@ -40,11 +40,14 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test scripts/test.ts scripts/upstream-bridge.test.ts scripts/runtime-lifecycle.test.ts scripts/capacity-lanes.test.ts scripts/usage.test.ts scripts/config-root.test.ts scripts/switch-default.test.ts scripts/agent-kinds.test.ts scripts/agent-kinds-surface.test.ts scripts/agent-kind-models.test.ts scripts/agent-kind-panel.test.ts scripts/kind-port.test.ts scripts/run-control.test.ts scripts/observability.test.ts scripts/fanout.test.ts scripts/child-tail.test.ts",
+    "test": "node --experimental-strip-types --test scripts/test.ts scripts/upstream-bridge.test.ts scripts/runtime-lifecycle.test.ts scripts/capacity-lanes.test.ts scripts/usage.test.ts scripts/config-root.test.ts scripts/switch-default.test.ts scripts/agent-kinds.test.ts scripts/agent-kinds-surface.test.ts scripts/agent-kind-models.test.ts scripts/agent-kind-panel.test.ts scripts/kind-port.test.ts scripts/run-control.test.ts scripts/observability.test.ts scripts/fanout.test.ts scripts/child-tail.test.ts scripts/cli.test.ts",
     "verify": "node --experimental-strip-types scripts/verify.ts"
   },
   "devDependencies": {
     "@types/node": "^22",
     "typescript": "^5"
+  },
+  "bin": {
+    "pi-coworkflow": "./scripts/cli.ts"
   }
 }

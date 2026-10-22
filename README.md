@@ -165,24 +165,50 @@ enabled: true                     # 可选默认值
 
 **出错只坏一个**：文件格式错、agent 名不合法或撞名、`model`/`thinking`/`maxConcurrent` 不可用、正文为空——**只有那个 kind 失败**，原因出现在 `/Coworkflow:status` 和设置面板里，其它 kind 照常工作。失败的 kind **不会被注册，派单会被拒绝**，不会出现「看起来可用、实际起不来」。
 
-### 三个入口，一个写入者
+### 入口：终端 CLI（给别的 agent 用）、Pi 内命令、公开请求
+
+**`pi-coworkflow` 是终端入口**——不需要 Pi 会话、不需要扩展宿主、不需要任何进程在跑。任何能执行 shell 的 agent（Claude Code、Codex、你自己的脚本）都能用它 DIY 本项目的子 agent：
 
 ```bash
-# 1) 手写文件（上面那个格式）
-# 2) 命令，任何人（包括 agent）都能用
-/Coworkflow:kind list
-/Coworkflow:kind show builder
-/Coworkflow:kind set builder label=建造者 role=implement prompt="按派单实现，报告事实"
-/Coworkflow:kind set builder maxConcurrent=3 thinking=high
-/Coworkflow:kind remove builder
+# 直接跑仓库里的入口（无需安装）
+node --experimental-strip-types /path/to/pi-Coworkflow/scripts/cli.ts kind list
 
-# 3) 公开请求（其它扩展/程序用），信封与 pi-subagents 的 RPC 一致
-#    频道 coworkflow:kind:v1:request，回复在 coworkflow:kind:v1:reply:<requestId>
-#    方法：list / show / define / remove；version 必须是 1
+# 或者装成 bin 之后
+npx pi-coworkflow kind list
+pi-coworkflow kind list --project /path/to/project
+
+pi-coworkflow kind show builder
+pi-coworkflow kind set builder label=建造者 role=implement prompt="按派单实现，报告事实"
+pi-coworkflow kind set builder maxConcurrent=3 thinking=high
+pi-coworkflow kind remove builder
+pi-coworkflow kind path          # 定义目录在哪
 ```
 
-三者都走同一个写入者：**先校验，再落盘**。所以被拒绝的值不会留下半个文件，也不存在「只活在内存里、`/reload` 就消失」的 kind——那种 kind 会让这个端口的核心承诺反过来。
+给 agent 用的两条约定：
 
+- **退出码是结论**：`0` 成功；`1` 值被拒绝（**文件未改动**）；`2` 用法/找不到；`3` 内部错误。拒绝原因在 stderr。
+- **`--json` 给机器读**：`list` / `show` / `set` / `remove` 都支持，成功与失败都输出结构化结果，不用解析中文散文。
+
+```bash
+$ pi-coworkflow kind set builder role=nope --json; echo "exit=$?"
+{"ok":false,"error":{"code":"rejected","message":"role 只能是 implement / check / research 或 none：nope"}}
+exit=1
+```
+
+`--project <dir>` 指定作用于哪个项目；**在 task worktree 里执行会自动写到主检出**——worktree 只有已提交文件，写在里面没有任何 gate 会读到（CLI 用的是扩展同一套解析）。
+
+另外两个入口，同一个写入者：
+
+```bash
+# Pi 会话内
+/Coworkflow:kind list | show <kind> | set <kind> k=v… | remove <kind>
+
+# 公开请求（其它扩展/程序），信封与 pi-subagents 的 RPC 一致
+# 频道 coworkflow:kind:v1:request，回复 coworkflow:kind:v1:reply:<requestId>
+# 方法 list / show / define / remove；version 必须是 1
+```
+
+**三者都走同一个写入者**：先校验，再落盘。所以 CLI 不可能接受一个会话会拒绝的值，被拒绝的值也不会留下半个文件。也**没有「只活在内存里」的 kind**——那种 kind 在 `/reload` 后会消失，正好把这个端口的核心承诺反过来；同理不做目录监听：刷新点是 `/reload` 与命令本身。
 
 ## 一次并发派出多件事：`coworkflow.fanout`
 
@@ -450,11 +476,13 @@ pi-Coworkflow/
 │   ├── agent-kinds/
 │   │   ├── index.ts               # 注册 + 按 kind 的 tool_call 门禁 + 状态行
 │   │   ├── registration.ts        # pi-subagents 运行时 agent 契约（加载/注册/dispose）
-│   │   ├── defaults.ts            # 内置 kind 表（含 kind → Trellis 角色）与资产加载
+│   │   ├── definitions.ts         # 项目定义文件（.pi/Coworkflow/agents/<kind>.md）的读写与校验
+│   │   ├── port.ts                # 公开请求端口 coworkflow:kind:v1（另一个入口，同一个写入者）
+│   │   ├── defaults.ts            # 随附 kind 表（含 kind → Trellis 角色）、默认值与资产加载
 │   │   └── assets/{executor,auditor,researcher}.md
 │   ├── lane-worktree/  capacity/
 │   └── panel/{index,shared,settings,models}.ts
-└── scripts/                       # node --test 套件 + verify.ts（手工探针）+ drive-tui.py
+└── scripts/                       # node --test 套件 + cli.ts（终端入口）+ verify.ts（手工探针）
 ```
 
 `modules/panel` 从 `@earendil-works/pi-tui` / `@earendil-works/pi-coding-agent` 导入——Pi 的加载器
