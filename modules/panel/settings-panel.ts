@@ -67,6 +67,8 @@ export class SettingsPanel extends Container {
   private readonly body = new Container();
   private readonly statusText = new Text("", 0, 0);
   private readonly searchInput = new Input();
+  /** Non-null while a value is being edited in place. */
+  private editing: { row: SettingRow; input: Input } | null = null;
 
   constructor(
     io: SettingsPanelIo,
@@ -304,7 +306,16 @@ export class SettingsPanel extends Container {
     for (let pad = painted; pad < this.targetRows(); pad += 1) {
       this.body.addChild(new Spacer(1));
     }
-    this.statusText.setText(this.status ? theme.fg("success", this.status) : "");
+    if (this.editing) {
+      const row = this.editing.row;
+      this.statusText.setText(
+        theme.fg("accent", `编辑「${row.label}」：`) +
+          this.editing.input.render(Math.max(20, width - 24)).join("") +
+          theme.fg("muted", `  ${row.editor?.placeholder ?? ""}（Enter 提交 · Esc 取消）`),
+      );
+    } else {
+      this.statusText.setText(this.status ? theme.fg("success", this.status) : "");
+    }
   }
 
   render(width: number): string[] {
@@ -343,11 +354,50 @@ export class SettingsPanel extends Container {
   private applyRow(): void {
     const row = this.rows[this.cursor];
     if (!row || row.readOnly || row.prose) return;
+    if (row.editor) {
+      this.beginEdit(row);
+      return;
+    }
     const action = row.act ?? row.toggle;
     if (action) this.run(action);
   }
 
+  /** Open the in-panel editor on this row. The panel stays the only dialog. */
+  private beginEdit(row: SettingRow): void {
+    if (this.inflight || !row.editor) return;
+    const input = new Input();
+    input.setValue(row.editor.current);
+    // `setValue` leaves the cursor at the start, so a typed digit would land *before* the
+    // current value: editing "6" by typing "0" produced "06". Move to the end, where a
+    // person editing a number expects to be.
+    input.handleInput("\x1b[F");
+    input.focused = true;
+    input.onSubmit = () => {
+      const value = input.getValue();
+      this.editing = null;
+      this.searchInput.focused = this.focus === "item";
+      void this.run(() => row.editor!.commit(value));
+    };
+    this.editing = { row, input };
+    this.searchInput.focused = false;
+    this.refresh();
+  }
+
+  private cancelEdit(): void {
+    this.editing = null;
+    this.searchInput.focused = this.focus === "item";
+    this.refresh();
+  }
+
   handleInput(data: string): void {
+    // While a value is being edited, the editor owns the keyboard: Esc abandons the
+    // edit (not the panel), Enter commits, and nothing else reaches the row cursor.
+    if (this.editing) {
+      if (this.matches(data, "cancel")) return this.cancelEdit();
+      this.editing.input.handleInput(data);
+      this.refresh();
+      return;
+    }
     if (this.matches(data, "cancel")) {
       this.io.close();
       return;

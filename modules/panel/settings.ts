@@ -41,6 +41,23 @@ export interface SettingRow {
   act?: () => string | Promise<string>;
   /** Space: flip a boolean without leaving the row. */
   toggle?: () => string | Promise<string>;
+  /**
+   * Enter edits the value **inside the panel**.
+   *
+   * Asking the host for a dialog (`ui.input`) while this component is open nests one
+   * dialog inside another; on this host the panel did not come back afterwards and the
+   * command then appeared to do nothing at all. Editing in place keeps the panel the only
+   * dialog, and validation lives in `commit`, so a bad answer is a status line rather than
+   * a closed panel.
+   */
+  editor?: {
+    /** What the edit line starts with, e.g. the current value. */
+    current: string;
+    /** Shown next to the editor, so the accepted range is visible while typing. */
+    placeholder: string;
+    /** Commit one answer; returns the status line. */
+    commit(value: string): string | Promise<string>;
+  };
 }
 
 /**
@@ -48,78 +65,28 @@ export interface SettingRow {
  * configured, and it offers to initialize a project that has not been adopted
  * yet.
  */
-/** Ask for a number; empty clears it. Used for the project concurrency limit. */
-async function editProjectLimit(
-  control: WorkflowControl,
-  commandCtx: any,
-  current: number | null,
-): Promise<string> {
-  const value = await commandCtx?.ui?.input?.(
-    "本项目子 agent 并发上限（留空 = 不限）",
-    current === null ? "" : String(current),
-  );
-  if (value === undefined) return "未修改";
-  const trimmed = value.trim();
-  if (!trimmed) return control.setSubagentConcurrency(null);
+/** A positive integer answer, or the reason it is not one. Every numeric row shares it. */
+function positiveInt(
+  raw: string,
+  what: string,
+  bound: { min: number; max?: number },
+  commit: (value: number | null) => string | Promise<string>,
+): string | Promise<string> {
+  const trimmed = raw.trim();
+  if (!trimmed) return commit(null);
   const parsed = Number(trimmed);
-  if (!Number.isInteger(parsed) || parsed < 1) {
-    return `并发上限需要 ≥ 1 的整数（留空 = 不限）：${trimmed}`;
+  const range = bound.max === undefined ? `≥ ${bound.min}` : `${bound.min}–${bound.max}`;
+  if (!Number.isInteger(parsed) || parsed < bound.min || (bound.max !== undefined && parsed > bound.max)) {
+    return `${what}需要 ${range} 的整数（留空 = 默认）：${trimmed}`;
   }
-  return control.setSubagentConcurrency(parsed);
+  return commit(parsed);
 }
 
 /**
- * Ask for the wall-clock budget one child run gets.
- *
- * Minutes, not milliseconds: this is a number a person reasons about, and the unit is what
- * makes "25" and "1500" different answers rather than the same one twice.
+ * Register `/Coworkflow:settings`. Always available: it is how a project gets
+ * configured, and it offers to initialize a project that has not been adopted
+ * yet.
  */
-async function editRunBudget(
-  control: WorkflowControl,
-  commandCtx: any,
-  current: number | null,
-): Promise<string> {
-  const value = await commandCtx?.ui?.input?.(
-    "子 agent 运行上限（分钟，1–240；留空 = 内置默认 25 分钟）",
-    current === null ? "" : String(current),
-  );
-  if (value === undefined) return "未修改";
-  const trimmed = value.trim();
-  if (!trimmed) return control.setRunBudgetMinutes(null);
-  const parsed = Number(trimmed);
-  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 240) {
-    return `运行上限需要 1–240 的整数分钟（留空 = 内置默认）：${trimmed}`;
-  }
-  return control.setRunBudgetMinutes(parsed);
-}
-
-/** Ask for one kind's limit; an empty answer restores the built-in default. */
-async function editKindLimit(
-  control: WorkflowControl,
-  commandCtx: any,
-  kind: string,
-  current: number,
-): Promise<string> {
-  const value = await commandCtx?.ui?.input?.(
-    `kind ${kind} 的并发上限（≥ 1；留空 = 内置默认）`,
-    String(current),
-  );
-  if (value === undefined) return "未修改";
-  const trimmed = value.trim();
-  if (!trimmed) return control.setAgentKind(kind, { maxConcurrent: null });
-  const parsed = Number(trimmed);
-  if (!Number.isInteger(parsed) || parsed < 1) {
-    return `并发上限需要 ≥ 1 的整数（留空 = 内置默认）：${trimmed}`;
-  }
-  return control.setAgentKind(kind, { maxConcurrent: parsed });
-}
-
-async function editPrefix(control: WorkflowControl, commandCtx: any): Promise<string> {
-  const value = await commandCtx?.ui?.input?.("worktree 目录前缀", control.prefix());
-  if (value === undefined) return "未修改";
-  return control.setPrefix(value.trim());
-}
-
 /**
  * The settings rows, built from the control surface so the panel and the slash
  * commands always agree about what is on.
@@ -168,7 +135,11 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
     label: "worktree 前缀",
     value: control.prefix(),
     detail: "任务 worktree 的目录名（../<前缀><任务>）",
-    act: () => editPrefix(control, commandCtx),
+    editor: {
+      current: control.prefix(),
+      placeholder: "任务 worktree 的目录名前缀",
+      commit: (value) => control.setPrefix(value.trim()),
+    },
   });
 
   // ── 子 agent ────────────────────────────────────────────────────────────
@@ -180,7 +151,12 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
     label: "本项目并发上限",
     value: limit === null ? "不限" : String(limit),
     detail: "同一会话同时活跃的顶层 async run；留空 = 不限（由 Coworkflow 拦截）",
-    act: () => editProjectLimit(control, commandCtx, limit),
+    editor: {
+      current: limit === null ? "" : String(limit),
+      placeholder: "≥ 1 的整数；留空 = 不限",
+      commit: (value) =>
+        positiveInt(value, "本项目并发上限", { min: 1 }, (parsed) => control.setSubagentConcurrency(parsed)),
+    },
   });
 
   const budget = control.runBudgetMinutes();
@@ -189,7 +165,14 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
     label: "子 agent 运行上限",
     value: budget === null ? "25 分钟（默认）" : `${budget} 分钟`,
     detail: "一次派单的墙上时间上限；接近上限前会要求子 agent 停下交接（留空 = 默认）",
-    act: () => editRunBudget(control, commandCtx, budget),
+    editor: {
+      current: budget === null ? "" : String(budget),
+      placeholder: "1–240 分钟；留空 = 内置默认",
+      commit: (value) =>
+        positiveInt(value, "子 agent 运行上限", { min: 1, max: 240 }, (parsed) =>
+          control.setRunBudgetMinutes(parsed),
+        ),
+    },
   });
 
   const kinds = control.agentKinds();
@@ -221,7 +204,14 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
               ? "注册失败（原因见 状态 tab）"
               : "已启用；注册状态见 状态 tab",
       toggle: () => control.setAgentKind(entry.kind, { enabled: !entry.enabled }),
-      act: () => editKindLimit(control, commandCtx, entry.kind, entry.maxConcurrent),
+      editor: {
+        current: String(entry.maxConcurrent),
+        placeholder: "≥ 1 的整数；留空 = 内置默认",
+        commit: (value) =>
+          positiveInt(value, `kind ${entry.kind} 的并发上限`, { min: 1 }, (parsed) =>
+            control.setAgentKind(entry.kind, { maxConcurrent: parsed }),
+          ),
+      },
     });
   }
   if (kinds.length === 0) {
@@ -279,24 +269,32 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
  * configured, and it offers to initialize a project that has not been adopted
  * yet.
  */
-/** Ask for a number; empty clears it. Used for the project concurrency limit. */
-/**
- * Register `/Coworkflow:settings`. Always available: it is how a project gets
- * configured, and it offers to initialize a project that has not been adopted
- * yet.
- */
-export function registerSettingsPanel(host: PiRuntimeHost, runtime: RuntimeContext): void {
+export function registerSettingsPanel(
+  host: PiRuntimeHost,
+  runtime: RuntimeContext,
+  /**
+   * The runtime this session is running *now*.
+   *
+   * The value passed alongside is the one from registration, which a reload replaces; the
+   * panel must drive the live session or it configures one that no longer exists. Optional
+   * so a host that cannot answer still gets the registration-time runtime.
+   */
+  live?: () => RuntimeContext,
+): void {
   const registered = settingsPanelRegistered.get(host);
-  if (registered) { registered.runtime = runtime; return; }
-  const registration = { runtime };
+  if (registered) { registered.runtime = runtime; registered.live = live; return; }
+  const registration = { runtime, live };
   settingsPanelRegistered.set(host, registration);
   host.registerCommand?.(`Coworkflow:settings`, {
     description:
       "Coworkflow 设置面板：模块开关、会话、子 agent 类型与并发上限、维护；分页显示，未初始化时可从这里初始化本项目",
     handler: async (_args: string, commandCtx: any) => {
-      const runtime = registration.runtime;
+      // The runtime this session is actually running, not the one captured when the
+      // command was registered: after a reload those differ, and driving the stale one
+      // reads and writes a session that no longer exists.
+      const liveRuntime = registration.live?.() ?? registration.runtime;
+      const runtime = liveRuntime;
       runtime.refresh();
-      const epoch = runtime.sessionEpoch;
       // One refresh at panel-open, bounded. Each public RPC has a 10 s timeout, so
       // awaiting them unbounded made the command take ~20 s to open in a session
       // whose event bus exists but whose owner never answers — for facts that are
@@ -329,7 +327,6 @@ export function registerSettingsPanel(host: PiRuntimeHost, runtime: RuntimeConte
       } else {
         staleNote = null;
       }
-      if (epoch !== runtime.sessionEpoch || registration.runtime !== runtime) return;
       const control = runtime.control;
       const say = (text: string): void => {
         try {
@@ -346,6 +343,12 @@ export function registerSettingsPanel(host: PiRuntimeHost, runtime: RuntimeConte
         }
       };
 
+      if (registration.live !== undefined && registration.live() !== runtime) {
+        // Not silent: a command that appears to do nothing is the one failure a user
+        // cannot diagnose, and this is a real state — the layer was reloaded underneath.
+        say("本会话的 Coworkflow 运行时已被替换（例如 /reload）：请再运行一次本命令。");
+        return;
+      }
       if (commandCtx?.mode !== "tui" || typeof commandCtx?.ui?.custom !== "function") {
         say(
           control.initialized()
@@ -400,4 +403,7 @@ export function registerSettingsPanel(host: PiRuntimeHost, runtime: RuntimeConte
   });
 }
 
-const settingsPanelRegistered = new WeakMap<object, { runtime: RuntimeContext }>();
+const settingsPanelRegistered = new WeakMap<
+  object,
+  { runtime: RuntimeContext; live?: (() => RuntimeContext) | undefined }
+>();

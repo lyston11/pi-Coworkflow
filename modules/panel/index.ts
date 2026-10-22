@@ -66,7 +66,7 @@ export const panelModule: WorkflowModule = {
   activate(host: PiRuntimeHost, runtime: RuntimeContext): void {
     // Children have no interactive UI and must never open a panel.
     if (runtime.isChild || !host.registerCommand) return;
-    registerSettingsPanel(host, runtime);
+    registerSettingsPanel(host, runtime, () => runtime);
     registerModelPanel(host, runtime);
   },
 

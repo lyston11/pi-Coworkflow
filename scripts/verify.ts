@@ -139,16 +139,20 @@ switch (command) {
   }
 
   case "settings": {
-    const { SettingsPanel, buildSettingRows } = (await import(
+    // The class lives in the lazily imported renderer module, which is where the host
+    // UI packages are allowed to be imported; `settings.ts` only registers the command.
+    const { buildSettingRows } = (await import(
       here("../modules/panel/settings.ts")
     )) as unknown as {
+      buildSettingRows: (control: unknown, ctx: unknown) => unknown[];
+    };
+    const { SettingsPanel } = (await import(here("../modules/panel/settings-panel.ts"))) as unknown as {
       SettingsPanel: new (
         io: unknown,
         theme: unknown,
         tui: unknown,
         keybindings?: unknown,
       ) => PanelLike;
-      buildSettingRows: (control: unknown, ctx: unknown) => unknown[];
     };
     const control = (globalThis as { __coworkflowControl?: unknown }).__coworkflowControl;
     if (!control) throw new Error("harness did not capture the control surface");

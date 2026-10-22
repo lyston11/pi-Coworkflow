@@ -1064,3 +1064,95 @@ test("panel: the run budget is editable and reaches the workflow", async () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+/**
+ * Editing a value must not require a second dialog.
+ *
+ * The numeric rows used `ui.input`, which nests a host dialog inside this component. On the
+ * real host the panel did not come back after that, and the command then appeared to do
+ * nothing at all — the one failure a user cannot diagnose. Editing in place keeps the panel
+ * the only dialog, and a rejected value stays a status line.
+ */
+test("panel: numeric rows edit in place, and a bad answer does not close the panel", async () => {
+  const { buildSettingRows } = await import("../modules/panel/settings.ts");
+  const { SettingsPanel } = await import("../modules/panel/settings-panel.ts");
+  const writes: Array<number | null> = [];
+  const control: any = {
+    initialized: () => true,
+    switches: () => ({}),
+    moduleIds: () => [],
+    configRoot: () => "/tmp/project",
+    configRootNote: () => null,
+    autoEnable: () => false,
+    moduleEnabled: () => true,
+    subagentConcurrency: () => 6,
+    runBudgetMinutes: () => null,
+    agentKinds: () => [{ kind: "executor", label: "执行者", agent: "cw-executor", enabled: true, maxConcurrent: 5 }],
+    agentKindStatus: () => [],
+    facts: () => [],
+    prefix: () => "wt-",
+    setSubagentConcurrency: (value: number | null) => {
+      writes.push(value);
+      return `并发上限 → ${value ?? "不限"}`;
+    },
+  };
+
+  const statuses: string[] = [];
+  let closed = false;
+  let panel!: InstanceType<typeof SettingsPanel>;
+  panel = new SettingsPanel(
+    {
+      rows: () => buildSettingRows(control, {}),
+      close: () => {
+        closed = true;
+      },
+      changed: (status: string) => {
+        statuses.push(status);
+        panel.reload(status);
+      },
+    },
+    { fg: (_c: string, text: string) => text, bold: (text: string) => text },
+    { requestRender: () => {} },
+  );
+
+  const focusOn = (needle: string): void => {
+    for (let page = 0; page < 6; page += 1) {
+      for (let step = 0; step < 40; step += 1) {
+        if (panel.selectedRow()?.label.includes(needle)) return;
+        panel.handleInput("\x1b[B");
+      }
+      panel.handleInput("\t");
+    }
+    throw new Error(`row not found: ${needle}`);
+  };
+
+  focusOn("本项目并发上限");
+  panel.handleInput("\r");
+  // The edit line replaces the status line: the panel is still the active component and
+  // nothing was closed to ask the question.
+  assert.ok(!closed, "opening an editor does not close the panel");
+  assert.match(panel.render(80).join("\n"), /编辑「本项目并发上限」/);
+  // A rejected answer reports itself instead of committing. The cursor starts at the end
+  // of the prefilled value, so typing appends rather than prepending.
+  panel.handleInput("\x7f"); // backspace the "6"
+  panel.handleInput("0");
+  panel.handleInput("\r");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(writes, [], "0 is not a limit");
+  assert.match(statuses.at(-1) ?? "", /需要 ≥ 1 的整数/, statuses.join("|"));
+  assert.ok(!closed, "and the panel is still open");
+
+  // Esc abandons the edit, not the panel.
+  panel.handleInput("\r");
+  panel.handleInput("\x1b");
+  assert.ok(!closed, "Esc leaves the edit, not the panel");
+  assert.match(panel.render(80).join("\n"), /本项目并发上限/);
+
+  // A good answer commits: clear the prefilled value first, as a person would.
+  panel.handleInput("\r");
+  panel.handleInput("\x7f");
+  panel.handleInput("9");
+  panel.handleInput("\r");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(writes, [9]);
+});
