@@ -3,10 +3,15 @@
  * defaults to.
  *
  * A kind is not a new execution path. It is a *name* the installed pi-subagents
- * owner registers as an agent, plus two project policies (enabled, max concurrent)
- * that this package enforces. Everything about how the child runs — model,
- * context, async, limits — stays the owner's business, so nothing here declares
- * a runner, a model, or a concurrency mechanism.
+ * owner registers as an agent, plus project policies (enabled, max concurrent, and
+ * optionally the model and thinking level its children run on) that this package
+ * passes to that registration. Everything about *how* the child runs — context,
+ * async, limits, the runner — stays the owner's business, so nothing here declares
+ * a runner or a concurrency mechanism.
+ *
+ * The model is the one field where this table deliberately declares nothing: a kind
+ * that inherits is the default, and a built-in model here would override the
+ * project's own `subagents.defaultModel` for one kind without anybody asking.
  *
  * Two things are deliberately data and not code:
  *
@@ -38,7 +43,7 @@ export interface BuiltinKind {
   /** Asset holding the system prompt, relative to this module. */
   asset: string;
   /** Policy for a project that declares nothing about this kind. */
-  defaults: Required<AgentKindConfig>;
+  defaults: Required<Pick<AgentKindConfig, "enabled" | "maxConcurrent">>;
 }
 
 /**
@@ -184,6 +189,11 @@ export function resolveKinds(config: WorkflowConfig | null): ResolvedAgentKind[]
       agent: agentNameFor(entry.kind),
       enabled: policy?.enabled ?? entry.defaults.enabled,
       maxConcurrent: positiveInteger(policy?.maxConcurrent) ?? entry.defaults.maxConcurrent,
+      // Passed through unchanged, and never defaulted: an absent model means inherit,
+      // and `parseAgentKinds` has already dropped anything unusable, so there is
+      // nothing left here for a second validation to disagree about.
+      ...(policy?.model === undefined ? {} : { model: policy.model }),
+      ...(policy?.thinking === undefined ? {} : { thinking: policy.thinking }),
     };
   });
 }

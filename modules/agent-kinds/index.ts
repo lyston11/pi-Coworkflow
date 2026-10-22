@@ -77,14 +77,27 @@ import {
 interface Snapshot {
   /** Why the contract was unavailable, when it was. */
   contractFailure?: string;
-  /** Kinds the owner accepted, with their agent names. */
-  registered: { kind: string; agent: string }[];
+  /**
+   * Kinds the owner accepted, with their agent names and the model each one was
+   * registered with.
+   *
+   * The model is carried here rather than re-read by the report: `/Coworkflow:status`
+   * and `/Comodels` must not be able to disagree about what a kind runs on, and the
+   * registration is the fact that decides it.
+   */
+  registered: { kind: string; agent: string; model?: string; thinking?: string }[];
   /** Kinds that failed to register, with the owner's own reason (a collision). */
   failures: { kind: string; reason: string }[];
   /** Kinds the project declared that this package has no agent for. */
   unshipped: string[];
-  /** Kinds the project switched off: declared, shipped, intentionally absent. */
-  disabled: string[];
+  /**
+   * Kinds the project switched off: declared, shipped, intentionally absent.
+   *
+   * Their model and thinking level are carried too. A disabled kind keeps its
+   * settings — switching it on must apply what the project already chose, not reset
+   * it — so the report names them the same way it names a registered kind's.
+   */
+  disabled: { kind: string; model?: string; thinking?: string }[];
 }
 
 interface State {
@@ -287,7 +300,15 @@ export function kindRegistrationPlan(
     desired.push({
       kind: entry.kind,
       agent: agentNameFor(entry.kind),
-      definition: { description: builtin.description, systemPrompt: prompt },
+      definition: {
+        description: builtin.description,
+        systemPrompt: prompt,
+        // `parseAgentKinds` has already dropped anything unusable, so a value that
+        // reaches here is one upstream will accept at registration. Absent stays
+        // absent: the field is how a kind says "inherit".
+        ...(entry.model === undefined ? {} : { model: entry.model }),
+        ...(entry.thinking === undefined ? {} : { thinking: entry.thinking }),
+      },
     });
   }
   return { desired, missingAssets };
@@ -337,15 +358,29 @@ function schedule(host: PiRuntimeHost, runtime: RuntimeContext): Promise<void> {
       return;
     }
     const results = registry.reconcile(contract.ok ? contract.contract : null, desired);
+    const policyOf = new Map(kinds.map((entry) => [entry.kind, entry]));
     const snapshot: Snapshot = {
       ...(contract.ok ? {} : { contractFailure: contract.reason }),
-      registered: results.flatMap((entry) => (entry.ok ? [{ kind: entry.kind, agent: entry.agent }] : [])),
+      registered: results.flatMap((entry) => {
+        if (!entry.ok) return [];
+        const policy = policyOf.get(entry.kind);
+        return [{
+          kind: entry.kind,
+          agent: entry.agent,
+          ...(policy?.model === undefined ? {} : { model: policy.model }),
+          ...(policy?.thinking === undefined ? {} : { thinking: policy.thinking }),
+        }];
+      }),
       failures: [
         ...results.flatMap((entry) => (entry.ok ? [] : [{ kind: entry.kind, reason: entry.reason }])),
         ...missingAssets.map((kind) => ({ kind, reason: "本包缺少该 kind 的系统提示资产（modules/agent-kinds/assets/）" })),
       ],
       unshipped: unshippedKinds(config),
-      disabled: kinds.filter((entry) => !entry.enabled).map((entry) => entry.kind),
+      disabled: kinds.flatMap((entry) => entry.enabled ? [] : [{
+        kind: entry.kind,
+        ...(entry.model === undefined ? {} : { model: entry.model }),
+        ...(entry.thinking === undefined ? {} : { thinking: entry.thinking }),
+      }]),
     };
     state.snapshot = snapshot;
   })().catch((error: unknown) => {
@@ -359,6 +394,20 @@ function schedule(host: PiRuntimeHost, runtime: RuntimeContext): Promise<void> {
   });
   state.pending = run;
   return run;
+}
+
+/**
+ * How one registered kind's model reads in a status line: pinned, or inherited.
+ *
+ * The two are different facts and the report must not blur them: "继承默认" says this
+ * kind has no model of its own, which is what makes a project-wide change to
+ * `subagents.defaultModel` apply to it. A pinned model is named in full so the line
+ * can be compared with the panel without re-reading the config.
+ */
+function kindModelSuffix(entry: { model?: string; thinking?: string }): string {
+  const model = entry.model === undefined ? "继承默认" : `模型 ${entry.model}`;
+  const thinking = entry.thinking === undefined ? "继承" : entry.thinking;
+  return ` · ${model} · 思考 ${thinking}`;
 }
 
 /**
@@ -626,7 +675,9 @@ export const agentKindsModule: WorkflowModule = {
         `  - agent-kinds: 未注册任何 kind；声明过的 kind 派单会被拒绝，而不是被当成可用`,
       ];
     }
-    const lines = snapshot.registered.map((entry) => `  = agent-kinds: ${entry.agent}（kind ${entry.kind}）已注册`);
+    const lines = snapshot.registered.map((entry) =>
+      `  = agent-kinds: ${entry.agent}（kind ${entry.kind}）已注册${kindModelSuffix(entry)}`,
+    );
     // "Nothing enabled" and "everything failed" are different facts, and the
     // second one must never read as the first: a reader who sees "没有启用的 kind"
     // stops looking, while a failed registration is exactly what they need to see.
@@ -635,7 +686,9 @@ export const agentKindsModule: WorkflowModule = {
     } else if (lines.length === 0) {
       lines.push(`  - agent-kinds: 没有已注册的 kind（启用的 kind 都未能注册，原因见下）`);
     }
-    for (const entry of snapshot.disabled) lines.push(`  - agent-kinds: ${entry} 已关闭（不注册；派单会被拒绝）`);
+    for (const entry of snapshot.disabled) {
+      lines.push(`  - agent-kinds: ${entry.kind} 已关闭（不注册；派单会被拒绝）${kindModelSuffix(entry)}`);
+    }
     for (const entry of snapshot.failures) lines.push(`  x agent-kinds: ${entry.kind} 注册失败：${entry.reason}`);
     for (const kind of snapshot.unshipped) {
       lines.push(`  ! agent-kinds: 项目声明了 kind ${kind}，但本包没有这个 kind 的定义，未注册`);

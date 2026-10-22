@@ -74,7 +74,7 @@ This boundary cannot govern other extensions' RPC calls, other processes, or all
 
 ## Agent kinds (typed subagent families)
 
-A kind is a named agent definition plus two project policies (enabled, max concurrent). It is a *registration and gating* concern, never a new execution path: nothing in this package spawns, schedules, retries, or keeps a per-kind ledger.
+A kind is a named agent definition plus its project policies (enabled, max concurrent, and optionally its own model and thinking level). It is a *registration and gating* concern, never a new execution path: nothing in this package spawns, schedules, retries, or keeps a per-kind ledger.
 
 Registration uses only the installed owner's documented runtime-agent contract — its public `./agents` export and the process-local `pi-subagents:runtime-agent-register:v1` event. The event is used rather than a direct `registerRuntimeAgent` call because a direct call writes into the owner's registry whether or not any owner is loaded in this process; this package would then report a kind as available while nothing merges it into an agent list. No listener therefore means "pi-subagents is not loaded", which is a fact to report, not a registration to keep. Names are namespace-prefixed (`cw-<kind>`) so they cannot collide with the owner's builtin table or a project agent; a collision is that kind's failure and is reported as such, never retried under another name.
 
@@ -86,10 +86,12 @@ Kind→role mapping lives in one table (`modules/agent-kinds/defaults.ts`): `exe
 
 Deployment honesty is a gate requirement, not a diagnostic: when the contract is unavailable, nothing is registered, `runtimeStatus` and the settings panel state the exact reason, and a dispatch of a declared kind is refused. A kind is never reported as available on the strength of the project's own enablement.
 
+A kind may also carry its own `model` and `thinking` (`agentKinds.<kind>.model` / `.thinking` in `.pi/Coworkflow.json`), which travel inside the runtime agent definition rather than in a launch argument: the definition is the authoritative place for a registered agent and covers every dispatch of that kind, including a hand-written one this package never sees. `subagents.agentOverrides` is deliberately not used — it targets discovered agents, and one config field per fact is the point. Precedence is kind model → `subagents.defaultModel` → Pi's default; absent means inherit. Both fields are part of the reconcile signature, so a change re-registers instead of reading as unchanged. A stored value is validated on read and **dropped** rather than forwarded (upstream refuses an unusable model at registration, which would take the whole kind down); the writer validates and **refuses** instead, so a rejected value never becomes a setting that vanishes on the next read.
+
 ## Human authority and UI compatibility
 
 Parent/human acceptance and integration remain authoritative. Coworkflow can report a workflow verdict and offer evidence; it never accepts/merges/publishes automatically. Failure is reported; re-dispatch/resume are explicit decisions.
 
-The model panel retains its existing three columns and all supported thinking levels. Tab still switches the session/child tab; Left/Right still switches model/thinking columns. Usage uncertainty is textual within existing areas; this contract does not authorize layout redesign.
+The model panel retains its existing three columns, key gestures and all supported thinking levels. Its page list is computed from the configured kinds — 主会话, 子 agent（默认）, then one page per kind — so adding or removing a kind adds or removes a page, and a disabled kind keeps its page and is marked as off. Tab cycles that computed list; Left/Right still switches model/thinking columns; the session page's behaviour is unchanged. A kind page's thinking levels follow the effective model for that page (the kind's own pin, else the model it inherits). Usage uncertainty is textual within existing areas; this contract does not authorize layout redesign.
 
 The settings panel's existing row builders and key conventions are extended, not replaced: rows gain optional `toggle` (Space) and `adjust` (Left/Right) actions, and every row that declares neither keeps Enter-only behaviour. Per-kind rows sit beside the existing project concurrency row; the global limit and the per-kind limits remain visibly distinct settings.

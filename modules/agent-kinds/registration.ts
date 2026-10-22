@@ -48,6 +48,19 @@ export interface KindDefinition {
   description: string;
   systemPrompt: string;
   tools?: readonly string[];
+  /**
+   * The model this agent runs on: `provider/id`, a bare id, or either with a
+   * trailing `:level`.
+   *
+   * Part of the definition rather than a launch argument on purpose: a kind is
+   * runtime-*registered*, so the definition is what every dispatch of that kind
+   * uses — including a hand-written `subagent({ agent: "cw-executor" })` that this
+   * package never sees. A launch-level model would only cover dispatches this
+   * package makes.
+   */
+  model?: string;
+  /** The thinking level this agent runs at; absent means inherit. */
+  thinking?: string;
 }
 
 export interface Disposable {
@@ -193,7 +206,14 @@ export type KindRegistration =
   | { ok: true; kind: string; agent: string }
   | { ok: false; kind: string; agent: string; reason: string };
 
-/** What a reconcile pass wants one kind to look like. */
+/**
+ * What a reconcile pass wants one kind to look like.
+ *
+ * The model and thinking level travel inside `definition`, not beside it: the
+ * definition is what the owner registers, so a copy here would be a second place for
+ * the two to disagree — and the signature that decides "unchanged" is computed from
+ * the definition.
+ */
 export interface DesiredKind {
   kind: string;
   agent: string;
@@ -224,11 +244,22 @@ export interface KindRegistry {
   dispose(): void;
 }
 
+/**
+ * The comparison key for "is this kind's live registration still the one we want".
+ *
+ * Every field that reaches the owner's definition belongs here. A field left out
+ * would make a change to it read as "unchanged", so reconcile would keep the live
+ * registration and the session would keep running the old value — a panel writing a
+ * setting the session does not use, which is exactly the failure this module exists
+ * to remove.
+ */
 function signature(definition: KindDefinition): string {
   return JSON.stringify({
     description: definition.description,
     systemPrompt: definition.systemPrompt,
     tools: definition.tools ?? [],
+    model: definition.model ?? null,
+    thinking: definition.thinking ?? null,
   });
 }
 

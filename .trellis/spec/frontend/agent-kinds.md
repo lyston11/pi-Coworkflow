@@ -30,6 +30,77 @@
 
 Trellis 自己拥有的 `.pi/agents/trellis-*.md` 不删除、不改写（那是 `trellis update` 的地盘），只是不再作为本项目的推荐派单目标。
 
+### 每个 kind 自己的模型与思考等级
+
+三种 kind 通常不该跑同一个模型：执行者做机械的活，适合便宜的；审计者做复核，适合强的。一个继承来的默认模型无法表达这件事，所以每个 kind 可以在 `.pi/Coworkflow.json` 里单独声明：
+
+```jsonc
+"agentKinds": {
+  "executor":   { "model": "anthropic/claude-haiku-4",  "thinking": "low" },
+  "auditor":    { "model": "anthropic/claude-opus-4",   "thinking": "high" }
+}
+```
+
+**写在定义里，不写在派单参数里。** 我们的 kind 是*运行时注册*的，定义就是权威位置：上游在注册时校验 `model`/`thinking`，定义生效于该 kind 的**每一次**派单，包括手写的 `subagent({ agent: "cw-executor" })`；派单级参数只覆盖本包自己发起的那些。同理也不用上游的 `subagents.agentOverrides`：那是给发现式 agent 的，我们的 kind 由本包注册，配置面应当只有一个。
+
+优先级（高到低）：**kind 自己的 `model` → `subagents.defaultModel` → Pi 默认**。字段缺省就是继承，这就是「没有自己的模型」的表达方式；`thinking` 与 `model` 独立，可以固定模型而继承等级。
+
+两条验证规则，方向相反且都必要：
+
+| 时机 | 行为 | 理由 |
+|---|---|---|
+| 写入时（面板） | 形状不合法或**注册表里查不到**都**拒绝并说明原因**，不落盘 | 面板手里就有注册表；写进去只会在该 kind 派单时炸 |
+| 写入时（`setAgentKind`） | **拒绝并说明原因**，不落盘 | 解码器会丢弃非法值，写进去等于一条下次读就消失的设置 |
+| 读取时（`parseAgentKinds`） | **丢弃，不转发** | 上游在注册时拒绝不可用的 model，那会让整个 kind 连派单都不可用；丢弃只是回到继承 |
+
+两层的分工要说清楚：`setAgentKind` 只管**形状**（它是一个纯配置写入器，手里没有模型注册表），
+所以“形状对但 id 不存在”的校验落在**面板**这一层。两层都拒绝时配置都不动。
+读取时那一层只管形状：解码发生在没有注册表的地方（门禁、状态行、子会话），
+它不能、也不应当判断某个 id 今天是否在注册表里。
+
+`model` 接受 `provider/id`、裸 id，或任一形式后跟 `:level`（上游语义）。可以包含控制字符或过长（> 200 字符）的值一律视为不可用——那是粘贴事故，不是模型 id。
+
+**模型必须进定义签名。** 注册器按每个 kind 定义的 `signature()` 判断「变没变」，相同的定义保留活注册。若 `model`/`thinking` 不在签名里，改模型会被判成 unchanged，会话继续用旧模型——「面板写了一个会话不用的设置」正是本模块要消灭的那种失败。
+
+### 面板页跟随 kind 表，不写死
+
+`/Comodels` 不再是固定的「主会话 / 子 agent」两页：
+
+```
+主会话              会话模型 + 思考等级，经 pi.setModel 只作用于本会话
+子 agent（默认）     subagents.defaultModel / defaultProvider / defaultThinking
+执行者 cw-executor   agentKinds.executor.model / .thinking
+审计者 cw-auditor    …
+```
+
+- 页面列表**就是** `control.agentKinds()` 的返回值（`snapshot.kinds`），面板里**没有**任何 kind 列表。因此它跟随的是本包**发布**的 kind 表：发布一个新 kind，它的页面自动出现，面板一行都不用改。硬编码的 kind 列表在这里等于「发布了一个 kind，面板看不见它」。
+- 「加一个 kind 多一页、删一个少一页」只在**发布物**这个意义上成立，这是有意的：一个 kind 需要本包提供系统提示资产与 Trellis 角色映射，所以它不是用户自由定义的配置键。项目在 `agentKinds` 里声明了一个本包没有的 kind 会**保留**在配置里（那是项目写下的决定），但**没有页面**——背后没有 agent 可注册；`/Coworkflow:status` 把它作为「已声明、本包未发布」报出来。
+- 关掉的 kind **保留页面**并标注「已关闭」：它的模型仍然存着，打开那一刻就生效。`agent-kinds` 模块关掉时页面也保留，但标注「本会话未启用」——那时没有注册任何 kind，写入只改配置。
+- 思考等级跟随该页的**有效模型**：固定了模型的 kind 列该模型的等级，继承的列它继承到的模型的等级——默认页本来就是这个规则，只是现在按 kind 逐页应用。
+- 选中「继承」那一行 = 删掉该键（`setAgentKind(kind, { model: null })`），不是写空串：两者不能对「继承」有两种说法。
+- `/Coworkflow:status` 每个 kind 一行：`cw-executor（kind executor）已注册 · 模型 <provider/id> · 思考 <level>` 或 `· 继承默认 · 思考 继承`。面板与状态读同一个解析结果，所以不会互相矛盾。
+
+#### 一页只有一个当前值
+
+这是面板里最容易出数据丢失的地方，规则写死在这里：
+
+| 情形 | 当前值（`✓`） | 光标初始位置 | `Enter` 写回 |
+|---|---|---|---|
+| kind 没固定模型 | 「继承」那一行 | 继承行 | 删除该键 |
+| 固定了模型，注册表里能解析 | 那个模型的行 | 那一行 | 同一个模型 |
+| 固定了模型，注册表里**解析不到** | 该 pin 自己单独一行（`…（不在模型注册表）`） | 那一行 | **原样写回同一个字符串** |
+
+两条必须同时成立，否则「不动光标按一下 `Enter`」就会把用户没选过的模型写进 `.pi/Coworkflow.json`：
+
+- 解析不到的 pin **不得**回退成继承到的模型。那是**另一个设置**：拿它当 `effectiveModel` 会把继承模型的行标成当前、光标落到那里，一下 `Enter` 就把 pin 覆盖掉。查不到就是查不到，页面写明「不在当前模型注册表中」，`effectiveModel` 留空。
+- 一行不能既因「存的字符串」又因「解析出的模型」被标成当前。存的值为准；`effective` 只在没有存值时才用来标记（默认页的 `subagents.defaultModel` 是裸 id 的情形）。
+
+模型引用（`provider/id`、裸 id、任一形式后跟 `:level`）的解析规则：
+
+- 只有**已知的思考等级**后缀才是等级（上游 `splitKnownThinkingSuffix` 的规则）。`ollama/llama3:latest`、`openrouter/x:free` 的冒号是 id 的一部分，剥掉就解析不到——或者更糟，解析成另一个同名的模型。
+- 裸 id 在多个 provider 下都存在是**歧义，不是「取第一个」**（上游的解析器此时返回 `undefined`）：猜一个会展示、并且写回错的 provider 的模型。给定 provider 时优先它，唯一匹配才采纳。
+- 面板写入时用注册表校验：形状合法但注册表里没有的 id **拒绝写入并说明**（配置不动），因为写进去只会在该 kind 派单时失败。清除（「继承」行）不受影响。
+
 ### 三种约束，强度不同，不能混为一谈
 
 | 想要的 | 机制 | 强度 |
@@ -125,8 +196,20 @@ fleet 投影的 `key` 是不透明显示键，上游明确禁止当作 run 或 a
 | stop 被接受 | 只说「已接受」，并做一次状态复核，不用轮询 |
 | 开关改了但没生效 | 每次派单从磁盘重读策略；不重启生效 |
 | 面板显示与实际不一致 | 面板只复述模块自己的事实，不推断 |
+| 一个 kind 的模型改了却没生效 | `model`/`thinking` 属于定义签名，改动即重新注册 |
+| 存的模型 id 打错了 | 读取时丢弃（回到继承），写入时拒绝并说明原因；面板额外用模型注册表校验，查不到的 id 拒绝写盘 |
 
 最后一条尤其重要：这个包已经出现过两次「自称在拦、实际没拦」——那是比没有功能更坏的状态。
+
+## 面板的一条硬规则：不动光标按 Enter 必须写回原值
+
+模型列和思考等级列都要满足：**光标落点就是当前生效值**。
+
+- 存着的固定模型若不在模型注册表里，它**自己占一行**并标记为当前，光标落在它上面；选中它不会写入（面板拒绝并说明），要清除得选「继承」。
+- 存着的思考等级若不在本页提供的等级里（该 kind 的模型变了、或模型解析不到只剩通用集），同样**自己占一行**并标记为当前，选中它写回同一个值。
+- 「继承」那一行只在真的没有固定值时才标记为当前。
+
+理由是这个类别的失败是**静默丢数据**：没有当前行时，光标落到「继承」行，一次 Enter 就把用户没动过的设置删掉。模型列先修，思考列漏过一次，两列现在都有测试守着（`scripts/agent-kind-panel.test.ts`）。
 
 ## 落点
 
@@ -136,6 +219,7 @@ fleet 投影的 `key` 是不透明显示键，上游明确禁止当作 run 或 a
 - 配置形状与开关解析：`core/config.ts`
 - 角色映射：`modules/subagent-context/index.ts`（映射表在 `kindRole()`，`BUILTIN_KINDS[].role`）
 - 面板行：`modules/panel/settings.ts`
+- 模型面板（页面列表、每页的取值与写入）：`modules/panel/shared.ts`（`panelPages` / `modelRows` / `thinkingRows` / `modelForRef` / `stripThinkingSuffix`）、`modules/panel/models.ts`（`snapshot.kinds`、`kindsActive`、`applyKindModel`/`applyKindThinking`）、`modules/panel/models-panel.ts`（页签与表体）
 - 派单记录与 lane 展示：`modules/lane-worktree/index.ts`、`core/subagents-workflow.ts`
 - 中断控制：`core/subagents-client.ts`、`modules/subagents/run-control.ts`
 - 集成契约（所有权与公开能力下限）：`.trellis/spec/frontend/subagents-integration.md`

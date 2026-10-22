@@ -10,19 +10,29 @@
  *                  gets configured, and in an uninitialized project it offers to
  *                  initialize it.
  *   `models.ts`    `/Comodels` — the session's model and thinking level, the
- *                  project's defaults for dispatched children, and token usage.
- *                  Only once this session loaded Coworkflow.
+ *                  project's defaults for dispatched children, one page per kind,
+ *                  and token usage. Only once this session loaded Coworkflow.
  *
  * `/Coworkflow:start`, or the project's `autoEnable`, is what loads the layer.
  * Before that a session is plain Pi: native `/model`, the user's own subagent
  * configuration, no Trellis injection, no Coworkflow panel.
  *
- * Model control is split by scope: the session tab applies through
+ * Model control is split by scope: the session page applies through
  * `pi.setModel` / `pi.setThinkingLevel` (Pi documents those as session-scoped,
- * never written to a settings file), and the subagent tab writes the *project's*
+ * never written to a settings file), the subagent page writes the *project's*
  * `.pi/settings.json` (`subagents.defaultModel` / `defaultProvider` /
  * `defaultThinking`), which pi-subagents resolves with project settings taking
- * precedence over the user's. Nothing global is written.
+ * precedence over the user's, and each further page writes one kind's
+ * `agentKinds.<kind>.model` / `.thinking` through `setAgentKind`, which persists
+ * the config and re-registers that agent. Nothing global is written.
+ *
+ * The page list is computed from the project's kinds, never declared: it is exactly
+ * what `control.agentKinds()` resolves, which is one entry per kind this package
+ * *ships* with the project's policy applied. Shipping a new kind adds its page with
+ * no panel change; a kind the project declares without an asset behind it gets no page
+ * (there is no agent behind it) and is reported by `/Coworkflow:status` instead. The
+ * model precedence is the one the documentation states — kind model →
+ * `subagents.defaultModel` → Pi's default.
  *
  * Everything around both panels follows what already exists rather than a new
  * convention:
@@ -44,8 +54,25 @@
  */
 
 export { THINKING_LEVELS, supportedThinkingLevels, modelRows, thinkingRows } from "./shared.ts";
+export {
+  DEFAULT_PAGE_LABEL,
+  SESSION_PAGE_LABEL,
+  kindForTab,
+  kindStateLabel,
+  kindTab,
+  kindsLayerNote,
+  modelForRef,
+  modelRefOf,
+  nextTab,
+  panelPages,
+  registryKeyOf,
+  resolveTab,
+  stripThinkingSuffix,
+} from "./shared.ts";
 export type {
+  PanelKindSnapshot,
   PanelModel,
+  PanelPage,
   PanelRow,
   PanelSnapshot,
   PanelTheme,

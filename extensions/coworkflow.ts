@@ -50,6 +50,9 @@ import {
   createConfigRootResolver,
   describeSwitches,
   isEnabled,
+  isKindModel,
+  isThinkingLevel,
+  MAX_KIND_MODEL_LENGTH,
   readConfig,
   readConfigAt,
   resolveSwitch,
@@ -66,6 +69,7 @@ import { agentKindsModule, syncAgentKinds } from "../modules/agent-kinds/index.t
 import { syncSubagentsRuntime } from "../modules/subagents/index.ts";
 import { RUN_BUDGET_MS } from "../core/subagents-workflow.ts";
 import { BUILTIN_KINDS, agentNameFor, builtinKind, resolveKinds } from "../modules/agent-kinds/defaults.ts";
+import { THINKING_LEVELS } from "../modules/panel/shared.ts";
 import { installedPrefix } from "../modules/worktree/index.ts";
 
 const DEFAULT_PREFIX = "wt-";
@@ -794,6 +798,20 @@ function sessionFileOf(ctx: any): string | null {
   return noteSessionFile(ctx);
 }
 
+/**
+ * The model part of a `setAgentKind` report line.
+ *
+ * Two different facts, said differently: a pinned model is named, an absent one is
+ * called out as inheriting. A report that only prints the value would read
+ * `模型 ` (empty) after a clear, which is indistinguishable from a bug.
+ */
+function kindModelLine(entry: { model?: string; thinking?: string } | undefined): string {
+  if (entry === undefined) return "";
+  const model = entry.model === undefined ? "继承" : entry.model;
+  const thinking = entry.thinking === undefined ? "继承" : entry.thinking;
+  return `，模型 ${model}，思考 ${thinking}`;
+}
+
 /** The control surface the panels use; same operations as the slash commands. */
 function createControl(): WorkflowControl {
   // The resolver is the runtime's own, so a panel that reads five values in one
@@ -987,6 +1005,15 @@ function createControl(): WorkflowControl {
           (!Number.isInteger(patch.maxConcurrent) || patch.maxConcurrent < 1)) {
         return `并发上限需要 ≥ 1 的整数：${patch.maxConcurrent}`;
       }
+      // Validated here, not on the next read: the decoder *drops* an unusable model,
+      // so writing one would look applied in this session and be gone after a
+      // reload. Refusing with a message is what lets the panel say why.
+      if (patch.model !== undefined && patch.model !== null && !isKindModel(patch.model)) {
+        return `模型 id 不可用：${JSON.stringify(patch.model)}（需要 1-${MAX_KIND_MODEL_LENGTH} 个字符、无空白前后缀与控制字符的 provider/id 或裸 id）`;
+      }
+      if (patch.thinking !== undefined && patch.thinking !== null && !isThinkingLevel(patch.thinking)) {
+        return `未知思考等级：${JSON.stringify(patch.thinking)}（可用：${THINKING_LEVELS.join("、")}）`;
+      }
       // An absent field keeps whatever the project already said, so toggling one
       // switch cannot silently reset the other value to its built-in default.
       const previous = config.agentKinds?.[kind] ?? {};
@@ -994,6 +1021,12 @@ function createControl(): WorkflowControl {
       if (patch.enabled !== undefined) next.enabled = patch.enabled;
       if (patch.maxConcurrent === null) delete next.maxConcurrent;
       else if (patch.maxConcurrent !== undefined) next.maxConcurrent = patch.maxConcurrent;
+      // `null` deletes the key: absent is how a kind says "inherit", and the two
+      // must not be able to disagree about it.
+      if (patch.model === null) delete next.model;
+      else if (patch.model !== undefined) next.model = patch.model;
+      if (patch.thinking === null) delete next.thinking;
+      else if (patch.thinking !== undefined) next.thinking = patch.thinking;
       writeConfig(root, { ...config, agentKinds: { ...config.agentKinds, [kind]: next } });
       // Same path as a module switch, then awaited: re-registering is what makes
       // an enabled kind exist in the agent list before the next dispatch, and a
@@ -1007,7 +1040,7 @@ function createControl(): WorkflowControl {
       const resolved = resolveKinds(readConfig(root)).find((entry) => entry.kind === kind);
       const state = `${kind}（${agentNameFor(kind)}）→ ${resolved?.enabled ? "on" : "off"}${
         resolved === undefined ? "" : `，上限 ${resolved.maxConcurrent}`
-      }`;
+      }${kindModelLine(resolved)}`;
       // The registration outcome, not just the policy: "on" and "available in the
       // agent list" are two different facts and the panel shows both.
       const failure = lines.find((line) => line.includes(`${kind} 注册失败`));

@@ -82,6 +82,31 @@ subagent({ agent: "cw-executor", async: true, context: "fresh",
 `Space` 开关、`←→` 调上限、`Enter` 输数字。**当场生效，无需重启**；改两次等于没改，
 不会留下重复注册或多出来的钩子。
 
+### 每个 kind 自己的模型
+
+三种 kind 通常不该跑同一个模型：执行者适合便宜的，审计者适合强的。在 `/Comodels` 里每个 kind 各有一页：
+
+```
+ 主会话   子 agent（默认）   [执行者 cw-executor]   审计者 cw-auditor   调研者 cw-researcher
+ 当前：p/cheap · high · 固定 p/cheap
+```
+
+字段写在 `.pi/Coworkflow.json` 的 `agentKinds.<kind>.model` / `.thinking`，**写进 agent 定义本身**，
+所以每一次该 kind 的派单都按它跑（包括手写的 `subagent({ agent: "cw-executor" })`），
+写盘后立即重新注册，当前会话无需重启。优先级：
+
+**kind 自己的 model → `subagents.defaultModel` → Pi 默认**
+
+选中「继承」那一行就是删掉该键，回到上一级；思考等级同理，与模型独立（可以固定模型、继承等级）。
+
+- 选中的值在写盘前校验：形状不合法（空白前后缀、控制字符、超长）**当场拒绝并说明**；
+  形状合法但**当前模型注册表里查不到**的 id 也拒绝——面板就拿着这张注册表，写进去只会让该 kind 在派单时失败。
+  两种情况都**不落盘**（不留一个下次读就消失、或下次派单才炸的设置）。
+- 已存的不合法值在读取时**丢弃而不是转发**：上游会在注册时拒绝一个不能用的 model，
+  那会让整个 kind 连派单都不可用——丢掉则只是回到继承。
+- 关掉的 kind 仍然有页面，并写明「已关闭」：模型还在，打开那一刻就生效。
+- `agent-kinds` 模块关掉时页面保留并写明「本会话未启用」：那时没有注册任何 kind，写入只改配置。
+
 ### 三种约束，强度不同
 
 | 想要的 | 机制 | 强度 |
@@ -241,7 +266,7 @@ subagent({ workflow: "coworkflow.fanout", args: {
 | `/Coworkflow:start` | 在本会话加载；`off` 卸载，`status` 查看 |
 | `/Coworkflow:settings` | 设置面板：模块开关、自动加载、worktree 前缀、并发上限、**子 agent 类型**、Trellis 对齐 |
 | `/Coworkflow:status` | 初始化状态、模块开关、本会话加载状态、原生能力与派单重叠（不改文件） |
-| `/Comodels` | 模型面板：主会话 / 子 agent 两个 tab，三列 = 模型 \| 思考等级 \| 用量 |
+| `/Comodels` | 模型面板：主会话、子 agent 默认模型、每个 kind 各自的模型与思考等级，三列 = 模型 \| 思考等级 \| 用量 |
 | `/Coworkflow:run [focus]` | 在验证过的当前任务 worktree 跑 `implement → review` |
 | `/Coworkflow:lanes` | 当前任务的 lane 状态、patch 路径、合并计划、**任务出口检查** |
 | `/Coworkflow:lanes stop <runId>` | 只停本任务记录过的 run |
@@ -257,14 +282,39 @@ subagent({ workflow: "coworkflow.fanout", args: {
 
 一张表格，模型与思考等级是独立两列（思考列始终显示全部等级），用量列是一整块 7 天柱状图。
 
+**页面不是写死的两个**：`主会话`、`子 agent（默认）`，然后是本包**发布**的每个 kind 一页
+（`执行者 cw-executor`、`审计者 cw-auditor`……）。页面列表就是 `control.agentKinds()` 的返回值，
+面板自己**不持有**任何 kind 列表：本包发布一个新 kind，它的页面自动出现，面板一行都不用改；
+关掉的 kind 保留页面并标注「已关闭」（它存的模型仍在）；`agent-kinds` 模块关掉时页面仍在，
+但标注「本会话未启用」——那时什么都没注册，写入只改配置。
+
+「加一个 kind 多一页、删一个少一页」只在**本包发布**的 kind 表这个意义上成立，这是有意的：
+一个 kind 需要本包提供一份系统提示资产与一个 Trellis 角色，所以 kind 是发布物而不是用户自由定义的键。
+项目在 `agentKinds` 里声明了一个本包没有的 kind，会**保留**在配置里，但**没有页面**——
+它背后没有 agent 可注册；`/Coworkflow:status` 会把它作为「已声明、本包未发布」报告出来。
+
+**一页一次只标一个当前值。** 某 kind 固定了一个模型时，当前值就是那个模型：
+若它在当前模型注册表里，光标落在它自己那一行；若不在（比如项目固定了一个本会话没配的模型，
+或 `ollama/llama3:latest` 这种冒号是 id 一部分的写法），它单独占一行并写明「不在当前模型注册表」，
+光标也落在那一行。**不动光标直接按 `Enter` 会写回原值**，不会把继承到的模型写上去；
+注册表里查不到的 id 一律拒绝写入并说明原因（配置不动），「继承」那一行仍可清除。
+
 | 键 | 作用 |
 |---|---|
 | `↑↓` | 在当前列内移动（模型列移动即切换统计对象） |
-| `Tab` | 切换 主会话 / 子 agent |
+| `Tab` | 切换到下一个页面（主会话 → 默认 → 各 kind，循环） |
 | `←→` | 在 模型 / 思考 列之间切光标 |
 | `Enter` | 应用 |
 | `Esc` | 关闭 |
 | 直接打字 | 搜索过滤（只在模型列） |
+
+各页写到哪里、思考等级取自哪个模型：
+
+| 页面 | `Enter` 写进 | 思考等级来自 |
+|---|---|---|
+| 主会话 | `pi.setModel` / `pi.setThinkingLevel`（仅本会话） | 会话模型 |
+| 子 agent（默认） | `.pi/settings.json` 的 `subagents.defaultModel/defaultProvider/defaultThinking` | 该默认模型，否则会话模型 |
+| 某个 kind | `.pi/Coworkflow.json` 的 `agentKinds.<kind>.model/.thinking`，并重新注册 | 该 kind 固定的模型（固定了但注册表里查不到时，页面照实说查不到，不回退到继承的模型） |
 
 口径：`input + output + cacheRead + cacheWrite`，按 `provider/model` 精确匹配，只统计 `/Coworkflow:start`
 之后的消耗；7 天滑动窗口按本地日期。
@@ -306,7 +356,7 @@ subagent({ workflow: "coworkflow.fanout", args: {
   "autoEnable": false,
   "subagentConcurrency": 6,          // 可选：项目级并发上限
   "agentKinds": {                    // 可选：缺省用内置默认
-    "executor":  { "enabled": true,  "maxConcurrent": 3 },
+    "executor":  { "enabled": true,  "maxConcurrent": 3, "model": "anthropic/claude-sonnet-4", "thinking": "high" },
     "auditor":   { "enabled": false, "maxConcurrent": 1 }
   },
   "modules": { "trellis": true, "worktree": true, "agents": true,
@@ -441,12 +491,13 @@ Pi 把 `.pi/settings.json`、`.pi/extensions`、`.pi/agents` 等当作**受信�
 
 ```bash
 npm run typecheck     # tsc --noEmit
-npm test              # 195 项，node --test，无第三方依赖
+npm test              # 224 项，node --test，无第三方依赖
 ```
 
 `npm test` 覆盖的正是「失效时不会报错、只会静默给错答案」的那几处：
 
 - kind 注册、按 kind 的门禁、面板与状态的一致性、角色映射、lane 分组（`agent-kinds*.test.ts`）
+- 每个 kind 的模型：存储值的丢弃、定义签名变更即重新注册、清空回继承、面板页随 kind 增删（`agent-kind-models.test.ts`、`agent-kind-panel.test.ts`）
 - 工作流并发是真的并发、kind 策略被遵守、失败不互相取消（`fanout.test.ts`）
 - `stop` 的能力探测、接受≠终止、畸形回复是协议错误（`run-control.test.ts`）
 - 尾部读的边界、半行容忍、无定时器（`child-tail.test.ts`）

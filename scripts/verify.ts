@@ -302,8 +302,12 @@ switch (command) {
   }
 
   case "panel": {
+    // The class lives in the lazily imported renderer module — that split is what keeps a
+    // host without the UI packages from losing the whole extension. Importing it from
+    // `models.ts` (which only re-exports types) failed with "not a constructor", so this
+    // probe had been unrunnable since the split.
     const { ModelPanel } = (await import(
-      here("../modules/panel/models.ts")
+      here("../modules/panel/models-panel.ts")
     )) as unknown as { ModelPanel: new (port: unknown, theme: unknown, tui: unknown) => PanelLike };
     const usageModule = "../core/usage.ts";
     const { collectUsageHistory, formatNativeCost } = (await import(
@@ -360,6 +364,9 @@ switch (command) {
       subagentThinking: "",
       sessionEffectiveModel: models[0],
       subagentEffectiveModel: models[0],
+      // No kinds in this probe: `snapshot.kinds` is what `/Comodels` derives its
+      // per-kind pages from, and an empty list leaves the two scope pages.
+      kinds: [],
       // The panel charts the model under the cursor, so the snapshot carries one
       // 7-day series rather than a map.
       history: {

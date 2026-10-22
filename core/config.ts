@@ -18,6 +18,12 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
+// The one list of thinking levels this package knows, taken from the module that
+// already owns it instead of restated here: a second copy would let the panel offer
+// a level this decoder drops, or drop one the panel offers. That module's only
+// runtime import is `node:path` (the usage series is a type-only import), so this
+// does not drag the usage reader into the config decoder.
+import { THINKING_LEVELS, type ThinkingLevelName } from "../modules/panel/shared.ts";
 
 export const CONFIG_REL = join(".pi", "Coworkflow.json");
 /** The file name this package used before it was renamed to pi-Coworkflow. */
@@ -73,6 +79,22 @@ export interface WorkflowConfig {
 export interface AgentKindConfig {
   enabled?: boolean;
   maxConcurrent?: number;
+  /**
+   * The model this kind's children run on: `provider/id`, a bare id, or either with
+   * a trailing `:level`.
+   *
+   * Absent means *inherit* — the project's `subagents.defaultModel`, then Pi's own
+   * default. It lives here rather than in `subagents.agentOverrides` because our
+   * kinds are runtime-registered: the definition is the authoritative place, and it
+   * applies to every dispatch of the kind, including a hand-written
+   * `subagent({ agent: "cw-executor" })` that this package never sees.
+   */
+  model?: string;
+  /**
+   * The thinking level this kind's children run at. Absent means inherit, like the
+   * model — the two are independent, so a kind may pin a level on an inherited model.
+   */
+  thinking?: string;
 }
 
 export function configPath(root: string): string {
@@ -331,18 +353,67 @@ export interface ResolvedAgentKind {
   agent: string;
   enabled: boolean;
   maxConcurrent: number;
+  /**
+   * The model this kind pins, or absent for inherit.
+   *
+   * There is no built-in default to fill in: a kind that declares nothing inherits,
+   * and inventing a model here would silently override the project's own
+   * `subagents.defaultModel` for one kind.
+   */
+  model?: string;
+  /** The thinking level this kind pins, or absent for inherit. */
+  thinking?: string;
+}
+
+/**
+ * The longest model id this decoder accepts, in characters.
+ *
+ * Bounded rather than merely non-empty: a model id is a short token (`provider/id`
+ * plus an optional `:level`), and a kilobyte of text in that field is a paste
+ * accident that upstream would happily store and then fail to launch.
+ */
+export const MAX_KIND_MODEL_LENGTH = 200;
+
+/** Control characters, NUL included: a model id is a token, not prose. */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
+/**
+ * Whether a stored value is usable as a runtime agent definition's `model`.
+ *
+ * A stored value that fails here is **dropped, not forwarded**. Upstream validates
+ * `model` at registration and refuses the launch, so passing a typo through would
+ * take the whole kind down and surface as "dispatch refused" — the user would go
+ * looking at their dispatch policy instead of at the model id they mistyped.
+ * Dropping it means the kind keeps working on the inherited model, and the panel can
+ * say the stored value was not usable.
+ */
+export function isKindModel(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  if (value.length === 0 || value.length > MAX_KIND_MODEL_LENGTH) return false;
+  // Upstream rejects leading/trailing whitespace too; a value that needs trimming is
+  // a value somebody mistyped, not one this layer should silently repair.
+  if (value.trim() !== value) return false;
+  return !CONTROL_CHARS.test(value);
+}
+
+/** Whether a stored value is one of the thinking levels this package offers. */
+export function isThinkingLevel(value: unknown): value is ThinkingLevelName {
+  return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
 }
 
 /**
  * Decode the kinds block, or `undefined` when the project declared none.
  *
- * Three rules, each of which is a decision the gate depends on:
+ * Four rules, each of which is a decision the gate depends on:
  *
  *   - a value that is not an object is not a policy, so it is dropped rather
  *     than turned into "enabled with some default";
  *   - a limit that is not a positive integer is dropped for the same reason —
  *     `0` would read as "refuse everything" and `-1` as "no limit", and neither
  *     is what an unreadable value means;
+ *   - a model or thinking level that is not usable is dropped rather than
+ *     forwarded, because upstream fails a *launch* on an unusable one — a stored
+ *     typo would take the kind down instead of reading as "that id is wrong";
  *   - an unknown kind is preserved with whatever it declared. The project owns
  *     the key; only the built-in table decides whether there is an agent behind it.
  */
@@ -352,12 +423,14 @@ function parseAgentKinds(value: unknown): Record<string, AgentKindConfig> | unde
   for (const [kind, raw] of Object.entries(value as Record<string, unknown>)) {
     if (kind.trim() !== kind || !kind) continue;
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
-    const entry = raw as { enabled?: unknown; maxConcurrent?: unknown };
+    const entry = raw as { enabled?: unknown; maxConcurrent?: unknown; model?: unknown; thinking?: unknown };
     kinds[kind] = {
       ...(typeof entry.enabled === "boolean" ? { enabled: entry.enabled } : {}),
       ...(typeof entry.maxConcurrent === "number" && Number.isInteger(entry.maxConcurrent) && entry.maxConcurrent > 0
         ? { maxConcurrent: entry.maxConcurrent }
         : {}),
+      ...(isKindModel(entry.model) ? { model: entry.model } : {}),
+      ...(isThinkingLevel(entry.thinking) ? { thinking: entry.thinking } : {}),
     };
   }
   return Object.keys(kinds).length > 0 ? kinds : undefined;

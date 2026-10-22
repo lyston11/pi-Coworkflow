@@ -29,21 +29,30 @@ import {
   MAX_VISIBLE,
   type PanelKeybindings,
   type PanelModel,
+  type PanelPage,
   type PanelRow,
   type PanelSnapshot,
   type PanelTheme,
   type Tab,
   type ThinkingLevelName,
+  kindForTab,
+  kindStateLabel,
+  kindsLayerNote,
   modelRows,
+  nextTab,
+  panelPages,
+  registryKeyOf,
+  resolveTab,
   supportedThinkingLevels,
   thinkingRows,
 } from "./shared.ts";
 import { formatTokens, type DailySeries } from "../../core/usage.ts";
+import { CONFIG_REL } from "../../core/config.ts";
 import type { PanelPort } from "./models.ts";
 
 /**
- * The model panel: tabs on top (主会话 / 子 agent), three columns below —
- * 模型 | 思考等级 | 用量.
+ * The model panel: tabs on top (主会话 / 子 agent（默认） / one per kind), three
+ * columns below — 模型 | 思考等级 | 用量.
  */
 export class ModelPanel extends Container {
   private readonly port: PanelPort;
@@ -92,7 +101,7 @@ export class ModelPanel extends Container {
       new Text(
         theme.fg(
           "muted",
-          "↑↓ 移动 · ←→ 切换 模型/思考 列 · Tab 切换 主会话/子 agent · Enter 应用 · Esc 关闭 · 直接输入可搜索",
+          "↑↓ 移动 · ←→ 切换 模型/思考 列 · Tab 切换页面 · Enter 应用 · Esc 关闭 · 直接输入可搜索",
         ),
         0,
         0,
@@ -119,16 +128,35 @@ export class ModelPanel extends Container {
    */
   private syncCursorContext(): void {
     const snapshot = this.snapshot();
-    const rows = this.focus === "model" ? modelRows(snapshot, this.tab) : modelRows(snapshot, this.tab);
+    const rows = modelRows(snapshot, this.tab);
     const row = rows[this.focus === "model" ? this.cursor(snapshot) : this.cursorOf(snapshot, "model")];
-    const model = row?.model;
-    this.port.setCursorContext?.(this.tab, model ? `${model.provider}/${model.id}` : "");
+    // The registry key, not a fabricated one: a row standing for a stored pin the
+    // registry does not hold has no tokens to attribute, and `/provider/id` would chart
+    // whatever model happens to share that spelling.
+    this.port.setCursorContext?.(this.tab, registryKeyOf(row?.model ?? undefined));
     this.cached = undefined;
   }
 
   /** Rows currently rendered in the focused column, for tests. */
   currentRows(): PanelRow[] {
     return this.activeRows(this.snapshot());
+  }
+
+  /**
+   * The pages the tab bar is built from, for tests.
+   *
+   * The list is computed from the snapshot's kinds — which is what
+   * `control.agentKinds()` resolves — so asserting on it is asserting that no scope
+   * list is hardcoded: a kind this package ships gets its page without this file
+   * changing.
+   */
+  pages(): PanelPage[] {
+    return panelPages(this.snapshot());
+  }
+
+  /** Which page currently owns the cursor, for tests. */
+  currentTab(): Tab {
+    return this.tab;
   }
 
   private key(): string {
@@ -170,6 +198,7 @@ export class ModelPanel extends Container {
     const rows = this.activeRows(snapshot);
     const row = rows[this.cursor(snapshot)];
     if (!row) return;
+    const kind = kindForTab(snapshot, this.tab);
 
     if (this.focus === "model") {
       if (this.tab === "session") {
@@ -187,18 +216,48 @@ export class ModelPanel extends Container {
           });
         return;
       }
+      if (kind) {
+        // Through the kind's own writer: it validates, persists the config key and
+        // re-registers the agent, so the panel reports the registration outcome
+        // instead of echoing the choice it just made.
+        void this.port
+          .applyKindModel(kind.kind, row.model ?? null)
+          .then((status) => {
+            this.status = status;
+            this.refresh();
+          })
+          .catch((error: unknown) => {
+            this.status = `应用失败：${error instanceof Error ? error.message : String(error)}`;
+            this.refresh();
+          });
+        return;
+      }
       this.status = this.port.applySubagentModel(row.model ?? null);
       this.refresh();
       return;
     }
 
     const level = row.thinking ?? null;
-    this.status =
-      this.tab === "session"
-        ? level === null
-          ? "主会话思考等级不能清空"
-          : this.port.applySessionThinking(level)
-        : this.port.applySubagentThinking(level);
+    if (this.tab === "session") {
+      this.status = level === null ? "主会话思考等级不能清空" : this.port.applySessionThinking(level);
+      this.cached = undefined;
+      this.refresh();
+      return;
+    }
+    if (kind) {
+      void this.port
+        .applyKindThinking(kind.kind, level)
+        .then((status) => {
+          this.status = status;
+          this.refresh();
+        })
+        .catch((error: unknown) => {
+          this.status = `应用失败：${error instanceof Error ? error.message : String(error)}`;
+          this.refresh();
+        });
+      return;
+    }
+    this.status = this.port.applySubagentThinking(level);
     this.cached = undefined;
     this.refresh();
   }
@@ -212,12 +271,12 @@ export class ModelPanel extends Container {
       return;
     }
 
-    // Tab switches the scope tab (主会话 / 子 agent), from either column. ←→
-    // must be matched here rather than left to the search field: `Input` treats
+    // Tab cycles every page, from either column: the two scopes, then one per kind.
+    // ←→ must be matched here rather than left to the search field: `Input` treats
     // cursorLeft/cursorRight as its own and would swallow them, which is exactly
     // why key-driven switching has to happen before the search input sees them.
     if (matchesKey(data, Key.tab)) {
-      this.tab = this.tab === "session" ? "subagent" : "session";
+      this.tab = nextTab(snapshot, this.tab);
       this.refresh();
       return;
     }
@@ -328,32 +387,43 @@ export class ModelPanel extends Container {
     return `  ${model}${sep}${thinking}${sep}${usage}`;
   }
 
+  /**
+   * The page bar: every page the snapshot defines, in order, with the current one
+   * bracketed.
+   *
+   * Built from `panelPages`, so a kind this package ships appears and one removed from
+   * the shipped table disappears — a hardcoded 主会话/子 agent pair was exactly what made
+   * a per-kind model unrepresentable in this panel.
+   */
   private tabBar(snapshot: PanelSnapshot): Container {
     const theme = this.theme;
     const header = new Container();
-    const tabLine = (["session", "subagent"] as Tab[])
-      .map((tab) => {
-        const label = tab === "session" ? "主会话" : "子 agent";
-        return this.tab === tab ? theme.fg("accent", `[${label}]`) : theme.fg("muted", ` ${label} `);
+    const pages = panelPages(snapshot);
+    const tabLine = pages
+      .map((page) => {
+        const text = page.note ? `${page.label}（${page.note}）` : page.label;
+        return this.tab === page.tab ? theme.fg("accent", `[${text}]`) : theme.fg("muted", ` ${text} `);
       })
       .join(" ");
-    header.addChild(
-      new Text(
-        `${tabLine}  ${theme.fg(
-          "muted",
-          this.tab === "session" ? "本会话" : `本项目 ${PROJECT_SETTINGS}`,
-        )}`,
-        0,
-        0,
-      ),
-    );
+    const kind = kindForTab(snapshot, this.tab);
+    // Where the page's `Enter` actually writes. A kind page writes
+    // `.pi/Coworkflow.json` (`agentKinds.<kind>`), not the subagents settings file — the
+    // panel is where a user learns where a setting lives.
+    const scope =
+      this.tab === "session" ? "本会话"
+      : kind ? `本项目 ${CONFIG_REL} · agentKinds.${kind.kind}`
+      : `本项目 ${PROJECT_SETTINGS}`;
+    const layer = kindsLayerNote(snapshot);
+    header.addChild(new Text(`${tabLine}  ${theme.fg("muted", scope)}${layer ? `  ${theme.fg("warning", layer)}` : ""}`, 0, 0));
     header.addChild(
       new Text(
         theme.fg(
           "muted",
           this.tab === "session"
             ? `当前：${snapshot.sessionModel || "(未设置)"} · ${snapshot.sessionThinking || "(未设置)"}`
-            : `当前：${snapshot.subagentModel || INHERIT_MODEL_LABEL} · ${snapshot.subagentThinking || INHERIT_THINKING_LABEL}`,
+            : kind
+              ? `当前：${kind.model || INHERIT_MODEL_LABEL} · ${kind.thinking || INHERIT_THINKING_LABEL} · ${kindStateLabel(snapshot, kind)}${kind.enabled ? "" : " · 该 kind 已关闭，模型仍然保留"}`
+              : `当前：${snapshot.subagentModel || INHERIT_MODEL_LABEL} · ${snapshot.subagentThinking || INHERIT_THINKING_LABEL}`,
         ),
         0,
         0,
@@ -508,6 +578,10 @@ export class ModelPanel extends Container {
   }
 
   private updateBody(): void {
+    // A page whose kind is gone — the block was removed from the config while this
+    // panel was open — must not render as an empty table: fall back to the session
+    // page, which always exists.
+    this.tab = resolveTab(this.snapshot(), this.tab);
     // Push the cursor's model first: the snapshot's 7-day window is computed for
     // it, so asking before syncing would chart the previously selected model.
     this.syncCursorContext();
@@ -530,9 +604,18 @@ export class ModelPanel extends Container {
 
   /** One line summarising what is in effect, right under the table. */
   private currentModelLine(snapshot: PanelSnapshot): string {
-    return this.tab === "session"
-      ? `当前生效：${snapshot.sessionModel || "(未设置)"} · 思考 ${snapshot.sessionThinking || "(未设置)"} · 仅本会话`
-      : `当前生效：${snapshot.subagentModel || INHERIT_MODEL_LABEL} · 思考 ${snapshot.subagentThinking || INHERIT_THINKING_LABEL} · 本项目`;
+    const kind = kindForTab(snapshot, this.tab);
+    if (this.tab === "session") {
+      return `当前生效：${snapshot.sessionModel || "(未设置)"} · 思考 ${snapshot.sessionThinking || "(未设置)"} · 仅本会话`;
+    }
+    if (kind) {
+      // Reads the same field the status report does, so the two cannot disagree
+      // about what this kind runs on.
+      const layer = kindsLayerNote(snapshot);
+      return `当前生效：${kind.model || INHERIT_MODEL_LABEL} · 思考 ${kind.thinking || INHERIT_THINKING_LABEL} · ${
+        kind.enabled ? "本项目" : "本项目（该 kind 已关闭，模型仍然保留）"}${layer ? ` · ${layer}` : ""}`;
+    }
+    return `当前生效：${snapshot.subagentModel || INHERIT_MODEL_LABEL} · 思考 ${snapshot.subagentThinking || INHERIT_THINKING_LABEL} · 本项目`;
   }
 
   /** Cursor of a column that does not currently own the focus. */

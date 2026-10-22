@@ -390,13 +390,24 @@ export interface WorkflowControl {
    * Persist one kind's policy; an absent field keeps the current value, and
    * `null` for the limit means "back to the built-in default".
    *
+   * `model` and `thinking` follow the same rule with one difference in meaning:
+   * `null` there means **inherit** (the key is deleted), because absent is how a
+   * kind says it has no model of its own. A malformed value is refused with a
+   * message rather than written: the decoder would drop it on the next read, so
+   * writing it would only produce a setting the project believes it made.
+   *
    * A promise, because applying it means re-registering with the owner: the
    * caller reports what actually happened (`已注册` / `注册失败：…`) instead of a
    * policy it just wrote while the agent list may not contain the kind yet.
    */
   setAgentKind(
     kind: string,
-    patch: { enabled?: boolean; maxConcurrent?: number | null },
+    patch: {
+      enabled?: boolean;
+      maxConcurrent?: number | null;
+      model?: string | null;
+      thinking?: string | null;
+    },
   ): string | Promise<string>;
   /**
    * The `agent-kinds` module's own status lines: which kinds registered, or the
