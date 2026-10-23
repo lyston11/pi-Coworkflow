@@ -1,0 +1,29 @@
+{
+  "id": "kind-only-surface",
+  "name": "kind-only-surface",
+  "title": "Kind-only Trellis surface",
+  "description": "Remove trellis-* role agents and role duplication; the project surface speaks kinds only",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "lyston11",
+  "assignee": "lyston11",
+  "createdAt": "2026-10-23",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "10-23-kind-only-workflow",
+    "10-23-kind-only-role"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}
