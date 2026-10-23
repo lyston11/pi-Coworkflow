@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/frontend/agent-kinds.md", "reason": "kind 的约束强度、占用计数来源与失败模式"}
+{"file": ".trellis/spec/frontend/subagents-integration.md", "reason": "本包与 pi-subagents 的所有权边界与准入契约"}

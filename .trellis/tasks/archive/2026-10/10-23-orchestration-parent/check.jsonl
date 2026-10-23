@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "质量门槛与验证要求"}
+{"file": ".trellis/spec/frontend/agent-kinds.md", "reason": "校验 kind 语义与失败模式未被削弱"}

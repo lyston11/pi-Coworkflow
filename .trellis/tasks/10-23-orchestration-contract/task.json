@@ -1,0 +1,30 @@
+{
+  "id": "orchestration-contract",
+  "name": "orchestration-contract",
+  "title": "Coherent parent orchestration and bounded delegation",
+  "description": "Unify parent execution guidance, live capabilities, work-unit scheduling and per-kind launch policy without duplicating the upstream runner",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "lyston11",
+  "assignee": "lyston11",
+  "createdAt": "2026-10-23",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "10-23-orchestration-parent",
+    "10-23-orchestration-scheduler",
+    "10-23-orchestration-admission"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}
