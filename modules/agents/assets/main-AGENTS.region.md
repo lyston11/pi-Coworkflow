@@ -35,10 +35,12 @@
 
 **主会话负责规划、拆解、派单、监听、审计、决策；具体的执行工作由多个子 agent 完成，子 agent 只回结果。** 主会话不是执行者，它派完单不空等——继续做自己的判断、盯着进度、随时审计，直到总任务完成。
 
+**执行归属以本节为准。** Trellis 的 Pi 分支（`.trellis/workflow.md` 与 `in_progress` 的 inline 步骤）写的是「自己读规范、自己实现、自己跑检查」——那描述的是这一步**要做完什么**，不改变**由谁做**。两者冲突时按本节分工执行；这是唯一需要点明的冲突，且不需要、也不应该去改写 Trellis 的生成资产（`.trellis/workflow.md`、`.pi/extensions/trellis/`、`trellis-*` agent 定义）。
+
 ```text
 主会话
   ├─ 规划：理解需求 → 建/更新 Trellis 任务 → 拆成可独立验证的子任务
-  ├─ 派单：subagent({ agent: "cw-executor" | "cw-auditor" | "cw-researcher", … })
+  ├─ 派单：subagent({ agent: "<kind 的 agent 名>", … })（可用名字看 /Coworkflow:status）
   │          多件互不依赖的工作：workflow "coworkflow.fanout" 一次并发派出
   ├─ 监听：完成通知 + subagent({ action: "status" })；子 agent 提问走 contact_supervisor
   ├─ 中断：/Coworkflow:stop <runId>（停止）或 /Coworkflow:steer <runId> <说明>（追加指令）
@@ -48,21 +50,48 @@
 
 主会话自己动手的唯一场合：**需要全局判断、或改动小到不值得派单**（一行修复、改个配置、回答一个问题）。除此之外，"我来写"不是理由——派出去、审回来。
 
-### 派单用 kind，不用 `trellis-*` 角色 agent
+#### 开始执行前先定分工
 
-本项目装了 `agent-kinds` 模块后，**子 agent 的类型就是这三个 kind**，它们与 Trellis 的三个角色一一对应，并额外带上面板可配的开关与并发限制：
+动手之前把这一轮的工作单元列出来，每个标注归属，然后再开始：
 
-| kind | agent | Trellis 角色 | 默认 |
-|---|---|---|---|
-| 执行者 | `cw-executor` | implement | 开，上限 {{kindLimit}} |
-| 审计者 | `cw-auditor` | check | 开，上限 {{kindLimit}} |
-| 调研者 | `cw-researcher` | research | 开，上限 {{kindLimit}} |
+| 交给子 agent | 留在主会话 |
+|---|---|
+| 有明确输入、产物、验收方式 | 需要全局判断或跨模块契约 |
+| 能独立验证（它自己的检查就能判定对错） | 最终验收与集成（审计、合并、决策） |
+| 工作量大于一次派单的成本 | 改动小到派单成本更高：一行修复、一个配置值、回答一个问题 |
 
-这三个只是本包随附的默认值。**一个 kind 就是一份 markdown**：`<项目>/.pi/Coworkflow/agents/<kind>.md`，frontmatter 声明它是什么（label / agent / role / description / model / thinking / maxConcurrent / enabled），正文就是它的系统提示词（职能）。所以你可以改这三个的职能与名字，也可以新增自己的 kind；改完下一次派单就生效，不用重启。用 `pi-coworkflow kind scaffold|export|set --from|check` 操作它，或在面板/`/Coworkflow:kind` 里改。
+- 留主会话的小改动**要在交付说明里写出范围**（改了哪几处），别因为"顺手"扩成一次大改。
+- 分工是执行前的一次决定，不是按工具调用次数触发的提醒：本包不统计调用次数，也不会为这件事往对话里注入消息。分不清时按上表判——输入、产物、验收说得清的执行工作就派出去。
 
-派单写 `agent: "cw-executor"`，**不要写** `trellis-implement` / `trellis-check` / `trellis-research`：`cw-*` 拿到的是同一份角色上下文，但会经过本项目的开关与数量限制；`trellis-*` 绕开了这两道闸。
+### 可派角色以 `/Coworkflow:status` 为准
+
+本项目装了 `agent-kinds` 模块后，可派的子 agent 类型（kind）由**本会话的注册状态**决定，而它会变：项目可能关掉某类、改它的上限，注册也可能失败。所以本文件**不写死清单**——这一会话能派哪些 agent，以 `/Coworkflow:status` 的 `agent-kinds` 行为准（每个已注册 kind 一行：`= agent-kinds: cw-executor（kind executor）已注册 · 模型 …`），或以 `subagent({ action: "list" })` 的实际结果为准。
+
+**稳定的是对应关系，不是可用性。** 每个 kind 与 Trellis 的一个角色一一对应，因此 `cw-*` 拿到同一份角色上下文，并额外经过本项目的开关与并发上限：
+
+| kind | agent | Trellis 角色 |
+|---|---|---|
+| 执行者 | `cw-executor` | implement |
+| 审计者 | `cw-auditor` | check |
+| 调研者 | `cw-researcher` | research |
+
+这是本包随附的三个默认 kind：默认都开、默认上限 {{kindLimit}}，实际值由 `/Coworkflow:settings` 的面板决定。**一个 kind 就是一份 markdown**：`<项目>/.pi/Coworkflow/agents/<kind>.md`，frontmatter 声明它是什么（label / agent / role / description / model / thinking / maxConcurrent / enabled），正文就是它的系统提示词（职能）。所以你可以改这三个的职能与名字，也可以新增自己的 kind；改完下一次派单就生效，不用重启。用 `pi-coworkflow kind scaffold|export|set --from|check` 操作它，或在面板/`/Coworkflow:kind` 里改。
+
+`trellis-implement` / `trellis-check` / `trellis-research` 不是本项目的推荐派单目标：`cw-*` 拿到的是同一份角色上下文，但会经过本项目的开关与数量限制，而 `trellis-*` 绕开了这两道闸。这个说法的前提是**该 kind 在本会话可用**；不可用时的退路见下一节，不是退回 `trellis-*`。
 
 面板（`/Coworkflow:settings` 的「子 agent 类型」）里关掉的 kind，派单会被拒绝并列出当前可用的 kind；超过某 kind 的上限也会被拒绝并给出当前占用。**这条上限对直接派单和 `coworkflow.fanout` 同样有效**：fanout 里某个 kind 的任务数加上正在运行的数量超过上限时，**整批**被拒（workflow 要么全跑要么不跑），并在拒绝理由里给出批大小、上限与当前占用。
+
+### kind 不可用时怎么办
+
+派单被拒、或 `/Coworkflow:status` 里找不到你要的 kind 时，**不要换个名字重试**，也不要当成没事发生，按这三条处理：
+
+1. **先读原因。** 常见四类，都能从 `/Coworkflow:status` 或拒绝理由里读出来：面板把它关了（`已关闭（不注册；派单会被拒绝）`）、注册失败（`x agent-kinds: <kind> 无法使用：<原因>`）、运行时契约不可用（`x agent-kinds: 注册契约…`）、上游拒绝（派单返回 `Unknown agent 'cw-…'` —— 它是真的不在本会话的 agent 列表里，不是名字打错了）。
+2. **按顺序退让。** 先改派给 `/Coworkflow:status` 里**已列出**的 kind（同一份角色上下文、同样的开关与上限）；实在无可用 kind，或没有对应的角色，就把这个工作单元**收回主会话自己做完**。两条禁止：不得静默换成 `trellis-implement` / `trellis-check` / `trellis-research`（它们绕开项目开关与上限，这正是 kind 存在的理由），也不得不声不响地自己顶替而把这次降级藏起来。
+3. **报告里写明**哪个 kind 不可用、原因是什么、最后走了哪条路（改派给谁 / 收回主会话）。这是一次降级，要当事实写出来，不要说成正常派单。
+
+### 连 `subagent` 工具都没有
+
+这是 kind 不可用的极端情况，同样是事实而不是违约。
 
 **先确认 `subagent` 工具存在再用它。** 派单靠的是 pi-subagents 提供的 `subagent` 工具；它没加载时（新项目还没 `/Coworkflow:init`、项目未受信任、刚装完还没重开 Pi），本会话里根本没有这个工具。这种情况下：
 
@@ -71,7 +100,7 @@
 - 按单体直接做，在交付说明里写一句「本会话没有 subagent 工具，未派单」，并说明修法（`/Coworkflow:init` 后重开 Pi）；
 - `/Coworkflow:status` 会明确报这一行：`! subagents: 本会话没有 subagent 工具`。
 
-这条界线靠判断，不靠计数：本包不再统计本会话的工具调用次数，也不会因为"改动不少"就插入提醒。反过来，分不清该不该派时按工作量估：能独立验证、输入产物验收方式都说得清的执行工作就该派出去；需要全局判断、跨模块协调、或只有一两处改动的，留在这里自己做完更快。
+### 派单执行约定
 
 - 授权：主会话可以主动派发子 agent，不必逐次询问。
 - **必须后台，这一条由代码强制。** `async` 默认就是开的，所以只需别传 `async: false`；万一传了，`agent-kinds` 的 gate 会在放行之前把它改回后台（`/Coworkflow:status` 会报「已把 N 次前台派单改为后台」）。理由不只是"会占住主会话"：前台子会话跑在主进程内、拿不到 ambient 扩展，拿不到子 agent 该有的上下文。确实需要结果就用 `bg_wait` 显式等，而不是靠前台阻塞。后台派单后主会话继续做自己的事，用完成通知和 `subagent({ action: "status" })` 监控，子 agent 的提问走 `contact_supervisor` 转达。实测：后台子会话由 harness 加载项目 `AGENTS.md` 与 Magic Context（ambient 扩展），但本包的 `subagent-context` 会在注入子 agent 约定之前把**本受管区**（`<!-- pi-Coworkflow:start/end -->` 之间，含上面的核心分工）从继承来的 `<project_instructions>` 里剥掉，项目自己写在区外的内容照旧保留。所以派单提示词只需给任务，不要把本文件受管区的约定重抄一遍。

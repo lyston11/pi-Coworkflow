@@ -1179,6 +1179,64 @@ test("gate: a foreground dispatch is put in the background, and the rewrite is r
   }
 });
 
+test("gate: a parallel batch of agents this package does not own is admitted without a public read", { skip }, async () => {
+  // A plain batch — the everyday use of the owner's `parallel` workflow — used to be looked up in the
+  // project's kind table item by item, miss, and be refused whole as "an unregistered kind". The
+  // direct-dispatch path has always promised the opposite: a name the table does not know is not this
+  // gate's business. The batch path now keeps that promise, and keeps it *before* the owner is asked
+  // for anything: a gate that reads fleet status to decide a batch it does not police costs a public
+  // round trip per ordinary fanout.
+  const harness = gateHarness({ kinds: { executor: { enabled: true, maxConcurrent: 1 } } });
+  try {
+    await syncAgentKinds(harness.host, harness.runtime);
+    const before = harness.requests.length;
+    const batch = {
+      workflow: "parallel",
+      args: { tasks: [{ agent: "reviewer", task: "review" }, { agent: "trellis-check", task: "check" }] },
+    };
+    assert.equal(await harness.call(batch), undefined, "no kind of ours in the batch, so no refusal");
+    assert.equal(
+      harness.requests.length,
+      before,
+      "and no public read either: the fleet is not asked about agents the ceiling does not cover",
+    );
+  } finally {
+    harness.close();
+  }
+});
+
+test("gate: a mixed batch is refused for its own kind only, and names only that kind", { skip }, async () => {
+  // Mixed batches are how a session actually works: one executor doing the edit, a reviewer outside
+  // this package. The refusal is about the executor alone; mentioning the reviewer would read as if
+  // the reviewer were over a ceiling, and the model would have no way to tell which task to drop.
+  const harness = gateHarness({ kinds: { executor: { enabled: true, maxConcurrent: 1 } } });
+  try {
+    await syncAgentKinds(harness.host, harness.runtime);
+    harness.live.push("cw-executor");
+    const refused = await harness.call({
+      workflow: "parallel",
+      args: {
+        tasks: [
+          { agent: "cw-executor", task: "implement" },
+          { agent: "reviewer", task: "review" },
+        ],
+      },
+    });
+    assert.ok(refused, "the executor is at its ceiling, so the batch is refused");
+    const reason = String(refused.reason ?? "");
+    // R4: which kind (and its agent name), the ceiling, the occupancy, and that nothing started.
+    assert.match(reason, /cw-executor/, "the kind's agent is named");
+    assert.match(reason, /executor/, "and so is the kind");
+    assert.match(reason, /上限是 1/, "the ceiling is stated");
+    assert.match(reason, /当前已有 1 个在运行/, "and what is running now");
+    assert.match(reason, /没有启动任何子进程/, "and that nothing was started");
+    assert.doesNotMatch(reason, /reviewer/, "the unrelated agent is not part of the reason");
+    assert.doesNotMatch(reason, /trellis-/, "nor is any other non-kind name");
+  } finally {
+    harness.close();
+  }
+});
+
 /**
  * The owner's own parallel workflow dispatches kinds too, and it bypassed the ceiling.
  *

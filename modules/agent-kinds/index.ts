@@ -615,15 +615,24 @@ async function gateFanout(
     return { count, policy, kind, agent: policy?.agent ?? agentNameFor(kind) };
   });
 
+  // A batch with no kind of ours in it is not this gate's business, and it must not cost a public
+  // read: the owner's `parallel` workflow is a general purpose one, and a plain batch of
+  // `reviewer`/`trellis-check` tasks used to be refused here as "an unregistered kind" — the shape
+  // check promised in `decodeKindDispatch` (a name the table does not know passes untouched) had no
+  // counterpart on the batch path. Returning before `attachSubagents` is what makes that a fact.
+  const own = entries.filter(
+    (entry): entry is typeof entry & { policy: ResolvedAgentKind } => entry.policy !== undefined,
+  );
+  if (own.length === 0) return;
+
   const decide = (): Refusal | undefined => {
     const snapshot = state.snapshot;
     const live = snapshot === null || snapshot.contractFailure !== undefined
       ? null
       : new Set(snapshot.registered.map((entry) => entry.kind));
     const available = availableKinds(kinds, snapshot);
-    for (const { kind, agent, policy } of entries) {
+    for (const { kind, agent, policy } of own) {
       const dispatch = { agent, kind, async: true } satisfies KindDispatch;
-      if (policy === undefined) return unregisteredRefusal(dispatch, snapshot);
       if (!policy.enabled) return disabledRefusal(dispatch, available);
       if (live === null || !live.has(kind)) return unregisteredRefusal(dispatch, snapshot);
     }
@@ -636,8 +645,7 @@ async function gateFanout(
   const epoch = runtime.sessionEpoch;
   const bridge = attachSubagents(host, { epoch, events: host.events });
   state.attached = true;
-  for (const { count, policy, kind } of entries) {
-    if (policy === undefined) continue;
+  for (const { count, policy, kind } of own) {
     const observed = await bridge.agentCount(policy.agent);
     if (!on() || runtime.sessionEpoch !== epoch) {
       return { block: true, reason: "会话已更换或该层已关闭，未启动子进程。" };
@@ -652,7 +660,7 @@ async function gateFanout(
         block: true,
         reason: [
           `这个 coworkflow.fanout 要启动 ${count} 个 ${kindLabel(policy.agent, kind)}，但本项目的上限是 ${policy.maxConcurrent}，当前已有 ${observed.count} 个在运行。`,
-          `整批被拦下：workflow 要么全跑要么不跑，只启动一部分比一个都不启动更糟。`,
+          `整批被拦下，本次调用没有启动任何子进程：workflow 要么全跑要么不跑，只启动一部分比一个都不启动更糟。`,
           `请减少该 kind 的任务数、等其中一个结束，或在 /Coworkflow:settings 里调高 ${kind} 的上限。`,
         ].join(""),
       };
