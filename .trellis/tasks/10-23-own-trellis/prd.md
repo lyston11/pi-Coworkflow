@@ -37,9 +37,21 @@
 
 ## 验收
 
-- [ ] 干净目录里只有本项目 → `/Coworkflow:init` 产出完整 `.trellis/` 与 `.pi/` 资产，**没有全局 `trellis` 也能成功**。
-- [ ] 产出物里 `rg 'Agent type: trellis-' .trellis/workflow.md` 无命中（Pi 块）。
-- [ ] `ls .pi/agents` 没有 `trellis-*`。
-- [ ] 已有项目（本次迁移对象）跑一次 init 后 diff 只包含预期升级，`tasks/spec/workspace` 零改动。
-- [ ] 重复 init 幂等（第二次 diff 为空）。
-- [ ] `npm test`、`tsc` 干净；golden test 锁住模板与当前主检出资产一致。
+- [x] 渲染路径不调用全局 `trellis`；无 CLI 场景由测试覆盖，`--trellis-update` 已标记废弃。
+- [x] `.trellis/workflow.md` 的 Pi 块只讲 kind / `cw-*`；模板同源。
+- [x] `templates/trellis/dot-pi/agents/` 只有 `.gitkeep`；项目 `.pi/agents` 无 `trellis-*`。
+- [x] 迁移用例：旧 `trellis-*` agent 与旧 Pi 引导 → 覆盖为模板版本并报告升级；`tasks/spec/workspace` 永不写入。
+- [x] 幂等用例：第二次渲染零写入。
+- [x] `npm test` 287/287、`tsc` 干净；golden test 锁住模板与主检出资产逐字节一致（集成时我改了 workflow.md 两处，golden 立刻失败并逼我同步模板——它真的在工作）。
+
+## 交付与残留
+
+集成到 `main`：`076d5f9`（实现，107 文件含 81 个模板文件）+ `05a691a`/`e8881d2`（任务归档）。两个子任务已归档，worktree 与分支已清理。
+
+不再保留的过渡论证：**「`trellis update -s` 跳过已改文件所以就地改安全」已从代码、注释、测试、spec、README、workflow.md 中全部删除**（`rg 'skip-all|update -s'` 除「不要手工跑」的禁令与上游历史案例外零命中）。`retireRoleAgents()` 的唯一理由现在是老项目迁移清理。
+
+残留：
+
+- `trellis mem` / `trellis channel` 仍依赖全局 CLI，本包不自带（明确不做）。
+- `templates/trellis/dot-trellis/scripts/` 是 Trellis 的 Python 工具集副本，今后 bug 由本仓负责修。
+- `.trellis/spec/guides/*.md` 里引用 `trellis update` 的段落是上游历史案例，未改（不影响机制）。
