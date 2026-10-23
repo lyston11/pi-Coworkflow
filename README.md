@@ -208,10 +208,22 @@ pi-coworkflow kind remove auditor                    # 删掉覆盖，回到本�
 
 ### 终端 CLI（给别的 agent 用）、Pi 内命令、公开请求
 
+**非交互会话（`pi -p`、脚本、CI）要派单，先记下会话开关。** 斜杠命令在 `-p` 里会被当成提示词，`/Coworkflow:start` 不会执行，于是第一次派单会因为「本会话未启用」被拒：
+
+```bash
+pi-coworkflow session on --session 01a16686-ac7e-730c-97b8-1d38c653f93a
+# 也可以给会话文件路径，两种写法解析到同一个键
+pi-coworkflow session on --session ~/.pi/agent/sessions/<项目>/2026-…_<id>.jsonl
+pi-coworkflow session off --session <id>      # 显式关闭（区别于「从未选择」，后者回落到 autoEnable）
+```
+
+`on` / `off` 与交互会话里 `/Coworkflow:start` 写的是同一份记录（`.trellis/.runtime/workflow-sessions.json`）。它是**会话开关，不是采用**：项目还没有 `.pi/Coworkflow.json` 时命令会提示你先 `/Coworkflow:init`。
+
 **`pi-coworkflow` 是终端入口**——不需要 Pi 会话、不需要扩展宿主、不需要任何进程在跑。任何能执行 shell 的 agent（Claude Code、Codex、你自己的脚本）都能用它 DIY 本项目的子 agent：
 
 ```bash
 node --experimental-strip-types /path/to/pi-Coworkflow/scripts/cli.ts kind list
+pi-coworkflow session on --session <id>              # 非交互会话要派单，先这一步
 pi-coworkflow kind list --project /path/to/project
 pi-coworkflow kind show builder
 pi-coworkflow kind path builder

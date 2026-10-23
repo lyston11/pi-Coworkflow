@@ -1224,7 +1224,19 @@ function attachObservers(host: PiRuntimeHost, state: HostState, runtime: Runtime
     // extension's workflow, or a plain direct dispatch is not ours to judge.
     if (workflow !== WORKFLOW_NAME && workflow !== FANOUT_NAME) return;
     if (!runtime.enabled || !runtime.control.moduleEnabled("subagents")) {
-      return { block: true, reason: "Coworkflow 工作流模块已关闭。" };
+      // The refusal has to name the fix, because the most common way to hit it is a
+      // non-interactive session where the obvious fix does not work: `/Coworkflow:start` typed into
+      // `pi -p` is sent as a prompt, not executed, so the first dispatch is refused and the reader is
+      // left guessing. Both real remedies are named here.
+      return {
+        block: true,
+        reason: [
+          "Coworkflow 在本会话没有启用，所以这个工作流没有派单。",
+          "交互会话：先运行 /Coworkflow:start。",
+          "非交互会话（pi -p / 脚本）：斜杠命令会被当成提示词，不会执行——先执行 ",
+          `\`pi-coworkflow session on --session ${runtime.sessionId ?? "<会话 id>"}\`（或直接写 .trellis/.runtime/workflow-sessions.json 的 on: true）。`,
+        ].join(""),
+      };
     }
     await schedule(state, runtime, host);
     const current = state.current;

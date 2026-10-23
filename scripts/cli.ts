@@ -36,6 +36,7 @@
  */
 
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { SESSION_FLAGS_FILE, sessionFlagEntry, sessionKeys, setSessionFlag } from "../core/trellis.ts";
 import { join, resolve as resolvePath } from "node:path";
 
 import { readConfig } from "../core/config.ts";
@@ -68,11 +69,15 @@ const WRITABLE = [
 ] as const;
 
 interface Options {
+  /** The project the command acts on; already resolved to its main checkout. */
+  root: string;
   project: string;
   json: boolean;
   from?: string;
   out?: string;
   force: boolean;
+  /** The session a `session` command acts on: an id, or a session file path. */
+  session: string;
   rest: string[];
 }
 
@@ -82,6 +87,7 @@ function parseArgs(argv: string[]): Options {
   let from: string | undefined;
   let out: string | undefined;
   let force = false;
+  let session = "";
   const rest: string[] = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!;
@@ -96,9 +102,11 @@ function parseArgs(argv: string[]): Options {
     else if (arg === "--from") from = value(arg);
     else if (arg === "--out" || arg === "-o") out = value(arg);
     else if (arg === "--force") force = true;
+    else if (arg === "--session" || arg === "-s") session = value(arg);
     else rest.push(arg);
   }
-  return { project: resolvePath(project), json, from, out, force, rest };
+  const resolved = resolvePath(project);
+  return { root: projectRoot(resolved), project: resolved, json, from, out, force, session, rest };
 }
 
 class Usage extends Error {}
@@ -232,7 +240,7 @@ description: ${description}
 }
 
 function runKind(options: Options): number {
-  const root = projectRoot(options.project);
+  const root = options.root;
   const sub = options.rest[1] ?? "list";
   const kind = options.rest[2];
 
@@ -443,6 +451,9 @@ const HELP = `pi-coworkflow ${VERSION} — 自定义本项目的子 agent 类型
 文件在 ${DEFINITIONS_REL}/<kind>.md。
 
 用法：
+  pi-coworkflow session on  --session <id|路径>  为某个会话启用 Coworkflow（-p 模式必需）
+  pi-coworkflow session off --session <id|路径>  关闭该会话的开关
+
   pi-coworkflow kind list                     列出全部 kind（随附 + 项目定义）
   pi-coworkflow kind show <kind>              看一个 kind 的最终解析结果与提示词
   pi-coworkflow kind export <kind> [--out f]  把生效定义导出成 markdown（随附的也能导）
@@ -461,8 +472,14 @@ const HELP = `pi-coworkflow ${VERSION} — 自定义本项目的子 agent 类型
 字段（set k=v）：${WRITABLE.join("、")}
   role 取 implement | check | research | none；enabled 取 true|false；maxConcurrent 取 ≥1 的整数
 
+为什么需要 session 命令：
+  pi -p '/Coworkflow:start' 里的斜杠命令不会执行——它被当成提示词发出去，于是第一次派单
+  会因为「本会话未启用」被拒。非交互会话要派单，先用这条命令记下开关：
+    pi-coworkflow session on --session <会话 id 或会话文件路径>
+
 选项：
   -p, --project <dir>  作用于哪个项目（默认当前目录；worktree 会自动解析到主检出）
+  -s, --session <id>   session：会话 id 或会话文件路径（两种写法解析到同一个键）
       --from <file>    set：用这个 markdown 文件覆盖定义
   -o, --out <file>     export：写到文件而不是 stdout
       --force          scaffold：覆盖已存在的文件
@@ -486,6 +503,59 @@ const HELP = `pi-coworkflow ${VERSION} — 自定义本项目的子 agent 类型
   你是这个项目自己的执行者：按派单做完一件已定义的工作，然后报告事实。
 `;
 
+/**
+ * The session switch, from a terminal.
+ *
+ * `/Coworkflow:start` records this flag for the session it runs in, which is exactly what a
+ * non-interactive session cannot do: `pi -p '/Coworkflow:start'` sends that text as the prompt, the
+ * command never runs, and the very first dispatch is refused because the layer is off. The last
+ * session that hit this asked the model to read the flag's file format out of the source and write
+ * it by hand — a workaround that should not be the documented interface.
+ *
+ * So the same writer is exposed here. `--session` takes the id or the session file path; both
+ * spellings resolve to the same key, because that mismatch has already cost this package one silent
+ * bug (a parent passed a path, the flags were keyed by id, and every child read "no flag").
+ */
+function runSession(options: Options): number {
+  const sub = options.rest[1];
+  const session = options.session.trim();
+  if (!session) {
+    throw new Usage(
+      "需要一个会话：--session <会话 id 或会话文件路径>（`pi` 的会话 id 可以在 /Coworkflow:status 或会话文件名里看到）",
+    );
+  }
+  const keys = sessionKeys(session);
+  if (keys.length === 0) throw new Usage(`无法从 "${session}" 解析出会话 id`);
+  if (sub !== "on" && sub !== "off") {
+    throw new Usage(`未知子命令 ${sub ?? "(空)"}；可用：session on / session off`);
+  }
+  const on = sub === "on";
+  let written = 0;
+  for (const key of keys) if (setSessionFlag(options.root, key, on)) written += 1;
+  const entry = sessionFlagEntry(options.root, keys[0]!);
+  print(
+    {
+      ok: written > 0,
+      session: keys[0],
+      keys,
+      on,
+      // `.pi/Coworkflow.json` may not exist: this command records a per-session switch, it does not
+      // adopt the project. Saying so here is cheaper than the reader discovering it later.
+      adopted: existsSync(join(options.root, ".pi", "Coworkflow.json")),
+    },
+    options.json,
+    () =>
+      written === 0
+        ? `未能写入会话开关（${SESSION_FLAGS_FILE} 不可写）`
+        : `会话 ${keys[0]!.slice(0, 8)} 已${on ? "启用" : "关闭"} Coworkflow` +
+          `（记录在 ${SESSION_FLAGS_FILE}）` +
+          (on && !existsSync(join(options.root, ".pi", "Coworkflow.json"))
+            ? "；注意本项目还没有 .pi/Coworkflow.json——会话开关不等于采用，先用 /Coworkflow:init 采用本项目"
+            : ""),
+  );
+  return written > 0 ? 0 : 1;
+}
+
 function main(argv: string[]): number {
   if (argv.includes("--help") || argv.includes("-h") || argv.length === 0) {
     process.stdout.write(HELP);
@@ -497,8 +567,9 @@ function main(argv: string[]): number {
   }
   const options = parseArgs(argv);
   const group = options.rest[0];
+  if (group === "session") return runSession(options);
   if (group !== "kind") {
-    throw new Usage(`未知命令 ${group ?? "(空)"}；目前支持 kind（用 --help 看用法）`);
+    throw new Usage(`未知命令 ${group ?? "(空)"}；可用：kind / session（用 --help 看用法）`);
   }
   return runKind(options);
 }

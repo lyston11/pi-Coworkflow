@@ -307,3 +307,58 @@ test("cli: prompt= warns that a shell string is the wrong tool for a system prom
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/**
+ * The session switch, from a terminal.
+ *
+ * `/Coworkflow:start` records this flag for the session it runs in — which is precisely what a
+ * non-interactive session cannot do: `pi -p '/Coworkflow:start'` sends that text as the prompt, the
+ * command never runs, and the first dispatch is refused because the layer is off. The last session
+ * that hit this had to read the flag's file format out of the source and write it by hand. That
+ * workaround should not be the interface.
+ */
+test("cli: session on/off records the switch, and both spellings resolve to the same key", () => {
+  const root = project();
+  try {
+    const id = "01a16686-ac7e-730c-97b8-1d38c653f93a";
+    const on = cli(["session", "on", "--session", id], root);
+    assert.equal(on.code, 0, on.stderr);
+    assert.match(on.stdout, /已启用/);
+
+    // The session file path is the other spelling a caller may have; it must land on the same key,
+    // because a parent passing a path while the flags are keyed by id is a bug this package already
+    // shipped once.
+    const byFile = cli([
+      "session", "on",
+      "--session", `/tmp/sessions/--p--/2026-10-23T02-11-04-446Z_${id}.jsonl`,
+      "--json",
+    ], root);
+    assert.equal(byFile.code, 0, byFile.stderr);
+    const parsed = JSON.parse(byFile.stdout) as { keys: string[]; on: boolean };
+    assert.ok(parsed.keys.includes(id), `a path resolves to the id it contains: ${parsed.keys.join(",")}`);
+
+    const flags = JSON.parse(
+      readFileSync(join(root, ".trellis", ".runtime", "workflow-sessions.json"), "utf-8"),
+    ) as { sessions: Record<string, { on: boolean }> };
+    assert.equal(flags.sessions[id]?.on, true, "the switch is recorded for the session, by id");
+
+    // Off is an explicit choice, not the same thing as never having chosen: an absent entry falls
+    // back to the project's `autoEnable`, while `on: false` overrides it for this session.
+    const off = cli(["session", "off", "--session", id], root);
+    assert.equal(off.code, 0, off.stderr);
+    const after = JSON.parse(
+      readFileSync(join(root, ".trellis", ".runtime", "workflow-sessions.json"), "utf-8"),
+    ) as { sessions: Record<string, { on: boolean }> };
+    assert.equal(after.sessions[id]?.on, false, "off is recorded as an explicit false, not as absence");
+
+    // A missing session is a usage error, not a silent no-op.
+    assert.equal(cli(["session", "on"], root).code, 2);
+    // And it does not pretend a session switch means the project adopted the package.
+    rmSync(join(root, ".pi", "Coworkflow.json"));
+    const unadopted = cli(["session", "on", "--session", id], root);
+    assert.equal(unadopted.code, 0);
+    assert.match(unadopted.stdout, /还没有 \.pi\/Coworkflow\.json/, "a switch is not adoption, and says so");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
