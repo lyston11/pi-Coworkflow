@@ -58,6 +58,17 @@ const here = (rel: string): string => new URL(rel, import.meta.url).pathname;
 // ── the installed owner, resolved exactly as production resolves it ───
 
 const ownerPath = exportEntry("./agents", mkdtempSync(join(tmpdir(), "coworkflow-surface-probe-")));
+/** The installed owner's package root, from whichever build file `./agents` resolves to. */
+function ownerRoot(entryPath: string): string | null {
+  // 0.81.0 resolves `./agents` to `bundle/agents.js`, older builds to `src/api/agents.js`. Both ship
+  // `src/`, which is where the registry and the event listener live; deriving the root from the
+  // resolved file instead of assuming one layout is what keeps these tests driving the real owner
+  // after an upstream bump (a hardcoded `/src/api/agents.js` made the registry lookup silently miss,
+  // and optional chaining turned that miss into "undefined" rather than "skipped").
+  const match = /^(.*?)\/(?:bundle|src\/api)\/agents\.js$/.exec(entryPath);
+  return match?.[1] ?? null;
+}
+
 const installed = typeof ownerPath === "string";
 const skip = installed
   ? false
@@ -69,7 +80,7 @@ interface OwnerAgents {
 }
 const owner = installed ? ((await import(`file://${ownerPath as string}`)) as OwnerAgents) : null;
 const registryPath = installed
-  ? join((ownerPath as string).replace(/\/src\/api\/agents\.js$/, ""), "src", "agents", "runtime-agent-registry.js")
+  ? ownerRoot(ownerPath as string) === null ? null : join(ownerRoot(ownerPath as string)!, "src", "agents", "runtime-agent-registry.js")
   : null;
 const registryView = registryPath === null
   ? null

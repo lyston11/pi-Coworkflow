@@ -284,6 +284,37 @@ subagent({ workflow: "coworkflow.fanout", args: {
 
 `worktrees: true` 给每个 lane 自己的独立 worktree —— **「共用一个 worktree，不能同时写」是配置问题，不是依赖问题**。真正必须串行的只有一种：后一步要看到前一步**已实现的行为**才能定下自己的接口；那说明契约还没定。
 
+### worktree 里有什么，以及为什么
+
+worktree 是**已提交文件**的检出，而本包的 Trellis 状态（`.trellis/tasks`、`.trellis/scripts`、`config.yaml`、`workflow.md`、以及整个 `.pi/`）是**故意不入库**的。所以 `auto_worktree.py` 建好 worktree 后会把这几项**软链接**进去：
+
+```
+<worktree>/.trellis/{tasks,scripts,workspace,config.yaml,workflow.md} -> 主检出
+<worktree>/.pi                                                      -> 主检出
+```
+
+软链而不是拷贝：这些是**共享记录**——子 agent 更新任务状态时必须更新主会话读到的那一份，拷贝会造出两份会分叉的历史。于是 worktree 里的子 agent 能读自己的 PRD、能跑 `task.py`、能拿到项目配置与 kind 定义。
+
+**它仍然没有 `node_modules`**（链接一棵依赖树会让工具解析到别处的包），需要跑构建/测试时由项目自己决定。而上游托管的 lane worktree（`worktrees: true`）由 pi-subagents 创建，本包插不进去——那些 lane 里没有上述链接，所以 lane 的产物是 patch，集成与测试在主会话做。
+
+### 子 agent 用哪个模型
+
+优先级：`kind 的 model` → `.pi/settings.json` 的 `subagents.defaultModel` → 主会话的模型。
+
+**声明了但解析不到时是静默回退**，所以 `/Coworkflow:status` 把三件事分开报：声明了什么（哪个文件）、实际会用哪个、有没有在模型注册表里核验到。
+
+```
+子 agent 模型：声明了 cline-pass/deepseek-v4.1-flash-1017（来自 .pi/settings.json），但宿主没有
+提供模型注册表，无法确认它是否解析得到；解析不到时子 agent 会静默回退到主会话模型（…）
+```
+
+```
+子 agent 模型：声明的 cline-pass/… 解析不到（在模型注册表里找不到这个 provider/model）——
+子 agent 会静默回退到主会话模型（buddy2api/…），本项目等于没配；注册表里相近的有：clinepass/cline-pass/…
+```
+
+「宿主答不了」和「确认没有」是两种答案，本包不会把前者写成后者。
+
 ## 子 agent 的预算：为什么它们会撞上 30 分钟
 
 上游对一次运行有 **30 分钟兜底**，而子 agent **看不到这个数字**。实测本项目的 14 个子运行：

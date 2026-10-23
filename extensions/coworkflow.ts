@@ -59,6 +59,7 @@ import {
   writeConfig,
 } from "../core/config.ts";
 import { sessionFlag, sessionKeys, setSessionFlag } from "../core/trellis.ts";
+import { checkSubagentModel, formatSubagentModelLine, readDeclaredSubagentModel } from "../core/model-report.ts";
 import { existingSubagentsBridge, formatRunSummary } from "../core/subagents-client.ts";
 import { childTailActions } from "../core/child-tail.ts";
 import { decodeNativeCompletions, readUserConfig } from "../core/pi-subagents.ts";
@@ -485,6 +486,44 @@ function activateSession(): void {
 
 let runtimeHost: PiRuntimeHost | null = null;
 
+/**
+ * The subagent model, resolved against the host's registry when the host offers one.
+ *
+ * Reads the two settings files in precedence order (project beats user), because "which file said
+ * this" is part of the answer — a stale value in the wrong file looks identical to a correct one in
+ * the right file until someone asks where it came from.
+ */
+function subagentModelLines(root: string, ctx: CommandContext): string[] {
+  try {
+    const declared = readDeclaredSubagentModel(root);
+    const registry = (ctx as { modelRegistry?: { getAvailable?(): unknown[]; hasConfiguredAuth?(model: unknown): boolean } })
+      .modelRegistry;
+    const available =
+      typeof registry?.getAvailable === "function"
+        ? (registry.getAvailable() as { provider?: unknown; id?: unknown }[])
+            .map((model) => {
+              const provider = String(model?.provider ?? "");
+              const id = String(model?.id ?? "");
+              if (provider === "" || id === "") return null;
+              const authenticated =
+                typeof registry?.hasConfiguredAuth === "function"
+                  ? Boolean(registry.hasConfiguredAuth(model))
+                  : undefined;
+              return { provider, id, ...(authenticated === undefined ? {} : { authenticated }) };
+            })
+            .filter((model) => model !== null)
+        : undefined;
+    const session = (ctx as { model?: { provider?: unknown; id?: unknown } }).model;
+    const sessionModel =
+      typeof session?.provider === "string" && typeof session?.id === "string"
+        ? { provider: session.provider, id: session.id }
+        : null;
+    return [`  ${formatSubagentModelLine(checkSubagentModel({ declared, available, sessionModel }))}`];
+  } catch (error) {
+    return [`  ~ 子 agent 模型：无法判定（${error instanceof Error ? error.message : String(error)}）`];
+  }
+}
+
 function runSetup(args: string, ctx: CommandContext, forceDry: boolean): string {
   const parsed = parseArgs(args);
   if (parsed.error) return parsed.error;
@@ -511,6 +550,10 @@ function runSetup(args: string, ctx: CommandContext, forceDry: boolean): string 
   // files, so writing the config there would put the switches somewhere no gate
   // reads.
   const root = resolution.root;
+  // What a subagent will actually run on. Reported for the same reason every other line here is:
+  // a declared model that does not resolve falls back to the parent's, silently, and the session
+  // that discovered this had four children fail with a connection error and execute nothing.
+  const modelLines = subagentModelLines(root, ctx);
   const existing = readConfig(root);
   const firstInstall = existing === null;
 
@@ -674,6 +717,10 @@ function runSetup(args: string, ctx: CommandContext, forceDry: boolean): string 
       ...(existing?.agentKinds === undefined ? {} : { agentKinds: existing.agentKinds }),
     });
   }
+
+  // Before the runtime block: the model question is answered from the settings files and the host's
+  // registry, so it belongs with the other "what will this project actually do" lines.
+  if (modelLines.length > 0) blocks.push(modelLines.join("\n"));
 
   const runtimeBlock = runtimeReport();
   if (runtimeBlock) blocks.push(runtimeBlock);

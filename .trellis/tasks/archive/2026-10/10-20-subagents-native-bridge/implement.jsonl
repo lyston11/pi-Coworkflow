@@ -1,0 +1,3 @@
+{"file":".trellis/tasks/10-20-subagents-native-bridge/research/upstream-contracts.md","reason":"Public upstream ownership, interfaces, lifecycle and failure bounds"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Single decoding owner across native RPC and consumers"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reuse public runtime, avoid parallel lifecycle implementation"}

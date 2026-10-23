@@ -24,6 +24,26 @@ from pathlib import Path
 WORKTREE_DIR_PREFIX = "wt-"
 DEFAULT_BRANCHES = {"main", "master"}
 
+# Runtime directories a checkout does NOT contain but a working agent needs.
+#
+# A linked worktree is a checkout of committed files only. This package's Trellis state —
+# ``.trellis/tasks``, ``.trellis/scripts``, ``.trellis/config.yaml`` and the whole of ``.pi/`` — is
+# deliberately untracked, so a fresh worktree has none of it: no task records, no ``task.py``, no
+# spec injection inputs, no project config, and no subagent agent definitions. A child dispatched
+# there then cannot read its own PRD or run the task lifecycle, which is exactly the kind of
+# "works on my checkout" gap this hook exists to prevent.
+#
+# Symlinked, not copied: these are *shared* records. A child updating a task must update the one the
+# parent reads, and duplicating them would create two divergent histories.
+MATERIALISE = (
+    (".trellis/tasks", "dir"),
+    (".trellis/scripts", "dir"),
+    (".trellis/workspace", "dir"),
+    (".trellis/config.yaml", "file"),
+    (".trellis/workflow.md", "file"),
+    (".pi", "dir"),
+)
+
 
 def run_git(cwd: Path, *args: str) -> tuple[int, str, str]:
     proc = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
@@ -122,6 +142,23 @@ def main() -> int:
         code, _, err = run_git(repo_root, "worktree", "add", "-b", target_branch, str(worktree_path))
     if code != 0:
         return fail(f"git worktree add failed: {err}")
+
+    for relative, kind in MATERIALISE:
+        source = repo_root / relative
+        if not source.exists():
+            continue
+        target = worktree_path / relative
+        if target.exists() or target.is_symlink():
+            # Already tracked and checked out (older projects tracked some of these), or a hook ran
+            # twice: leaving the real files alone is the safe answer.
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.symlink_to(source, target_is_directory=(kind == "dir"))
+        except OSError as error:
+            # A worktree without these is still usable for a child that only edits code, so this is a
+            # warning rather than a failed start — but it has to be said, not swallowed.
+            print(f"[auto-worktree] warn: 未能链接 {relative}: {error}", file=sys.stderr)
 
     print(f"[auto-worktree] ready: {worktree_path} (branch {target_branch})")
     return record(task_json, data, target_branch, worktree_path)

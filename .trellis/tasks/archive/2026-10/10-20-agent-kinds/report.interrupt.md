@@ -1,0 +1,6 @@
+Workflow completed with 1 child run(s). Return: {
+  "taskDir": ".trellis/tasks/10-20-agent-kinds",
+  "cwd": "/Users/lyston/PycharmProjects/wt-10-20-agent-kinds",
+  "needsParentAcceptance": true,
+  "handoff": "/Users/lyston/PycharmProjects/pi-Coworkflow/.trellis/tasks/10-20-agent-kinds/report.interrupt.interrupt.md",
+  "summary": "Added honest interrupt control for child runs: public RPC wrappers stop/steer/interrupt in core/subagents-client.ts (capability-checked before emitting, malformed reply = protocol error, owner's error preserved, stop modelled as an ACCEPTANCE receipt `{accepted:true, state:\"stopping\"}` with no ambiguity alias), a shared report layer modules/subagents/run-control.ts that prints the acknowledgement and one follow-up public status read as two separate facts, `/Coworkflow:lanes stop <runId>` in modules/lane-worktree/index.ts (only run ids recorded for the current task, existing gates honoured, no arbitrary ids, never prints 已停止), and `/Coworkflow:stop <runId> [instructions]` + `/Coworkflow:steer <runId> <inst… (truncated; full return value and emits: /var/folders/8c/t8htn7h14t777qd1hclgyj940000gn/T/pi-subagents-uid-501/async-subagent-runs/338bf25d-ab82-4cbc-95a9-905ee5a4d247/status.json (workflow.value, workflow.emits)) Trace: 2 event(s).

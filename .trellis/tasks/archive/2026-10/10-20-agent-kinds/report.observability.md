@@ -1,0 +1,6 @@
+Workflow completed with 1 child run(s). Return: {
+  "taskDir": ".trellis/tasks/10-20-agent-kinds",
+  "cwd": "/Users/lyston/PycharmProjects/wt-10-20-agent-kinds",
+  "needsParentAcceptance": true,
+  "handoff": "/Users/lyston/PycharmProjects/pi-Coworkflow/.trellis/tasks/10-20-agent-kinds/report.observability.observability.md",
+  "summary": "Closed the observability gap behind a stop decision: decoded the fleet DTO the owner already publishes (opaque key, agent, role, model, effort, goal, startedAt, tokens) with the same strictness as the rest of core/subagents-client.ts, added a bounded per-run panel summary whose token sum is labelled a lower bound whenever the window is short, derived elapsed time from startedAt with a caller-supplied clock (no timer, no polling), recorded each dispatch's own agent and goal so lanes can show them attributed to \"本包派单记录\", and documented plainly in README + the integration spec what a parent can and cannot see. No fleet key is joined to a run id anywhere; live per-tool narration stays documented as un… (truncated; full return value and emits: /var/folders/8c/t8htn7h14t777qd1hclgyj940000gn/T/pi-subagents-uid-501/async-subagent-runs/ca45f659-cbf7-4e7e-b965-15396755e392/status.json (workflow.value, workflow.emits)) Trace: 2 event(s).
