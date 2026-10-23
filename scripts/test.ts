@@ -84,7 +84,7 @@ test("worktree: after_start is removed after config.yaml is reformatted", async 
   worktreeModule.apply?.(context as never);
   assert.match(readFileSync(configPath, "utf-8"), /after_start/);
 
-  // `trellis update` reformats: indentation and blank lines change, the entry stays.
+  // A reformat changes indentation and blank lines; the entry has to stay.
   const reformatted = readFileSync(configPath, "utf-8")
     .replace("hooks:\n", "hooks:\n\n")
     .replace("  after_start:\n", "  after_start:\n\n");

@@ -265,7 +265,7 @@ test("two processes: whole-file state is replaced atomically, never left half-wr
 test("two processes: every synchronous child is bounded", async () => {
   const fs = await import("node:fs");
   const path = await import("node:path");
-  const sources = ["core/config.ts", "core/trellis.ts", "extensions/coworkflow.ts", "modules/trellis/index.ts"];
+  const sources = ["core/config.ts", "core/trellis.ts", "extensions/coworkflow.ts"];
   for (const name of sources) {
     const text = fs.readFileSync(path.join(process.cwd(), name), "utf-8");
     // Each spawn site must carry a timeout; a bare execFileSync/spawnSync is the hang.
@@ -277,6 +277,12 @@ test("two processes: every synchronous child is bounded", async () => {
       `${name} must bound its synchronous child`,
     );
   }
+  // `modules/trellis/index.ts` renders a bundled template and starts nothing, so the
+  // stronger statement holds there: no synchronous child at all, therefore no timeout to
+  // forget. A future spawn in that module fails this rather than slipping in unbounded.
+  const rendering = fs.readFileSync(path.join(process.cwd(), "modules/trellis/index.ts"), "utf-8");
+  assert.doesNotMatch(rendering, /(execFileSync|spawnSync)\s*\(/, "the template renderer starts no child process");
+
   // And the constant itself is a hard ceiling, not a hopeful default.
   const { GIT_TIMEOUT_MS } = await import("../core/config.ts");
   assert.ok(GIT_TIMEOUT_MS > 0 && GIT_TIMEOUT_MS <= 30_000, `a git probe may block at most tens of seconds: ${GIT_TIMEOUT_MS}`);

@@ -42,8 +42,8 @@ export const TASKS_DIR = join(TRELLIS_DIR, "tasks");
  * only what a child needs, and is injected by `subagent-context`.
  */
 /**
- * Child-facing instructions. Owned by pi-Coworkflow, not Trellis: `trellis update`
- * must not treat it as something to reconcile.
+ * Child-facing instructions. Owned by pi-Coworkflow, outside the rendered surface, so
+ * a render never treats it as something to reconcile.
  */
 export const SUBAGENT_GUIDE = join(".pi", "Coworkflow", "subagent-AGENTS.md");
 

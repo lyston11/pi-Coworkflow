@@ -32,24 +32,18 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 
 没采用的项目里，这个扩展什么都不做：不安装、不注入、不记账。
 
-### 模板与 CLI 的分工
+### 模板与项目记录的分工
 
-**Trellis 资产是模板，不是 CLI 的产物。** 本包自带 `.trellis/`（`workflow.md`、`config.yaml`、`agents/`、`scripts/`）
-与 `.pi/`（`agents/`、`extensions/trellis/`、`prompts/`）的模板，`/Coworkflow:init` 按它们渲染到项目里。
-所以安装流程是「装这一个包 → init」，**没有「先装全局 `trellis` CLI → 先 `trellis init`」那一步**。
+**范式文件是模板，随本包发布。** 本包自带 `.trellis/`（`workflow.md`、`config.yaml`、`agents/`、`scripts/`）
+与 `.pi/`（`agents/`、`extensions/trellis/`、`prompts/`）的模板，`/Coworkflow:init` 按它们写进项目。
+安装流程就是「装这一个包 → init」一步。
 
-| 要用的东西 | 谁提供 |
+| 内容 | 谁提供 |
 |---|---|
-| `.trellis/`、`.pi/` 的范式文件（workflow、Trellis 脚本、agent 定义、Pi 扩展） | **本包随附的模板**，`/Coworkflow:init` 渲染 |
+| `.trellis/`、`.pi/` 的范式文件（workflow、任务脚本、agent 定义、Pi 扩展） | **本包随附的模板**，`/Coworkflow:init` 渲染 |
 | `tasks/`、`spec/`、`workspace/` 等项目记录 | 项目自己；模板不写、不覆盖 |
-| `trellis mem`、`trellis channel` | 全局 `trellis` CLI（`@mindfoldhq/trellis`）。**本包不自带这两个**，没装就用不了 |
 
-也就是说 `trellis` CLI 是**可选项**：缺了既不影响安装，也不影响派单、面板、lane 与任务脚本。
-缺了它就只有 `trellis mem` / `trellis channel` 这两项不可用——本包不假装自带它们。
-
-**不要手工跑 `trellis update`。** 它会把范式文件换回上游版本，使项目一半是本仓模板、一半是上游、
-而且没有任何一次运行会把它们重新对齐。要刷新范式就再跑一次 `/Coworkflow:init`（幂等，用户数据不动）。
-老项目里残留的 `trellis-*` 角色 agent 由 init 的迁移步骤清掉；新装项目的模板不产出它们。
+要刷新范式就再跑一次 `/Coworkflow:init`（幂等，用户数据不动）。
 
 ## 三层状态
 

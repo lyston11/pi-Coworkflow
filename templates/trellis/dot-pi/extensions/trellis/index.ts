@@ -199,9 +199,8 @@ function contextKey(input?: unknown, ctx?: PiExtensionContext): string | null {
  *
  * A session pointer is not always something the user typed. `task.py` now
  * refuses to store a ref that leaves the project, but a session file written
- * before that fix can still hold one, and `trellis update` does not rewrite
- * session files — so a poisoned pointer outlives the upgrade that closed the
- * writer. Both sides are resolved so a task directory symlinked outside is
+ * before that fix can still hold one, and nothing rewrites session files — so a
+ * poisoned pointer outlives the fix that closed the writer. Both sides are resolved so a task directory symlinked outside is
  * refused too, but the original `candidate` is returned on success: callers do
  * `relative(root, dir)`, and handing them a realpath would break that whenever
  * `root` itself sits behind a symlink (`/tmp` does on macOS).

@@ -55,8 +55,7 @@ max_journal_lines: 2000
 #-------------------------------------------------------------------------------
 
 # Declare packages for monorepo projects.
-# Trellis auto-detects workspaces during `trellis init`, but you can also
-# configure them manually here.
+# Workspaces are configured here; nothing detects them for you.
 #
 # packages:
 #   frontend:

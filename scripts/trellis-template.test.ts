@@ -35,7 +35,6 @@ import {
   missingConfigKeys,
   packageVersion,
   planTemplate,
-  probeOptionalCli,
   renderTemplate,
   templateEntries,
   topLevelBlocks,
@@ -327,24 +326,19 @@ test("template: a dry run describes the migration and deletes nothing", () => {
   assert.equal(existsSync(join(root, ".trellis", "agents", "implement.md")), false, "a dry run must not write");
 });
 
-// ── optional CLI ─────────────────────────────────────────────────────
+// ── no external generator ────────────────────────────────────────────
 
-test("template: a render succeeds with no `trellis` on PATH and reports the optional gap", () => {
+test("template: a render succeeds with an empty PATH — nothing external is invoked", () => {
   const root = tempProject();
   const originalPath = process.env.PATH;
-  // An empty PATH is the strongest form of "the CLI is not installed": no
-  // `trellis`, and nothing else that could stand in for it.
+  // An empty PATH is the strongest form of "no external tool exists": rendering reads the
+  // bundled template and writes files, and must not need anything else on the machine.
   process.env.PATH = "";
   try {
     const { ctx, lines } = contextFor(root);
     const report = renderTemplate(ctx);
-    assert.ok(report.failed.length === 0, `render must not fail without the CLI: ${JSON.stringify(report.failed)}`);
-    assert.equal(probeOptionalCli(ctx), null);
-    assert.ok(
-      lines.some((line) => line.includes("可选") && line.includes("mem/channel")),
-      `the optional gap must be one plain line: ${lines.join(" | ")}`,
-    );
-    assert.ok(!lines.some((line) => line.startsWith("error:")), "a missing optional CLI is not an error");
+    assert.ok(report.failed.length === 0, `render must not fail with no PATH: ${JSON.stringify(report.failed)}`);
+    assert.ok(!lines.some((line) => line.startsWith("error:")), "an empty PATH is not an error");
   } finally {
     process.env.PATH = originalPath;
   }

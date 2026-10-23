@@ -5,7 +5,7 @@
  * `.trellis/scripts/`, `.trellis/config.yaml`, `.pi/extensions/trellis/`,
  * `.pi/prompts/`, `.agents/skills/trellis-*`) ship inside this package under
  * `templates/trellis/`. `/Coworkflow:init` copies them into the project; no
- * `trellis init` / `trellis update` call is made, and the global CLI is not a
+ * the template is read, and nothing outside this package is a
  * prerequisite.
  *
  * The `dot-*` level of the template is a rename, not content: `dot-trellis/` →
@@ -26,7 +26,6 @@
  * surface, and hitting either one is reported as an upgrade.
  */
 
-import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -567,45 +566,6 @@ export function renderTemplate(ctx: ModuleContext, templateRoot = TEMPLATE_ROOT)
   return report;
 }
 
-// ── optional global CLI ──────────────────────────────────────────────
-
-function run(command: string, args: string[], cwd: string, timeoutMs = 15_000): { code: number; out: string; err: string } {
-  const proc = spawnSync(command, args, {
-    cwd,
-    encoding: "utf-8",
-    timeout: timeoutMs,
-    killSignal: "SIGKILL",
-    stdio: ["ignore", "pipe", "pipe"],
-    maxBuffer: 4 * 1024 * 1024,
-  });
-  return { code: proc.status ?? 1, out: (proc.stdout ?? "").trim(), err: (proc.stderr ?? "").trim() };
-}
-
-/** The global CLI's version, or `null` when it is not installed. */
-export function globalTrellisVersion(): string | null {
-  const found = run("trellis", ["--version"], process.cwd());
-  if (found.code !== 0) return null;
-  return /(\d+\.\d+\.\d+)/.exec(found.out || found.err)?.[1] ?? "unknown";
-}
-
-/**
- * Say whether the optional global CLI is there.
- *
- * It is optional on purpose: `mem` and `channel` are features of that CLI, and
- * `trellis init/update` are no longer used at all, so a project without it still
- * gets the whole workflow. Reporting this as an error would tell the user their
- * install is broken when nothing is missing but a convenience.
- */
-export function probeOptionalCli(ctx: ModuleContext): string | null {
-  const version = globalTrellisVersion();
-  if (version === null) {
-    ctx.report("ok", "可选：未安装全局 trellis CLI，mem/channel 不可用（其余功能不依赖它）");
-    return null;
-  }
-  ctx.report("ok", `可选：全局 trellis CLI ${version} 可用（mem / channel 由它提供；本包不用它渲染模板）`);
-  return version;
-}
-
 // ── module ───────────────────────────────────────────────────────────
 
 export const trellisModule: WorkflowModule = {
@@ -617,8 +577,7 @@ export const trellisModule: WorkflowModule = {
       ctx.report("error", `模板缺失：${TEMPLATE_ROOT}（包内 templates/trellis/ 未随包发布）`);
       return;
     }
-    ctx.report("ok", "模板源：本包 templates/trellis/（不调用 `trellis init` / `trellis update`）");
+    ctx.report("ok", `模板源：${TEMPLATE_ROOT}`);
     renderTemplate(ctx);
-    probeOptionalCli(ctx);
   },
 };

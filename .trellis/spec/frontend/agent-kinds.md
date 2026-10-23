@@ -184,7 +184,7 @@ fleet 投影的 `key` 是不透明显示键，上游明确禁止当作 run 或 a
 
 - 不做「自动把任务分给某个类」的调度器——那是判断，不是机制。
 - 不改 pi-subagents 的任何文件，不加载第二份运行器。
-- 不改写 Trellis 的 CLI 与全局模板；**但本包自带 Trellis 资产模板，本项目工作面只讲 kind**：模板不产出 `.pi/agents/trellis-{implement,check,research}.md`，老项目里残留的由 `retireRoleAgents()` 在迁移时删除，`.trellis/workflow.md` 的 Pi 块在模板里就写成 kind 派单，其它平台块不动。全局 `trellis` CLI 是可选的（只有 `trellis mem` / `trellis channel` 需要，本包不自带），也不用 `trellis update` 对齐——手工跑它会把范式换回上游版本，与本包模板混成两种真相。
+- 不改写 Trellis 的 CLI 与全局模板；**但本包自带 Trellis 资产模板，本项目工作面只讲 kind**：模板不产出 `.pi/agents/trellis-{implement,check,research}.md`，老项目里残留的由 `retireRoleAgents()` 在迁移时删除，`.trellis/workflow.md` 的 Pi 块在模板里就写成 kind 派单，其它平台块不动。范式文件由本包模板渲染，没有第二个来源；要刷新就重跑 `/Coworkflow:init`。
 - 不自动重试、不自动合并、不自动清理。
 
 ## 失败模式与对应要求

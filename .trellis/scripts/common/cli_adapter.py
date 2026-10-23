@@ -871,7 +871,7 @@ def detect_platform(project_root: Path) -> Platform:
 
     # Check for Devin workflow directory only when no other platform config
     # exists. `.windsurf/workflows` is the legacy pre-rename path (still detected
-    # as devin for back-compat until users migrate via `trellis update --migrate`).
+    # as devin for back-compat; the platform key is read from config, not hardcoded).
     if (
         (project_root / ".devin" / "workflows").is_dir()
         or (project_root / ".windsurf" / "workflows").is_dir()
