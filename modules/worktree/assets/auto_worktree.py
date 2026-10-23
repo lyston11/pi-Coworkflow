@@ -46,7 +46,18 @@ MATERIALISE = (
 
 
 def run_git(cwd: Path, *args: str) -> tuple[int, str, str]:
-    proc = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+    # Bounded: this hook runs inside `task.py start`, and an unbounded git call there blocks the
+    # whole session (worst on a slow filesystem, where `worktree add` can take minutes).
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", f"git {' '.join(args)} 超过 120 秒未返回"
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 

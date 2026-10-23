@@ -44,6 +44,7 @@ import type {
 } from "../core/module.ts";
 import { createContext, renderModule } from "../core/module.ts";
 import type { WorkflowConfig, AgentKindConfig } from "../core/config.ts";
+import { GIT_TIMEOUT_MS } from "../core/config.ts";
 import {
   configPath,
   configRootNote,
@@ -185,7 +186,16 @@ function parseArgs(args: string): ParsedArgs {
 }
 
 function gitRoot(cwd: string): string {
-  const proc = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf-8" });
+  const proc = spawnSync("git", ["rev-parse", "--show-toplevel"], {
+    cwd,
+    encoding: "utf-8",
+    // Same rule as everywhere a synchronous child is spawned here: bounded, because the alternative
+    // is a session that stops responding for a reason the user cannot see.
+    timeout: GIT_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+    stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: 1024 * 1024,
+  });
   const out = (proc.stdout ?? "").trim();
   return proc.status === 0 && out ? out : cwd;
 }

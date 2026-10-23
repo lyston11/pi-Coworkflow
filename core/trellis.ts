@@ -14,9 +14,10 @@
  * it for dispatched children, where the main session's prompt is not inherited.
  */
 
+import { GIT_TIMEOUT_MS } from "./config.ts";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export const TRELLIS_DIR = ".trellis";
@@ -59,6 +60,11 @@ function runGit(cwd: string, args: string[]): string | null {
     const out = execFileSync("git", ["-C", cwd, ...args], {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
+      // Bounded for the same reason as the config probe: a synchronous child owns the event loop,
+      // and "git did not answer" has a representable outcome (`null`) while a hang does not.
+      timeout: GIT_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      maxBuffer: 1024 * 1024,
     }).trim();
     return out || null;
   } catch {
@@ -628,6 +634,30 @@ export function laneDir(root: string, taskDir: string): string {
   return join(root, LANES_DIR, basename(taskDir));
 }
 
+/**
+ * Write a whole file without ever exposing a half-written one.
+ *
+ * Two pi processes can run in the same project — the same session flags file, the same run ledger —
+ * and both write from event handlers. A plain truncate-and-write is not atomic: the other process can
+ * read it mid-write, fail to parse, and take the empty result as "no flags / no runs" (every reader
+ * here swallows a parse error by design). Temp-then-rename in the same directory makes the swap
+ * atomic, so a concurrent reader sees the old file or the new one, never a fragment.
+ */
+export function writeFileAtomic(path: string, text: string): void {
+  const temp = `${path}.${process.pid}.${Date.now().toString(36)}.tmp`;
+  try {
+    writeFileSync(temp, text);
+    renameSync(temp, path);
+  } catch (error) {
+    try {
+      rmSync(temp, { force: true });
+    } catch {
+      // A leftover temp file is harmless; failing to remove it must not mask the original error.
+    }
+    throw error;
+  }
+}
+
 // ── Session-scoped enable flags ───────────────────────────────────────
 
 const FLAG_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -730,7 +760,7 @@ export function setSessionFlag(root: string, sessionId: string, on: boolean | nu
 
   try {
     mkdirSync(dirname(join(root, SESSION_FLAGS_FILE)), { recursive: true });
-    writeFileSync(join(root, SESSION_FLAGS_FILE), `${JSON.stringify(flags, null, 2)}\n`);
+    writeFileAtomic(join(root, SESSION_FLAGS_FILE), `${JSON.stringify(flags, null, 2)}\n`);
     return true;
   } catch {
     return false;

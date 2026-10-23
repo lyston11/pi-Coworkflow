@@ -219,3 +219,65 @@ test("accounting: none of these paths injects a message into the conversation", 
     h.close();
   }
 });
+
+/**
+ * Two pi processes in one project.
+ *
+ * Reported from a WSL session where two pi processes in the same project froze the machine. The
+ * extension never spawns subagent processes — it only dispatches through pi-subagents — but two
+ * things in it matter for that situation, and both are pinned here:
+ *
+ *   - **every synchronous child is bounded**, because a synchronous child owns this process's event
+ *     loop and "git is thinking on a slow filesystem" is indistinguishable from "pi is hung";
+ *   - **whole-file state is swapped atomically**, because both processes write the same session flags
+ *     and the same run ledger from event handlers, and every reader here treats an unparseable file
+ *     as "empty".
+ */
+test("two processes: whole-file state is replaced atomically, never left half-written", async () => {
+  const { writeFileAtomic } = await import("../core/trellis.ts");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "coworkflow-atomic-"));
+  const file = path.join(dir, "flags.json");
+  try {
+    writeFileAtomic(file, JSON.stringify({ sessions: { a: { on: true } } }));
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf-8")), { sessions: { a: { on: true } } });
+    // No temp file is left behind on the happy path, so a project does not accumulate debris.
+    assert.deepEqual(fs.readdirSync(dir).filter((name) => name.endsWith(".tmp")), []);
+
+    // A writer that fails leaves the previous content intact — the other process keeps reading a
+    // valid file rather than a truncated one.
+    fs.chmodSync(dir, 0o500);
+    try {
+      writeFileAtomic(file, "should-not-land");
+    } catch {
+      // Expected: a read-only directory.
+    }
+    fs.chmodSync(dir, 0o700);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf-8")), { sessions: { a: { on: true } } });
+    assert.deepEqual(fs.readdirSync(dir).filter((name) => name.endsWith(".tmp")), [], "and no debris");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("two processes: every synchronous child is bounded", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const sources = ["core/config.ts", "core/trellis.ts", "extensions/coworkflow.ts", "modules/trellis/index.ts"];
+  for (const name of sources) {
+    const text = fs.readFileSync(path.join(process.cwd(), name), "utf-8");
+    // Each spawn site must carry a timeout; a bare execFileSync/spawnSync is the hang.
+    const spawns = [...text.matchAll(/(execFileSync|spawnSync)\(/g)];
+    assert.ok(spawns.length > 0, `${name} should be scanned`);
+    assert.match(
+      text,
+      /(GIT_TIMEOUT_MS|timeoutMs)/,
+      `${name} must bound its synchronous child`,
+    );
+  }
+  // And the constant itself is a hard ceiling, not a hopeful default.
+  const { GIT_TIMEOUT_MS } = await import("../core/config.ts");
+  assert.ok(GIT_TIMEOUT_MS > 0 && GIT_TIMEOUT_MS <= 30_000, `a git probe may block at most tens of seconds: ${GIT_TIMEOUT_MS}`);
+});

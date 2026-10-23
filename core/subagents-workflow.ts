@@ -36,6 +36,7 @@ import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { subagentsPackageDir } from "./pi-subagents.ts";
 import { summarizeOverlap, type DispatchInterval, type OverlapSummary } from "./dispatch-timing.ts";
+import { writeFileAtomic } from "./trellis.ts";
 import {
   BUILTIN_KINDS,
   agentNameFor,
@@ -853,7 +854,7 @@ export function recordLaunchLink(root: string, link: Omit<NativeRunLink, "record
   const path = join(root, NATIVE_RUNS_FILE);
   try {
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, `${JSON.stringify({ version: 1, runs: kept }, null, 2)}\n`);
+    writeFileAtomic(path, `${JSON.stringify({ version: 1, runs: kept }, null, 2)}\n`);
   } catch {
     // Losing a link must never break the command that produced it.
   }

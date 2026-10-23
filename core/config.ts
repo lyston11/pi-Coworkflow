@@ -30,6 +30,16 @@ export const CONFIG_REL = join(".pi", "Coworkflow.json");
 /** The file name this package used before it was renamed to pi-Coworkflow. */
 export const LEGACY_CONFIG_REL = join(".pi", "trellis-workflow.json");
 
+/**
+ * How long a synchronous git probe may block this process before git counts as unanswered.
+ *
+ * Every synchronous child owns this process's event loop: an unbounded one turns a slow filesystem
+ * into a frozen session. On WSL with the repository on a mounted Windows drive each git call is many
+ * times slower, so "git is thinking" and "pi is hung" become indistinguishable to the user — which is
+ * why this number exists and why every probe passes it.
+ */
+export const GIT_TIMEOUT_MS = 5000;
+
 export interface WorkflowConfig {
   version: 1;
   /** ISO timestamp of the last `/Coworkflow:init`. */
@@ -161,6 +171,13 @@ const probeGit: GitRunner = (cwd, args) => {
     const out = execFileSync("git", ["-C", cwd, ...args], {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "pipe"],
+      // A synchronous child blocks this process's whole event loop, so an unbounded one turns a
+      // slow filesystem (WSL over a mounted Windows drive makes every git call many times slower)
+      // into a frozen session. Bounded, git that cannot answer is the `failed` state this function
+      // already models — a fact the caller can report, instead of a hang nobody can explain.
+      timeout: GIT_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      maxBuffer: 1024 * 1024,
       env: { ...process.env, LC_ALL: "C" },
     }).trim();
     return out ? { kind: "ok", out } : { kind: "failed", reason: `git ${args.join(" ")} 没有输出` };

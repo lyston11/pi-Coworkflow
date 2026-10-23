@@ -26,8 +26,27 @@ import type { ModuleContext, WorkflowModule } from "../../core/module.ts";
 const TRELLIS_REL = ".trellis";
 const PI_EXTENSION_REL = join(".pi", "extensions", "trellis", "index.ts");
 
-function run(command: string, args: string[], cwd: string): { code: number; out: string; err: string } {
-  const proc = spawnSync(command, args, { cwd, encoding: "utf-8" });
+function run(
+  command: string,
+  args: string[],
+  cwd: string,
+  /**
+   * How long this command may block the session.
+   *
+   * The CLI is not ours: a wrapper that waits on a prompt, a first-run download, or a hook reading
+   * stdin would hold this process's event loop forever. Version probes get seconds; `update` gets
+   * minutes, because it is legitimately slow and its output is the point.
+   */
+  timeoutMs = 15_000,
+): { code: number; out: string; err: string } {
+  const proc = spawnSync(command, args, {
+    cwd,
+    encoding: "utf-8",
+    timeout: timeoutMs,
+    killSignal: "SIGKILL",
+    stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: 4 * 1024 * 1024,
+  });
   return {
     code: proc.status ?? 1,
     out: (proc.stdout ?? "").trim(),
@@ -74,7 +93,7 @@ function ensurePiAssets(ctx: ModuleContext): void {
 }
 
 function runUpdate(ctx: ModuleContext): void {
-  const preview = run("trellis", ["update", "--dry-run"], ctx.root);
+  const preview = run("trellis", ["update", "--dry-run"], ctx.root, 180_000);
   if (preview.code !== 0) {
     ctx.report("error", `trellis update --dry-run 失败：${preview.err || preview.out || "未知错误"}`);
     return;
@@ -92,7 +111,7 @@ function runUpdate(ctx: ModuleContext): void {
   // `-s` keeps every file the project has modified and upgrades the rest, so
   // the edits this package makes to `config.yaml` / `.pi/settings.json` survive
   // and the modules that run after this one re-apply them regardless.
-  const applied = run("trellis", ["update", "-s"], ctx.root);
+  const applied = run("trellis", ["update", "-s"], ctx.root, 300_000);
   if (applied.code !== 0) {
     ctx.report("error", `trellis update -s 失败：${applied.err || applied.out || "未知错误"}`);
     return;
@@ -114,7 +133,7 @@ export const trellisModule: WorkflowModule = {
         ctx.report("created", "trellis init --pi -y（.trellis/、.pi/、.agents/skills/、AGENTS.md）");
         return;
       }
-      const result = run("trellis", ["init", "--pi", "-y"], ctx.root);
+      const result = run("trellis", ["init", "--pi", "-y"], ctx.root, 180_000);
       if (result.code !== 0) {
         ctx.report("error", `trellis init --pi -y 失败：${result.err || result.out || `exit ${result.code}`}`);
         return;
