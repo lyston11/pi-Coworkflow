@@ -28,6 +28,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { readConfig, createConfigRootResolver, type WorkflowConfig } from "../core/config.ts";
+import { checkpointFor } from "../core/subagents-workflow.ts";
 import { exportEntry } from "../core/subagents-workflow.ts";
 import {
   BUILTIN_KINDS,
@@ -1147,6 +1148,74 @@ test("gate: a fanout respects the kind ceiling including what is already running
  * project does not allow that. The gate rewrites the request rather than refusing it: the child still
  * runs, the caller still gets a run id to wait on, so nothing is lost but the block.
  */
+test("gate: one admission authority, so a direct dispatch and a batch refuse for the same reason", { skip }, async () => {
+  const harness = gateHarness({ kinds: { executor: { enabled: true, maxConcurrent: 1 } } });
+  try {
+    // Full: one already running against a ceiling of one.
+    harness.live.push("cw-executor");
+    const direct = await harness.call({ agent: "cw-executor", task: "x" });
+    const batch = await harness.call({
+      workflow: "coworkflow.fanout",
+      args: { tasks: [{ kind: "executor", task: "a" }] },
+    });
+    assert.ok(direct?.block && batch?.block, "both shapes refuse");
+    assert.match(direct!.reason!, /并发上限是 1/);
+    assert.match(batch!.reason!, /上限是 1/);
+
+    // Disabled: both say the kind is off, neither says "over the limit".
+    harness.live.length = 0;
+    harness.setModule(false);
+    harness.setModule(true);
+    const root = harness.root;
+    writeFileSync(
+      join(root, ".pi", "Coworkflow.json"),
+      JSON.stringify({ version: 1, modules: {}, agentKinds: { executor: { enabled: false } } }),
+    );
+    const directOff = await harness.call({ agent: "cw-executor", task: "x" });
+    const batchOff = await harness.call({
+      workflow: "coworkflow.fanout",
+      args: { tasks: [{ kind: "executor", task: "a" }] },
+    });
+    assert.match(directOff?.reason ?? "", /关闭|disabled|打开/);
+    assert.match(batchOff?.reason ?? "", /关闭|disabled|打开/);
+    assert.doesNotMatch(directOff?.reason ?? "", /并发上限/);
+    assert.doesNotMatch(batchOff?.reason ?? "", /已有 0 个在运行/);
+  } finally {
+    harness.close();
+  }
+});
+
+test("gate: the mechanical fields a dispatch needs are filled in, and explicit values are kept", { skip }, async () => {
+  const harness = gateHarness();
+  try {
+    const bare: Record<string, any> = { agent: "cw-executor", task: "x" };
+    assert.equal(await harness.call(bare), undefined);
+    assert.equal(bare.async, undefined, "an absent async is already background and stays absent");
+    assert.equal(bare.options.context, "fresh", "context defaults to a fresh child");
+    assert.equal(typeof bare.options.timeoutMs, "number");
+    assert.ok(bare.options.timeoutMs > 0);
+    assert.equal(
+      bare.options.checkpointBeforeDeadlineMs,
+      checkpointFor(bare.options.timeoutMs),
+      "the hand-over warning scales with the budget",
+    );
+
+    // An explicit choice is the caller's, and this never overwrites it.
+    const explicit: Record<string, any> = {
+      agent: "cw-executor",
+      task: "x",
+      async: true,
+      options: { context: "fork", timeoutMs: 90_000, checkpointBeforeDeadlineMs: 1_000 },
+    };
+    assert.equal(await harness.call(explicit), undefined);
+    assert.equal(explicit.options.context, "fork");
+    assert.equal(explicit.options.timeoutMs, 90_000);
+    assert.equal(explicit.options.checkpointBeforeDeadlineMs, 1_000);
+  } finally {
+    harness.close();
+  }
+});
+
 test("gate: a foreground dispatch is put in the background, and the rewrite is reported", { skip }, async () => {
   const harness = gateHarness();
   try {

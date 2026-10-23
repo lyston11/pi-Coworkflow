@@ -69,7 +69,12 @@ import {
 } from "./defaults.ts";
 import { readKindDefinitions } from "./definitions.ts";
 import { registerKindPort } from "./port.ts";
-import { FANOUT_NAME, type FanoutPolicy } from "../../core/subagents-workflow.ts";
+import {
+  FANOUT_NAME,
+  RUN_BUDGET_MS,
+  checkpointFor,
+  type FanoutPolicy,
+} from "../../core/subagents-workflow.ts";
 
 /** The owner's built-in parallel workflow: `{ tasks: [{ agent, task }] }`. */
 const PARALLEL_WORKFLOW = "parallel";
@@ -127,6 +132,8 @@ interface State {
    * child did not block.
    */
   forcedBackground: number;
+  /** How many mechanical fields this session has filled in for callers. */
+  defaultsFilled: number;
   /**
    * The fingerprint of what is registered right now, or `null` when nothing is.
    *
@@ -170,6 +177,7 @@ function stateFor(host: PiRuntimeHost): State {
     generation: 0,
     snapshot: null,
     forcedBackground: 0,
+    defaultsFilled: 0,
     registeredSignature: null,
     skipped: null,
     pending: Promise.resolve(),
@@ -236,24 +244,53 @@ export function decodeKindDispatch(input: unknown): { agent: string; async: bool
 }
 
 /**
- * Put a dispatch in the background, and say whether it had to be changed.
+ * Fill the mechanical fields a dispatch needs, and say which ones were filled.
  *
- * Project policy is that a dispatch never occupies the main session: `async` defaults to on, so the
- * only way to get a blocking child is to ask for one, and this rewrites that request instead of
- * refusing it. Rewriting is the better of the two here — the child still runs, the caller still gets
- * its receipt with a run id, and a caller that genuinely needs the result can wait for it explicitly
- * with `bg_wait`. Refusing would cost a round trip to correct a parameter that has exactly one
- * correct value in this project.
+ * The main session should state *what* to do; the budget, the fresh context and the hand-over
+ * checkpoint are project policy, not per-dispatch judgement. Leaving them to the caller is what makes
+ * dispatching feel more expensive than doing the work, which is the behaviour this fills in against.
  *
- * Mutating `input` in place is the documented mechanism (`tool_call` handlers may modify the call);
- * the host runs the tool with what the handler left behind.
+ * An explicit value always wins: a caller that asked for `context: "fork"` or its own `timeoutMs` knew
+ * something this function does not. Mutating `input` in place is the documented `tool_call` mechanism,
+ * the same mechanism the background rewrite used to use on its own.
  */
-export function forceBackground(input: unknown): boolean {
-  if (input === null || typeof input !== "object" || Array.isArray(input)) return false;
+export function applyDispatchDefaults(
+  input: unknown,
+  budgetMs: number | undefined,
+): string[] {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return [];
   const call = input as Record<string, unknown>;
-  if (call.async !== false) return false;
-  call.async = true;
-  return true;
+  const filled: string[] = [];
+
+  // Only an explicit `false` is a request to block; an absent field already means "background",
+  // and adding it would make every dispatch look rewritten in the status line.
+  if (call.async === false) {
+    call.async = true;
+    filled.push("async");
+  }
+
+  const budget = budgetMs ?? RUN_BUDGET_MS;
+  const current = call.options;
+  const options: Record<string, unknown> =
+    current !== null && typeof current === "object" && !Array.isArray(current)
+      ? (current as Record<string, unknown>)
+      : (call.options = {} as Record<string, unknown>);
+  if (options !== current) filled.push("options");
+
+  if (options.context === undefined) {
+    options.context = "fresh";
+    filled.push("context");
+  }
+  if (options.timeoutMs === undefined) {
+    options.timeoutMs = budget;
+    filled.push("timeoutMs");
+  }
+  if (options.checkpointBeforeDeadlineMs === undefined) {
+    const timeout = typeof options.timeoutMs === "number" ? options.timeoutMs : budget;
+    options.checkpointBeforeDeadlineMs = checkpointFor(timeout);
+    filled.push("checkpointBeforeDeadlineMs");
+  }
+  return filled;
 }
 
 /**
@@ -382,6 +419,60 @@ function unreadableCountRefusal(dispatch: KindDispatch, limit: number, reason: s
     `本项目给 ${kindLabel(dispatch.agent, dispatch.kind)} 设了并发上限 ${limit}，但无法确认现在有几个在运行：${reason}`,
     "为避免把上限变成一句空话，这次派单被拦下。请在 /Coworkflow:settings 里调高或调整该 kind 的上限，或确认 pi-subagents 提供 fleet 状态能力。",
   ], dispatch);
+}
+
+/** Count a rewrite: one un-blocked dispatch and the fields it had to fill are different facts. */
+function countDefaults(state: State, filled: readonly string[]): void {
+  state.defaultsFilled += filled.length;
+  if (filled.includes("async")) state.forcedBackground += 1;
+}
+
+/**
+ * Render one admission failure for a single dispatch.
+ *
+ * The decision is `admitOne`'s; only the wording is per shape. `session-gone` is a refusal rather
+ * than a message because the launch would have gone to a session that no longer exists.
+ */
+function refusalForFailure(
+  failure: AdmitFailure,
+  dispatch: KindDispatch,
+  snapshot: Snapshot | null,
+): Refusal | undefined {
+  switch (failure.code) {
+    case "session-gone":
+      return { block: true, reason: "会话已更换或该层已关闭，未启动子进程。" };
+    case "disabled":
+      return disabledRefusal(dispatch, failure.available);
+    case "unregistered":
+      return unregisteredRefusal(dispatch, snapshot);
+    case "unknown-count":
+      return unreadableCountRefusal(dispatch, failure.limit, failure.reason);
+    case "over-ceiling":
+      return overLimitRefusal(dispatch, failure.limit, failure.occupancy);
+  }
+}
+
+/**
+ * Render one admission failure for a batch.
+ *
+ * A batch has one fact a single dispatch does not: how many it wanted. Saying so is the difference
+ * between "you are full" and "you asked for four with room for two".
+ */
+function fanoutRefusalFor(
+  failure: AdmitFailure,
+  entry: { count: number; kind: string; agent: string },
+  snapshot: Snapshot | null,
+): Refusal | undefined {
+  const dispatch: KindDispatch = { agent: entry.agent, kind: entry.kind, async: true };
+  if (failure.code !== "over-ceiling") return refusalForFailure(failure, dispatch, snapshot);
+  return {
+    block: true,
+    reason: [
+      `这个 coworkflow.fanout 要启动 ${failure.requested} 个 ${kindLabel(entry.agent, entry.kind)}，但本项目的上限是 ${failure.limit}，当前已有 ${failure.occupancy} 个在运行。`,
+      `整批被拦下，本次调用没有启动任何子进程：workflow 要么全跑要么不跑，只启动一部分比一个都不启动更糟。`,
+      `请减少该 kind 的任务数、等其中一个结束，或在 /Coworkflow:settings 里调高 ${entry.kind} 的上限。要用排队替代整批拒绝，请改用 coworkflow.dispatch。`,
+    ].join(""),
+  };
 }
 
 /**
@@ -582,6 +673,101 @@ function kindModelSuffix(entry: { model?: string; thinking?: string }): string {
  * reported as such rather than as "over the limit" when both could be said.
  */
 /**
+ * Why a dispatch was refused, as data.
+ *
+ * Data and not a message: three call sites now ask the same question (a direct dispatch, a batch, and
+ * the queued channel), and the wording differs per shape — a batch must say "整批被拦下", a queued
+ * launch must say "留在这里等名额". One decision, three renderings, so the three can never disagree
+ * about whether a kind was disabled or merely full.
+ */
+export type AdmitFailure =
+  | { code: "session-gone" }
+  | { code: "disabled"; available: string[] }
+  | { code: "unregistered" }
+  | { code: "unknown-count"; limit: number; reason: string }
+  | { code: "over-ceiling"; limit: number; occupancy: number; requested: number };
+
+export type AdmitResult =
+  | { ok: true; kind: string; policy: ResolvedAgentKind; config: WorkflowConfig | null }
+  | { ok: false; failure: AdmitFailure };
+
+/**
+ * The one admission decision every launch goes through.
+ *
+ * Reads at call time: the session and project switches, the project's kind policy from disk, the
+ * registration snapshot, and the owner's live count. Order is deliberate — session gone, disabled,
+ * unregistered, then count — because each is a cheaper and more specific reason than the next, and
+ * an unregistered kind is reported as such rather than as "over the limit" when both could be said.
+ *
+ * `count` is how many launches the caller intends to start right now. A batch passes its size so the
+ * whole batch is admitted or refused together; the queued channel passes 1 per launch so each one is
+ * decided against what is running at that moment.
+ *
+ * Every public read happens here and nowhere else: a second reader is how two paths end up counting
+ * the same launch twice.
+ */
+export async function admitOne(
+  host: PiRuntimeHost,
+  state: State,
+  runtime: RuntimeContext,
+  request: { kind: string; count?: number },
+): Promise<AdmitResult> {
+  const count = request.count ?? 1;
+  const on = (): boolean => !runtime.isChild && runtime.enabled && runtime.control.moduleEnabled("agent-kinds");
+  const fail = (failure: AdmitFailure): AdmitResult => ({ ok: false, failure });
+
+  const readPolicy = (): { kinds: ResolvedAgentKind[]; policy: ResolvedAgentKind | undefined; config: WorkflowConfig | null } => {
+    const root = runtime.configRoots.root(runtime.cwd);
+    const config = root === null ? null : readConfig(root);
+    const kinds = resolveKinds(config, readKindDefinitions(root).definitions);
+    return { kinds, policy: kinds.find((entry) => entry.kind === request.kind), config };
+  };
+
+  await state.pending;
+  if (!on()) return fail({ code: "session-gone" });
+
+  const current = readPolicy();
+  if (current.policy === undefined) return fail({ code: "unregistered" });
+  if (!current.policy.enabled) {
+    return fail({ code: "disabled", available: availableKinds(current.kinds, state.snapshot) });
+  }
+  // Enabled but not in the owner's list: a contract that could not be reached, a collision, a
+  // missing asset. Refusing says so; admitting would start nothing.
+  const snapshot = state.snapshot;
+  const registeredSnapshot =
+    snapshot !== null && snapshot.contractFailure === undefined &&
+    snapshot.registered.some((entry) => entry.kind === request.kind);
+  if (!registeredSnapshot) return fail({ code: "unregistered" });
+
+  const epoch = runtime.sessionEpoch;
+  // One client, one serialized read queue, shared with the project-wide capacity gate.
+  const bridge = attachSubagents(host, { epoch, events: host.events });
+  state.attached = true;
+  const observed = await bridge.agentCount(current.policy.agent);
+  // A count that lands after the session moved belongs to a session that is gone.
+  if (!on() || runtime.sessionEpoch !== epoch) return fail({ code: "session-gone" });
+
+  // Re-read after the public read: a toggle during it must decide this dispatch.
+  const late = readPolicy();
+  if (late.policy === undefined) return fail({ code: "unregistered" });
+  if (!late.policy.enabled) {
+    return fail({ code: "disabled", available: availableKinds(late.kinds, state.snapshot) });
+  }
+  if (observed.kind === "unknown") {
+    return fail({ code: "unknown-count", limit: late.policy.maxConcurrent, reason: observed.reason });
+  }
+  if (observed.count + count > late.policy.maxConcurrent) {
+    return fail({
+      code: "over-ceiling",
+      limit: late.policy.maxConcurrent,
+      occupancy: observed.count,
+      requested: count,
+    });
+  }
+  return { ok: true, kind: late.policy.kind, policy: late.policy, config: late.config };
+}
+
+/**
  * The decision for a `coworkflow.fanout` call.
  *
  * The workflow resolver already refuses a batch that alone exceeds a kind's ceiling, but a fanout
@@ -625,49 +811,20 @@ async function gateFanout(
   );
   if (own.length === 0) return;
 
-  const decide = (): Refusal | undefined => {
-    const snapshot = state.snapshot;
-    const live = snapshot === null || snapshot.contractFailure !== undefined
-      ? null
-      : new Set(snapshot.registered.map((entry) => entry.kind));
-    const available = availableKinds(kinds, snapshot);
-    for (const { kind, agent, policy } of own) {
-      const dispatch = { agent, kind, async: true } satisfies KindDispatch;
-      if (!policy.enabled) return disabledRefusal(dispatch, available);
-      if (live === null || !live.has(kind)) return unregisteredRefusal(dispatch, snapshot);
-    }
-    return undefined;
-  };
-
-  const first = decide();
-  if (first !== undefined) return first;
-
-  const epoch = runtime.sessionEpoch;
-  const bridge = attachSubagents(host, { epoch, events: host.events });
-  state.attached = true;
-  for (const { count, policy, kind } of own) {
-    const observed = await bridge.agentCount(policy.agent);
-    if (!on() || runtime.sessionEpoch !== epoch) {
-      return { block: true, reason: "会话已更换或该层已关闭，未启动子进程。" };
-    }
-    const late = decide();
-    if (late !== undefined) return late;
-    if (observed.kind === "unknown") {
-      return unreadableCountRefusal({ agent: policy.agent, kind, async: true }, policy.maxConcurrent, observed.reason);
-    }
-    if (observed.count + count > policy.maxConcurrent) {
-      return {
-        block: true,
-        reason: [
-          `这个 coworkflow.fanout 要启动 ${count} 个 ${kindLabel(policy.agent, kind)}，但本项目的上限是 ${policy.maxConcurrent}，当前已有 ${observed.count} 个在运行。`,
-          `整批被拦下，本次调用没有启动任何子进程：workflow 要么全跑要么不跑，只启动一部分比一个都不启动更糟。`,
-          `请减少该 kind 的任务数、等其中一个结束，或在 /Coworkflow:settings 里调高 ${kind} 的上限。`,
-        ].join(""),
-      };
-    }
+  // One launch at a time through the single admission authority, so a batch cannot be admitted by
+  // a different rule than a direct dispatch — and a refused batch still starts nothing.
+  for (const entry of own) {
+    const admitted = await admitOne(host, state, runtime, { kind: entry.kind, count: entry.count });
+    if (admitted.ok) continue;
+    return fanoutRefusalFor(admitted.failure, entry, state.snapshot);
   }
-  // Admitted: it must not block the main session.
-  if (forceBackground(input)) state.forcedBackground += 1;
+
+  // Admitted: the same defaults as a single dispatch, so a batch does not need a different story.
+  const fanoutRoot = runtime.configRoots.root(runtime.cwd);
+  countDefaults(
+    state,
+    applyDispatchDefaults(input, fanoutRoot === null ? undefined : readConfig(fanoutRoot)?.subagentRunBudgetMs),
+  );
   return;
 }
 
@@ -718,57 +875,13 @@ async function gate(
   if (kind === null) return;
 
   const dispatch: KindDispatch = { ...decoded, kind };
-  /** Whether the owner accepted this kind in this session (not merely "was asked to"). */
-  const registered = (): boolean => {
-    const snapshot = state.snapshot;
-    return snapshot !== null && snapshot.contractFailure === undefined &&
-      snapshot.registered.some((entry) => entry.kind === dispatch.kind);
-  };
-  const decide = (): Refusal | undefined => {
-    const { kinds, policy } = policyOf();
-    if (policy === undefined) return unregisteredRefusal(dispatch, state.snapshot);
-    if (!policy.enabled) return disabledRefusal(dispatch, availableKinds(kinds, state.snapshot));
-    return undefined;
-  };
+  // Every launch, wherever it starts, asks this one question.
+  const admitted = await admitOne(host, state, runtime, { kind: dispatch.kind, count: 1 });
+  if (!admitted.ok) return refusalForFailure(admitted.failure, dispatch, state.snapshot);
 
-  // A pass may still be landing (the contract import is awaited), and a session
-  // start — or a toggle just made in `/Coworkflow:settings` — can dispatch before it
-  // lands. Waiting for that pass is the only way this decision is about the real
-  // state instead of a snapshot from before the change.
-  await state.pending;
-  if (!on()) return;
-
-  const first = decide();
-  if (first !== undefined) return first;
-  // Enabled but not in the owner's list: a contract that could not be reached, a
-  // collision, a missing asset. Refusing says so; admitting would start nothing.
-  if (!registered()) return unregisteredRefusal(dispatch, state.snapshot);
-
-  const epoch = runtime.sessionEpoch;
-  // The bridge is shared with the capacity gate: one client, one serialized read
-  // queue, so a per-kind check and the project-wide check never count the same
-  // launch twice or disagree about what the owner reported.
-  const bridge = attachSubagents(host, { epoch, events: host.events });
-  state.attached = true;
-  const observed = await bridge.agentCount(dispatch.agent);
-  // A count that lands after the session moved belongs to a session that is gone.
-  if (!on() || runtime.sessionEpoch !== epoch) {
-    return { block: true, reason: "会话已更换或该层已关闭，未启动子进程。" };
-  }
-
-  // Re-read the policy after the public read: a toggle during it must decide this
-  // dispatch, and the number that applies is the one in force now.
-  const late = decide();
-  if (late !== undefined) return late;
-  const limit = policyOf().policy?.maxConcurrent;
-  if (limit === undefined) return unregisteredRefusal(dispatch, state.snapshot);
-  if (observed.kind === "unknown") return unreadableCountRefusal(dispatch, limit, observed.reason);
-  // `>=`: at the limit there is no room for one more, which is what the limit means.
-  if (observed.count >= limit) return overLimitRefusal(dispatch, limit, observed.count);
-
-  // Admitted: it must not block the main session. Same rewrite as the fanout path — one rule, one
-  // implementation, so a future dispatch shape cannot accidentally keep the old behaviour.
-  if (forceBackground(event.input)) state.forcedBackground += 1;
+  // Admitted: fill what the caller should not have to think about, and never let it block the
+  // main session. Both rewrites are project policy, applied in one place.
+  countDefaults(state, applyDispatchDefaults(event.input, admitted.config?.subagentRunBudgetMs));
   return;
 }
 
