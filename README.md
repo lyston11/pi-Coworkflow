@@ -453,7 +453,7 @@ worktree 是**已提交文件**的检出，而本包的 Trellis 状态（`.trell
 | `/Coworkflow:steer <runId> <说明>` | 追加指令，不杀进程 |
 
 `/Coworkflow:init` 的参数：`--enable/--disable <id,…>`、`--auto-enable on|off`、`--prefix <p>`、
-`--trellis-update`、`--no-trust`、`--dry-run`。
+`--no-trust`、`--dry-run`。
 
 ## 面板
 

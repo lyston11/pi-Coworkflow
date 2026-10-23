@@ -120,7 +120,6 @@ interface ParsedArgs {
   enable: string[];
   disable: string[];
   autoEnable?: boolean;
-  trellisUpdate?: boolean;
   /** Skip saving Pi's project-trust decision for this project. */
   noTrust?: boolean;
   error?: string;
@@ -152,12 +151,10 @@ function parseArgs(args: string): ParsedArgs {
       parsed.dry = true;
     } else if (word === "--no-trust") {
       parsed.noTrust = true;
-    } else if (word === "--trellis-update") {
-      parsed.trellisUpdate = true;
     } else if (withValue === undefined) {
       return {
         ...parsed,
-        error: `无法识别的参数：${word}（可用：--enable/--disable/--auto-enable/--prefix/--trellis-update/--dry-run）`,
+        error: `无法识别的参数：${word}（可用：--enable/--disable/--auto-enable/--prefix/--dry-run）`,
       };
     } else {
       const inline = word.startsWith(`${withValue}=`)
@@ -682,7 +679,6 @@ function runSetup(args: string, ctx: CommandContext, forceDry: boolean): string 
       prefix,
       dry,
       flags: {
-        trellisUpdate: parsed.trellisUpdate === true,
         ...(existing?.subagentConcurrency !== undefined
           ? { subagentConcurrency: existing.subagentConcurrency }
           : {}),
@@ -1426,7 +1422,7 @@ export default function coworkflowExtension(pi: PiRuntimeHost): void {
 
   pi.registerCommand?.(`${NS}:init`, {
     description:
-      `初始化/刷新本项目的 Coworkflow 层（模块：${moduleIds()}）；--enable/--disable <id,...> 改模块开关，--auto-enable on|off 改新会话是否自动加载，--trellis-update 已废弃（模板由本包渲染），--prefix <p> 改 worktree 前缀，--dry-run 只报告`,
+      `初始化/刷新本项目的 Coworkflow 层（模块：${moduleIds()}）；--enable/--disable <id,...> 改模块开关，--auto-enable on|off 改新会话是否自动加载，--prefix <p> 改 worktree 前缀，--dry-run 只报告`,
     handler: setupHandler(false),
   });
 

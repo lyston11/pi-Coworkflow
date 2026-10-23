@@ -18,8 +18,8 @@
  *     skipped, never rewritten (no mtime churn on a second init);
  *   - `.trellis/config.yaml` — the project's file: written only when absent,
  *     otherwise missing top-level keys are appended and existing values kept;
- *   - the project's records — `.trellis/tasks|spec|workspace|.runtime|.developer`
- *     and `.trellis/.template-hashes.json`: never written, never deleted.
+ *   - the project's records — `.trellis/tasks|spec|workspace|.runtime|.developer`:
+ *     never written, never deleted.
  *
  * Old installs are detected, not guessed at: `retireRoleAgents()` and a Pi block
  * that still dispatches `trellis-*` are the two markers of the pre-template
@@ -72,7 +72,6 @@ const PROJECT_OWNED = [
   ".trellis/workspace",
   ".trellis/.runtime",
   ".trellis/.developer",
-  ".trellis/.template-hashes.json",
   ".pi/Coworkflow.json",
   ".pi/settings.json",
 ];
@@ -620,9 +619,6 @@ export const trellisModule: WorkflowModule = {
     }
     ctx.report("ok", "模板源：本包 templates/trellis/（不调用 `trellis init` / `trellis update`）");
     renderTemplate(ctx);
-    if (ctx.options?.trellisUpdate === true) {
-      ctx.report("ok", "--trellis-update 已废弃：模板由本包渲染，不再需要 `trellis update`");
-    }
     probeOptionalCli(ctx);
   },
 };
