@@ -8,3 +8,11 @@ node_modules
 # Committing them would be a second copy of the same truth — edit templates/ instead,
 # and `/Coworkflow:init` writes them back.
 .agents/
+
+# Rendered from templates/trellis/dot-pi/ (byte-identical, checked by the golden test).
+# `.pi/Coworkflow.json`, `.pi/settings.json` and `.pi/agents/` are the project's own and
+# stay tracked: the first two decide whether this project adopts the workflow at all.
+.pi/extensions/
+.pi/prompts/
+.pi/Coworkflow/
+.pi/npm/

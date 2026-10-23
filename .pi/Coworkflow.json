@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "installedAt": "2026-10-22T09:02:07.786Z",
+  "worktreePrefix": "wt-",
+  "modules": {
+    "trellis": true,
+    "worktree": true,
+    "agents": true,
+    "subagents": true,
+    "subagent-context": true,
+    "agent-kinds": true,
+    "lane-worktree": true,
+    "capacity": true,
+    "panel": true
+  },
+  "agentKinds": {
+    "executor": {
+      "enabled": true,
+      "maxConcurrent": 5
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "enableSkillCommands": true,
+  "extensions": [
+    "./extensions/trellis/index.ts"
+  ],
+  "prompts": [
+    "./prompts"
+  ],
+  "subagents": {
+    "defaultModel": "clinepass/cline-pass/deepseek-v4.1-flash-1017",
+    "defaultProvider": "clinepass",
+    "projectRootResolution": "git-root",
+    "defaultThinking": "high"
+  },
+  "packages": []
+}
