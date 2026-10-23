@@ -70,6 +70,9 @@ import {
 import { readKindDefinitions } from "./definitions.ts";
 import { registerKindPort } from "./port.ts";
 import { FANOUT_NAME, type FanoutPolicy } from "../../core/subagents-workflow.ts";
+
+/** The owner's built-in parallel workflow: `{ tasks: [{ agent, task }] }`. */
+const PARALLEL_WORKFLOW = "parallel";
 import { KIND_PREFIX } from "../../core/config.ts";
 import {
   kindRegistryFor,
@@ -263,7 +266,11 @@ export function forceBackground(input: unknown): boolean {
 export function decodeFanoutCall(input: unknown): { kind: string; count: number }[] | null {
   if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
   const call = input as Record<string, unknown>;
-  if (call.workflow !== FANOUT_NAME) return null;
+  // Two shapes carry a batch, and both have to be seen. Ours names `kind`; the owner's own
+  // `parallel` workflow names `agent`, which is how a real session on this package dispatched ten
+  // cw-executor children while the per-kind ceiling silently never ran: the gate only recognised
+  // its own workflow, so the path it did not recognise was the path that skipped the limit.
+  if (call.workflow !== FANOUT_NAME && call.workflow !== PARALLEL_WORKFLOW) return null;
   const args = call.args;
   if (args === null || typeof args !== "object" || Array.isArray(args)) return null;
   const tasks = (args as Record<string, unknown>).tasks;
@@ -271,8 +278,16 @@ export function decodeFanoutCall(input: unknown): { kind: string; count: number 
   const counts = new Map<string, number>();
   for (const task of tasks) {
     if (task === null || typeof task !== "object") continue;
-    const kind = (task as Record<string, unknown>).kind;
-    if (typeof kind === "string" && kind) counts.set(kind, (counts.get(kind) ?? 0) + 1);
+    const entry = task as Record<string, unknown>;
+    // Either spelling identifies the same kind; `gateFanout` resolves whichever came through against
+    // the project's table, so an agent name that is not a kind is simply not ours.
+    const name =
+      typeof entry.kind === "string" && entry.kind
+        ? entry.kind
+        : typeof entry.agent === "string" && entry.agent
+          ? entry.agent
+          : "";
+    if (name) counts.set(name, (counts.get(name) ?? 0) + 1);
   }
   return counts.size === 0 ? null : [...counts].map(([kind, count]) => ({ kind, count }));
 }
@@ -590,20 +605,27 @@ async function gateFanout(
   await state.pending;
   if (!on()) return;
 
+  // One normalisation for the whole function. A batch item arrives as a kind ("executor") from this
+  // package's own workflow and as an agent name ("cw-executor") from the owner's `parallel` one;
+  // resolving in one place is what keeps both loops below from silently looking up the wrong name —
+  // which is exactly how the owner's workflow escaped the ceiling the first time.
+  const entries = batch.map(({ kind: named, count }) => {
+    const policy = kinds.find((entry) => entry.kind === named) ?? kinds.find((entry) => entry.agent === named);
+    const kind = policy?.kind ?? named;
+    return { count, policy, kind, agent: policy?.agent ?? agentNameFor(kind) };
+  });
+
   const decide = (): Refusal | undefined => {
     const snapshot = state.snapshot;
     const live = snapshot === null || snapshot.contractFailure !== undefined
       ? null
       : new Set(snapshot.registered.map((entry) => entry.kind));
     const available = availableKinds(kinds, snapshot);
-    for (const { kind, count } of batch) {
-      const policy = kinds.find((entry) => entry.kind === kind);
-      const agent = policy?.agent ?? agentNameFor(kind);
+    for (const { kind, agent, policy } of entries) {
       const dispatch = { agent, kind, async: true } satisfies KindDispatch;
       if (policy === undefined) return unregisteredRefusal(dispatch, snapshot);
       if (!policy.enabled) return disabledRefusal(dispatch, available);
       if (live === null || !live.has(kind)) return unregisteredRefusal(dispatch, snapshot);
-      void count;
     }
     return undefined;
   };
@@ -614,8 +636,7 @@ async function gateFanout(
   const epoch = runtime.sessionEpoch;
   const bridge = attachSubagents(host, { epoch, events: host.events });
   state.attached = true;
-  for (const { kind, count } of batch) {
-    const policy = kinds.find((entry) => entry.kind === kind);
+  for (const { count, policy, kind } of entries) {
     if (policy === undefined) continue;
     const observed = await bridge.agentCount(policy.agent);
     if (!on() || runtime.sessionEpoch !== epoch) {

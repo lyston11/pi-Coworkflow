@@ -46,7 +46,7 @@ import {
   loadRuntimeAgentContract,
   type DesiredKind,
 } from "../modules/agent-kinds/registration.ts";
-import { agentKindsModule, decodeKindDispatch, kindRegistrationPlan, resolveDispatchKind, syncAgentKinds } from "../modules/agent-kinds/index.ts";
+import { agentKindsModule, decodeFanoutCall, decodeKindDispatch, kindRegistrationPlan, resolveDispatchKind, syncAgentKinds } from "../modules/agent-kinds/index.ts";
 import { capacityModule } from "../modules/capacity/index.ts";
 
 const here = (rel: string): string => new URL(rel, import.meta.url).pathname;
@@ -1070,6 +1070,32 @@ test("kinds: every kind starts enabled with the same ceiling", () => {
  * ceiling of five leaves room for two, and a fanout of three would overshoot even though three is
  * under five.
  */
+test("gate: the same ceiling holds for the owner's parallel workflow", { skip }, async () => {
+  // The regression that matters: a live session on this package dispatched ten cw-executor children
+  // through `{ workflow: "parallel", args: { tasks: [{ agent: "cw-executor", … }] } }`, and the gate
+  // did not see it because it only recognised its own workflow. Driving the production gate here, not
+  // just the decoder, is the whole point.
+  const harness = gateHarness({ kinds: { executor: { maxConcurrent: 5 } } });
+  try {
+    const parallel = (count: number) => ({
+      workflow: "parallel",
+      args: { tasks: Array.from({ length: count }, (_, i) => ({ agent: "cw-executor", task: `t${i}` })) },
+    });
+    harness.live.push("cw-executor", "cw-executor", "cw-executor");
+    assert.equal(await harness.call(parallel(2)), undefined, "within the ceiling, the gate stays out of it");
+
+    harness.live.push("cw-executor");
+    const over = await harness.call(parallel(2));
+    assert.ok(over, "six against a ceiling of five with four running must be refused");
+    const reason = String(over.reason ?? "");
+    assert.match(reason, /要启动 2 个/);
+    assert.match(reason, /上限是 5/);
+    assert.match(reason, /整批被拦下/, "a workflow is all-or-nothing");
+  } finally {
+    harness.close();
+  }
+});
+
 test("gate: a fanout respects the kind ceiling including what is already running", { skip }, async () => {
   const harness = gateHarness({ kinds: { executor: { maxConcurrent: 5 } } });
   try {
@@ -1151,4 +1177,38 @@ test("gate: a foreground dispatch is put in the background, and the rewrite is r
   } finally {
     harness.close();
   }
+});
+
+/**
+ * The owner's own parallel workflow dispatches kinds too, and it bypassed the ceiling.
+ *
+ * Found on a live machine: a session dispatched ten `cw-executor` children through
+ * `subagent({ workflow: "parallel", args: { tasks: [{ agent: "cw-executor", … }] } })` — the gate only
+ * recognised `coworkflow.fanout`, so the recommended path enforced the per-kind limit and the path the
+ * model actually chose did not. A limit that the most convenient dispatch shape skips is not a limit.
+ */
+test("gate: the owner's parallel workflow is measured by the same per-kind ceiling", () => {
+  const parallel = (agents: string[]): unknown => ({
+    workflow: "parallel",
+    args: { tasks: agents.map((agent, i) => ({ agent, task: `t${i}` })) },
+  });
+  // Five executors is the ceiling; six must be seen and refused.
+  assert.deepEqual(decodeFanoutCall(parallel(["cw-executor", "cw-executor"])), [
+    { kind: "cw-executor", count: 2 },
+  ]);
+  const six = decodeFanoutCall(parallel(Array.from({ length: 6 }, () => "cw-executor")));
+  assert.deepEqual(six, [{ kind: "cw-executor", count: 6 }], "the batch size is visible");
+
+  // Our own shape still decodes, and non-kind agents in a parallel batch are not ours.
+  assert.deepEqual(decodeFanoutCall({ workflow: "coworkflow.fanout", args: { tasks: [{ kind: "auditor" }] } }), [
+    { kind: "auditor", count: 1 },
+  ]);
+  assert.deepEqual(decodeFanoutCall(parallel(["trellis-check", "worker"])), [
+    { kind: "trellis-check", count: 1 },
+    { kind: "worker", count: 1 },
+  ], "it reports what it saw; resolving against the table is the gate's job");
+
+  // Anything that is not a batch is not this gate's business.
+  assert.equal(decodeFanoutCall({ workflow: "parallel", args: {} }), null);
+  assert.equal(decodeFanoutCall({ workflow: "other", args: { tasks: [{ agent: "cw-executor" }] } }), null);
 });
