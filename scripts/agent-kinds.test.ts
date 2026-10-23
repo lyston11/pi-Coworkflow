@@ -28,7 +28,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { readConfig, createConfigRootResolver, type WorkflowConfig } from "../core/config.ts";
-import { checkpointFor } from "../core/subagents-workflow.ts";
+import { checkpointFor, FANOUT_NAME } from "../core/subagents-workflow.ts";
 import { exportEntry } from "../core/subagents-workflow.ts";
 import {
   BUILTIN_KINDS,
@@ -48,7 +48,7 @@ import {
   loadRuntimeAgentContract,
   type DesiredKind,
 } from "../modules/agent-kinds/registration.ts";
-import { agentKindsModule, decodeFanoutCall, decodeKindDispatch, kindRegistrationPlan, resolveDispatchKind, syncAgentKinds } from "../modules/agent-kinds/index.ts";
+import { agentKindsModule, decodeFanoutCall, decodeKindDispatch, decodeUngovernedLaunch, kindRegistrationPlan, resolveDispatchKind, syncAgentKinds } from "../modules/agent-kinds/index.ts";
 import { capacityModule } from "../modules/capacity/index.ts";
 
 const here = (rel: string): string => new URL(rel, import.meta.url).pathname;
@@ -764,6 +764,101 @@ test("gate decoder: only a work-starting call is ours; the kind comes from the t
   const unknown = decodeKindDispatch({ agent: "cw-unknown", task: "x" });
   assert.ok(unknown, "the prefix is in this package's namespace");
   assert.equal(resolveDispatchKind(unknown!.agent, resolveKinds(null)), null, "but no kind claims it");
+});
+
+/**
+ * The boundary this task exists for: a child started *inside a script* is not a child this package can
+ * admit, and saying so is the difference between a stated boundary and a gate that claims coverage it
+ * does not have.
+ */
+test("boundary decoder: only the two documented script spellings are ungovernable, never a named resource", () => {
+  const launching = "const a = await runs.run('a', { agent: 'cw-executor', task: 'x' });";
+  const reads = (script: string): string | null =>
+    script === "./workflows/launch.js" || script === "/abs/launch.js"
+      ? launching
+      : script === "./workflows/pure.js"
+        ? "return runs; // mentions the namespace but starts nothing"
+        : null;
+
+  assert.deepEqual(decodeUngovernedLaunch({ workflow: true }, reads), { shape: "inline-script" });
+  assert.deepEqual(
+    decodeUngovernedLaunch({ workflow: "./workflows/launch.js" }, reads),
+    { shape: "script-file", script: "./workflows/launch.js" },
+  );
+  assert.deepEqual(
+    decodeUngovernedLaunch({ workflow: "/abs/launch.js", async: true }, reads),
+    { shape: "script-file", script: "/abs/launch.js" },
+    "an absolute path is still a script file",
+  );
+
+  for (const input of [
+    // Every named resource: our own fanout, the owner's parallel batch, another extension's workflow,
+    // a bare name. Upstream's rule is a `/` that makes a string a file path, so these are not scripts.
+    { workflow: "parallel", args: { tasks: [{ agent: "worker", task: "x" }] } },
+    { workflow: FANOUT_NAME, args: { tasks: [{ kind: "executor", task: "x" }] } },
+    { workflow: "someone.else" },
+    // A script that starts nothing of its own, and one we cannot read: unknown is not evidence.
+    { workflow: "./workflows/pure.js" },
+    { workflow: "./workflows/missing.js" },
+    // No action at all is what this decoder looks at, so nothing is a new launch.
+    { action: "status" },
+    { action: "validate", workflow: true },
+    { action: "stop", workflow: "./workflows/launch.js" },
+    // A direct dispatch carries no `workflow` at all.
+    { agent: "cw-executor", task: "x" },
+    {},
+    null,
+    "subagent",
+    ["workflow"],
+  ]) {
+    assert.equal(decodeUngovernedLaunch(input, reads), null, JSON.stringify(input) ?? "undefined");
+  }
+});
+
+test("gate: a script-internal launch is refused and told to use coworkflow.dispatch", { skip }, async () => {
+  const h = gateHarness();
+  try {
+    await syncAgentKinds(h.host, h.runtime);
+    const before = h.requests.length;
+
+    // The code-block form: nothing in the payload carries the script, so the shape is refused as such.
+    const inline = await h.call({ workflow: true, args: { whatever: true } });
+    assert.ok(inline, "a code-block workflow escapes every admission this package has");
+    assert.match(inline.reason ?? "", /不经过本包的准入/);
+    assert.match(inline.reason ?? "", /coworkflow\.dispatch/);
+    assert.match(inline.reason ?? "", /没有启动任何子进程/);
+
+    // The script-path form: the file is read, and only a script that actually starts children is refused.
+    writeFileSync(
+      join(h.root, "launch.js"),
+      "const a = await runs.run('a', { agent: 'cw-executor', task: 'x' });\nreturn a;",
+    );
+    writeFileSync(join(h.root, "pure.js"), "return runs.all.length; // no launch call here");
+    const file = await h.call({ workflow: "./launch.js", args: {} });
+    assert.ok(file, "a script that starts its own children is the shape this gate cannot admit");
+    assert.match(file.reason ?? "", /runs\.run/);
+    assert.match(file.reason ?? "", /coworkflow\.dispatch/);
+    assert.equal(await h.call({ workflow: "./pure.js" }), undefined, "a script that starts nothing is not refused");
+    assert.equal(await h.call({ workflow: "./absent.js" }), undefined, "an unreadable script is unknown, not a guess");
+
+    assert.equal(h.requests.length, before, "the boundary decision costs no public read");
+
+    // The boundary is not a policy on ordinary dispatching: a named batch and a direct call still pass,
+    // and the owner's `parallel` batch of agents that are not kinds is not this gate's business at all.
+    assert.equal(
+      await h.call({ workflow: "parallel", args: { tasks: [{ agent: "worker", task: "x" }] } }),
+      undefined,
+      "an ordinary parallel batch of someone else's agents is untouched",
+    );
+    assert.equal(await h.call({ agent: "trellis-implement", task: "work" }), undefined);
+    assert.equal(await h.call({ agent: "cw-executor", task: "one" }), undefined, "a direct dispatch of a kind is still admitted");
+
+    // With the layer off, nothing about this package's boundary applies.
+    h.setModule(false);
+    assert.equal(await h.call({ workflow: true }), undefined);
+  } finally {
+    h.close();
+  }
 });
 
 test("gate: a disabled kind is refused, and the reason names only kinds that really exist", { skip }, async () => {

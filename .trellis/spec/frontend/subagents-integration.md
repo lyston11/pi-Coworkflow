@@ -30,6 +30,16 @@ Serial dispatch of independent work is a defect this layer *measures*, not one i
 
 The conversation-injected reminder this replaces was removed and must not return: a custom message reaches the model as a **user turn**, so it disrupts and rewrites the very work it describes.
 
+## What is governed
+
+Three launch points, one admission function. A direct `subagent` dispatch of a kind, a `coworkflow.fanout` batch, and a `coworkflow.dispatch` work unit all ask `admitOne()` — the only place a kind's switch, registration and live ceiling are read. `admitOne` is exported by `modules/agent-kinds/index.ts`; no other code path counts occupancy or re-reads the policy for a launch. The `coworkflow.fanout` resolver still refuses a batch that alone exceeds a ceiling, and the gate refuses one that does not fit what is already running, but both decisions come from the same function so a batch and a single dispatch cannot disagree about what "disabled" or "full" means.
+
+What is **not** governed, stated rather than implied:
+
+- **A script's own children.** `workflow: true` (the script in that reply's code block) and a `workflow` string containing `/` (a script file) start children through the owner's `runs.run`/`runs.all`/`runs.lanes` inside the workflow sandbox. No `tool_call` of ours is in that path, so those launches are neither counted nor blocked. The gate refuses the two shapes it can identify — `workflow: true`, and a script file whose text (bounded read) contains a launch call — with a reason that says the launch skips admission and names `coworkflow.dispatch`. A named resource (`parallel`, another extension's workflow) is not a script and is judged by its arguments; `parallel` remains admitted per kind. An unreadable script file is unknown, not evidence, and passes through.
+- **Other processes and third-party extensions.** Anything launched outside this session's `tool_call` — another extension's own code, a shell, a separate Pi process — never reaches this extension.
+- **Upstream RPC called directly.** `subagents:rpc:v1` `spawn` is public and callable by anyone; this package's admission runs at its own launch boundaries, not inside the owner. It is not global capacity authority and does not claim to be.
+
 ## Public capability floor and failure handling
 
 Use documented `subagents:rpc:v1` with UUID-correlated requests for `ping`, `status`, `spawn`, and `cost`; verify protocol version, advertised method and capability shape, and versioned fleet/status projections. Session-local async completion events provide attribution when supported. Workflow-resource and required-child-extension registration use only their documented package exports, without loading the package main runtime or installing another copy. Capability floor is detected from live public advertisements and exported API availability, not inferred from semver alone.

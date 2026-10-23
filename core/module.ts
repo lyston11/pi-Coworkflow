@@ -278,6 +278,31 @@ export interface PiRuntimeHost {
   setModel?(model: unknown): Promise<boolean>;
   setThinkingLevel?(level: string): void;
   getThinkingLevel?(): string | undefined;
+  /**
+   * Register a model-callable tool for this session.
+   *
+   * Declared minimally — a name, a description, a JSON Schema for the parameters and an
+   * `execute` — because that is all this package uses. Registering the same name again
+   * replaces the earlier registration, which is what makes activation idempotent.
+   */
+  registerTool?(definition: {
+    name: string;
+    label: string;
+    description: string;
+    parameters: Record<string, unknown>;
+    execute(
+      toolCallId: string,
+      params: unknown,
+      signal?: unknown,
+      onUpdate?: unknown,
+      ctx?: unknown,
+    ): Promise<{
+      content: { type: "text"; text: string }[];
+      details?: unknown;
+      structuredContent?: unknown;
+      isError?: boolean;
+    }>;
+  }): void;
 }
 
 /** What a module needs to know about the session it is activating in. */

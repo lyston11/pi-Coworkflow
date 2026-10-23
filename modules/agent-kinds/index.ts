@@ -42,6 +42,17 @@
  *     The gate is not a policy on the model's choices; it is a refusal of two
  *     specific ones.
  *
+ * ## The stated boundary
+ *
+ * A child started *inside a workflow script* is not a child any `tool_call` of ours
+ * decides: the script calls the owner's `runs.run` from the sandbox. That is refused
+ * where it can be identified — `workflow: true`, or a script file whose text contains a
+ * launch call — with a reason that says it skips admission and names
+ * `coworkflow.dispatch`, the channel that does queue and admit. Named resources are
+ * judged by their arguments; an unreadable script is unknown and passes through.
+ * Claiming coverage of a path we cannot see would be the dishonest half-degradation
+ * this module exists to remove.
+ *
  * ## Honest degradation
  *
  * When the installed owner exports no compatible registration contract, nothing is
@@ -49,6 +60,9 @@
  * never reported as available: the failure mode this rule exists for is a gate
  * that quietly does nothing while the panel claims otherwise.
  */
+
+import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { isAbsolute, resolve as resolvePath } from "node:path";
 
 import type { PiRuntimeHost, RuntimeContext, Unsubscribe, WorkflowModule } from "../../core/module.ts";
 import { readConfig, type ResolvedAgentKind, type WorkflowConfig } from "../../core/config.ts";
@@ -78,6 +92,14 @@ import {
 
 /** The owner's built-in parallel workflow: `{ tasks: [{ agent, task }] }`. */
 const PARALLEL_WORKFLOW = "parallel";
+
+/**
+ * The replacement a refusal names: one call, every work unit, queued by kind ceiling.
+ *
+ * A constant because the refusal wording is the whole point of this boundary — a gate that says
+ * "no" without saying where to go sends the model looking for another ungoverned shape.
+ */
+export const DISPATCH_TOOL = "coworkflow.dispatch";
 import { KIND_PREFIX } from "../../core/config.ts";
 import {
   kindRegistryFor,
@@ -330,6 +352,99 @@ export function decodeFanoutCall(input: unknown): { kind: string; count: number 
 }
 
 /**
+ * A `subagent` call that starts its own children from JavaScript this package never sees.
+ *
+ * Two shapes, and both are upstream's own documented spellings rather than a guess about payloads:
+ * a `workflow: true` request means "run the script in this reply's code block", and a `workflow`
+ * string containing `/` means "run this script file" (any other string is a named resource). Only
+ * the second can be looked at before the call is admitted, so only it can be told apart from a
+ * script that starts nothing.
+ */
+export type UngovernedLaunch =
+  | { shape: "inline-script" }
+  | { shape: "script-file"; script: string };
+
+/** The calls a workflow script makes to start children itself. */
+const SCRIPT_LAUNCH = /\bruns\s*\.\s*(?:run|all|lanes)\s*\(/;
+
+/** How much of a script file is read to decide. A launch call beyond this is not identified. */
+const SCRIPT_READ_BYTES = 256 * 1024;
+
+/**
+ * Decode a `subagent` call whose children are started inside a script, or `null` for everything else.
+ *
+ * Why this is a refusal boundary at all: a script starts its children through the owner's own
+ * `runs.run`, in the workflow sandbox, and no `tool_call` of ours is in that path. A kind's switch and
+ * ceiling therefore cannot decide those launches — the work goes out uncounted and unblocked, which is
+ * exactly the "claims to gate, does not gate" state this module exists to remove. The honest move is to
+ * say so and name the channel that *is* admitted.
+ *
+ * What this function deliberately does **not** do:
+ *
+ *   - no `action` at all is refused: `status`/`stop`/`list`/`create` manage work, `validate` (which may
+ *     legitimately carry `workflow: true` or a path) starts none, and `resume` continues a run that was
+ *     already admitted.
+ *   - a named resource (`parallel`, another extension's workflow) is not a script: it has its own
+ *     arguments to decode, and `parallel` is decoded and admitted per kind elsewhere.
+ *   - a script that is unreadable, or readable and calls none of `runs.run`/`runs.all`/`runs.lanes`, is
+ *     passed through. Unknown is not evidence: refusing here would block a script that runs nothing,
+ *     which is worse than the hole this closes.
+ *
+ * The reader is injected so the decision is a pure function of the payload plus what the file says.
+ */
+export function decodeUngovernedLaunch(
+  input: unknown,
+  readScript: (script: string) => string | null,
+): UngovernedLaunch | null {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
+  const call = input as Record<string, unknown>;
+  const action = typeof call.action === "string" ? call.action.trim() : "";
+  if (action) return null;
+
+  const workflow = call.workflow;
+  // The code-block form. Nothing in the payload carries the script, so there is nothing to inspect at
+  // `tool_call` time — the shape is ungovernable whether or not that block happens to start children.
+  if (workflow === true) return { shape: "inline-script" };
+
+  // Upstream's rule, restated so this stays a shape check: a string with `/` is a script file, any
+  // other string is a named resource. Guessing beyond that ("looks like a filename") is the heuristic
+  // this boundary promises not to use.
+  if (typeof workflow !== "string" || !workflow.includes("/")) return null;
+  const script = readScript(workflow);
+  if (script === null || !SCRIPT_LAUNCH.test(script)) return null;
+  return { shape: "script-file", script: workflow };
+}
+
+/**
+ * A bounded, failure-tolerant read of a script path, relative to the request's own `cwd`.
+ *
+ * Bounded because a script is a small file and the gate runs on every dispatch; tolerant because a
+ * missing or unreadable path is not this gate's error to report — it is `null`, which
+ * `decodeUngovernedLaunch` reads as "not identified" and passes through to the owner, which is the
+ * component that actually owns script resolution and reports a bad path.
+ */
+export function readScriptForGate(
+  script: string,
+  cwd: string,
+): string | null {
+  const path = isAbsolute(script) ? script : resolvePath(cwd, script);
+  let fd: number | null = null;
+  try {
+    const stat = statSync(path);
+    if (!stat.isFile()) return null;
+    const size = Math.min(stat.size, SCRIPT_READ_BYTES);
+    fd = openSync(path, "r");
+    const buffer = Buffer.alloc(size);
+    const read = readSync(fd, buffer, 0, size, 0);
+    return buffer.subarray(0, read).toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+/**
  * Which kind a dispatch names, resolved against the project's own table.
  *
  * Separate from `decodeKindDispatch` because the table needs a root and a read, and decoding
@@ -419,6 +534,29 @@ function unreadableCountRefusal(dispatch: KindDispatch, limit: number, reason: s
     `本项目给 ${kindLabel(dispatch.agent, dispatch.kind)} 设了并发上限 ${limit}，但无法确认现在有几个在运行：${reason}`,
     "为避免把上限变成一句空话，这次派单被拦下。请在 /Coworkflow:settings 里调高或调整该 kind 的上限，或确认 pi-subagents 提供 fleet 状态能力。",
   ], dispatch);
+}
+
+/**
+ * Refuse a launch this package cannot admit, and name the launch that it can.
+ *
+ * The two facts a reader needs are both here: *why* this shape escapes the gate (the children are
+ * started inside a script, so no `tool_call` of ours decides them), and *where to go instead*. A
+ * refusal that only says "no" is how a caller ends up hunting for the next ungoverned spelling.
+ */
+function ungovernedLaunchRefusal(launch: UngovernedLaunch): Refusal {
+  const shape = launch.shape === "inline-script"
+    ? "workflow: true（脚本写在回复的代码块里）"
+    : `workflow: "${launch.script}"（脚本文件里自己调用 runs.run）`;
+  return {
+    block: true,
+    reason: [
+      `这次 subagent 调用是脚本内自建启动（${shape}）：子进程由那段脚本自己启动，不经过本包的准入。`,
+      "每个 kind 的开关与并发上限都在准入里，所以这种形状派出去的工作既不会被上限挡住，也不会被计数——本包管不到它。",
+      `请改用 ${DISPATCH_TOOL}：一次交全部工作单元，按 kind 上限自动排队（完成一个自动放行下一个），依赖用 needs 表达，每次启动前都经同一处准入。`,
+      `只拒这种能识别的形状：直接派单、parallel 与 ${FANOUT_NAME} 批次照常放行。`,
+      "这次派单被拦下，没有启动任何子进程。",
+    ].join(""),
+  };
 }
 
 /** Count a rewrite: one un-blocked dispatch and the fields it had to fill are different facts. */
@@ -836,6 +974,21 @@ async function gate(
 ): Promise<Refusal | undefined> {
   const on = (): boolean => !runtime.isChild && runtime.enabled && runtime.control.moduleEnabled("agent-kinds");
   if (event?.toolName !== "subagent" || !on()) return;
+
+  // Before any decode that only knows our own shapes: a script launch carries neither `agent` nor
+  // `args.tasks`, so it would otherwise return here as "not this gate's business" — and that is
+  // precisely the path that leaves the ceiling uncounted. No public read is spent on the decision.
+  const request = event.input;
+  const requestCwd = request !== null && typeof request === "object" && !Array.isArray(request) &&
+      typeof (request as Record<string, unknown>).cwd === "string"
+    ? ((request as Record<string, unknown>).cwd as string)
+    : runtime.cwd;
+  const ungoverned = decodeUngovernedLaunch(
+    request,
+    (script) => readScriptForGate(script, requestCwd),
+  );
+  if (ungoverned !== null) return ungovernedLaunchRefusal(ungoverned);
+
   const fanout = decodeFanoutCall(event.input);
   const decoded = decodeKindDispatch(event.input);
   if (decoded === null && fanout === null) return;
@@ -985,6 +1138,18 @@ export function kindWorkflowAgents(
  */
 export function syncAgentKinds(host: PiRuntimeHost, runtime: RuntimeContext): Promise<void> {
   return schedule(host, runtime);
+}
+
+/**
+ * This host's admission state, for another launch path that must ask the same authority.
+ *
+ * The queued channel (`modules/dispatch`) admits one unit at a time through `admitOne()`, and
+ * `admitOne` decides from the registration snapshot this module owns. Exposing the state is
+ * what lets that channel ask the *same* question instead of rebuilding a second one — a
+ * reimplementation would drift the moment the gate's order or snapshot changes.
+ */
+export function agentKindsState(host: PiRuntimeHost): ReturnType<typeof stateFor> {
+  return stateFor(host);
 }
 
 export const agentKindsModule: WorkflowModule = {
