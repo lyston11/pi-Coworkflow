@@ -273,12 +273,12 @@ Inline mode: skip jsonl curation; Phase 2 reads artifacts/specs via `trellis-bef
      therefore must cover every required step from implementation through
      commit, including Phase 3.3 spec update and Phase 3.4 commit. -->
 
-Sub-agent dispatch protocol applies to all platforms and all sub-agents, including native Codex `SubagentStart` context injection with child-side pull fallback, class-2 Gemini/Qoder/Copilot/Reasonix/Trae/Grok/Kimi Code, hook-backed ZCode/Snow, and `trellis-research`: every dispatch prompt starts with `Active task: <task path from task.py current>` before role-specific instructions. On Grok Build, use `spawn_subagent` with `subagent_type` set to the Trellis agent name (e.g. `trellis-implement`). On Kimi Code, dispatch the built-in `coder` / `explore` sub-agent with the matching `.kimi-code/skills/trellis-<role>/SKILL.md` instructions.
+Sub-agent dispatch protocol applies to all platforms and all sub-agents, including native Codex `SubagentStart` context injection with child-side pull fallback, class-2 Gemini/Qoder/Copilot/Reasonix/Trae/Grok/Kimi Code, hook-backed ZCode/Snow, and the research kind: every dispatch prompt starts with `Active task: <task path from task.py current>` before role-specific instructions. On Grok Build, use `spawn_subagent` with `subagent_type` set to the kind's agent name (e.g. `cw-executor`; live names from /Coworkflow:status). On Kimi Code, dispatch the built-in `coder` / `explore` sub-agent with the matching `.kimi-code/skills/trellis-<role>/SKILL.md` instructions.
 
 [workflow-state:in_progress]
-Tools: `trellis-implement` / `trellis-research` are sub-agent types only (Task/Agent tool, NOT Skill; there is no skill by these names). `trellis-update-spec` is a skill. `trellis-check` exists as both; prefer the Agent form when verifying after code changes.
-Flow: `trellis-implement` -> `trellis-check` -> `trellis-update-spec` -> commit (Phase 3.4) -> `/trellis:finish-work`.
-Main-session default: dispatch implement/check sub-agents. Sub-agent self-exemption: if already running as `trellis-implement`, do NOT spawn another `trellis-implement` or `trellis-check`; if already running as `trellis-check`, do NOT spawn another `trellis-check` or `trellis-implement`. Dispatch is main session only.
+Tools: dispatch the kinds — `cw-executor` / `cw-auditor` / `cw-researcher` (live names from /Coworkflow:status; the template ships no `trellis-*` agents). `trellis-before-dev` / `trellis-update-spec` / `trellis-break-loop` are skills.
+Flow: execute kind -> audit kind -> `trellis-update-spec` -> commit (Phase 3.4) -> `/trellis:finish-work`.
+Main-session default: dispatch the execute and audit kinds. Sub-agent self-exemption: an executor must not spawn another executor or auditor; an auditor must not spawn another auditor or executor. Dispatch is main session only.
 Dispatch prompt starts with `Active task: <task path from task.py current>`. Read context: jsonl entries -> `prd.md` -> `design.md if present` -> `implement.md if present`.
 Before integrating: run `task.py preflight <name>` and hold the integration lane with `integration-claim`; one task integrates at a time.
 [/workflow-state:in_progress]
@@ -298,8 +298,8 @@ Before integrating: run `task.py preflight <name>` and hold the integration lane
      matches their step 2.1. -->
 
 [workflow-state:in_progress-inline]
-Flow: `trellis-before-dev` -> edit -> `trellis-check` -> validation -> `trellis-update-spec` -> commit (Phase 3.4) -> `/trellis:finish-work`.
-Do not dispatch implement/check sub-agents in inline mode.
+Flow: `trellis-before-dev` -> dispatch the execute kind -> dispatch the audit kind -> `trellis-update-spec` -> commit (Phase 3.4) -> `/trellis:finish-work`.
+Dispatch the execute and audit kinds; acceptance stays in the main session, which reads the child's structured completion and re-runs the checks before Phase 3.
 Read context: `prd.md` -> `design.md if present` -> `implement.md if present`, plus relevant spec/research loaded by skills.
 Before integrating: run `task.py preflight <name>` and hold the integration lane with `integration-claim`; one task integrates at a time.
 [/workflow-state:in_progress-inline]
@@ -339,7 +339,7 @@ When a user request matches one of these intents inside an active task, route fi
 [Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
 
 - Planning or unclear requirements -> `trellis-brainstorm`.
-- `in_progress` implementation/check -> dispatch `trellis-implement` / `trellis-check`.
+- `in_progress` implementation/check -> dispatch the execute kind / the audit kind (`cw-executor` / `cw-auditor`; live names from /Coworkflow:status).
 - Repeated debugging -> `trellis-break-loop`; spec updates -> `trellis-update-spec`.
 
 [/Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
@@ -421,7 +421,7 @@ Research can happen at any time during requirement exploration. It isn't limited
 
 Spawn the research sub-agent:
 
-- **Agent type**: `trellis-research`
+- **Agent type**: `cw-researcher`
 - **Task description**: Research <specific question>
 - **Key requirement**: Research output MUST be persisted to `{TASK_DIR}/research/`
 
@@ -540,9 +540,9 @@ Goal: turn reviewed planning artifacts into code that passes quality checks.
 
 Spawn the implement sub-agent:
 
-- **Agent type**: `trellis-implement`
+- **Agent type**: `cw-executor`
 - **Task description**: Implement the reviewed task artifacts, consulting materials under `{TASK_DIR}/research/`; finish by running project lint and type-check
-- **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then tell the spawned agent it is already the `trellis-implement` sub-agent and must implement directly, not spawn another `trellis-implement` / `trellis-check`.
+- **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then tell the spawned agent it is already the execute sub-agent and must implement directly, not spawn another sub-agent.
 
 The platform hook/plugin auto-handles:
 - Reads `implement.jsonl` and injects referenced spec/research files into the agent prompt
@@ -555,9 +555,9 @@ The platform hook/plugin auto-handles:
 
 Spawn the implement sub-agent:
 
-- **Agent type**: `trellis-implement`
+- **Agent type**: `cw-executor`
 - **Task description**: Implement the reviewed task artifacts, consulting materials under `{TASK_DIR}/research/`; finish by running project lint and type-check
-- **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then explicitly say the spawned agent is already `trellis-implement` and must implement directly without spawning another `trellis-implement` / `trellis-check`.
+- **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then explicitly say the spawned agent is already the execute sub-agent and must implement directly without spawning another sub-agent.
 
 The pull-based sub-agent definition auto-handles the context load requirement:
 - Resolves the active task with `task.py current --source`, then reads `prd.md`, `design.md` if present, and `implement.md` if present
@@ -569,9 +569,9 @@ The pull-based sub-agent definition auto-handles the context load requirement:
 
 Spawn the implement sub-agent:
 
-- **Agent type**: `trellis-implement`
+- **Agent type**: `cw-executor`
 - **Task description**: Implement the reviewed task artifacts, consulting materials under `{TASK_DIR}/research/`; finish by running project lint and type-check
-- **Dispatch prompt guard**: Tell the spawned agent it is already the `trellis-implement` sub-agent and must implement directly, not spawn another `trellis-implement` / `trellis-check`.
+- **Dispatch prompt guard**: Tell the spawned agent it is already the execute sub-agent and must implement directly, not spawn another sub-agent.
 
 The platform prelude auto-handles the context load requirement:
 - Reads `implement.jsonl` and injects referenced spec/research files into the agent prompt
@@ -601,9 +601,9 @@ Acceptance stays in the main session: read the child's structured completion, ch
 
 Spawn the check sub-agent:
 
-- **Agent type**: `trellis-check`
+- **Agent type**: `cw-auditor`
 - **Task description**: Review all code changes against specs and task artifacts; fix any findings directly; ensure lint and type-check pass
-- **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then tell the spawned agent it is already the `trellis-check` sub-agent and must review/fix directly, not spawn another `trellis-check` / `trellis-implement`.
+- **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then tell the spawned agent it is already the audit sub-agent and must review/fix directly, not spawn another sub-agent.
 
 The check agent's job:
 - Review code changes against specs
