@@ -3,3 +3,8 @@ node_modules/
 # Local harness links only; Pi resolves @earendil-works/* through its loader aliases.
 node_modules
 .DS_Store
+
+# Rendered from templates/trellis/: 43 files, byte-identical to the template source.
+# Committing them would be a second copy of the same truth — edit templates/ instead,
+# and `/Coworkflow:init` writes them back.
+.agents/
