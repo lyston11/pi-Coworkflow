@@ -66,7 +66,7 @@ import {
   validTaskRef,
   type PreparedWorkflowContext,
 } from "../../core/subagents-workflow.ts";
-import { formatOverlapLine } from "../../core/dispatch-timing.ts";
+import { formatDispatchFacts, formatOverlapLine } from "../../core/dispatch-timing.ts";
 
 const PROJECT_SETTINGS = join(".pi", "settings.json");
 const PACKAGE = "pi-subagents";
@@ -163,6 +163,99 @@ function reportContextDefault(ctx: ModuleContext): void {
 }
 
 /**
+ * Count the children a dispatch call starts, from the call itself.
+ *
+ * A fanout names its tasks; `implement-review` runs two fixed steps; a direct dispatch is one child.
+ * Counted from the request because that is the only place the number is stated — the runner reports
+ * each child separately, and a number inferred from completions would silently miss the ones that
+ * never complete.
+ */
+export function childrenOfCall(input: unknown): number {
+  if (input === null || typeof input !== "object") return 1;
+  const call = input as Record<string, unknown>;
+  if (call.workflow === FANOUT_NAME) {
+    const tasks = (call.args as Record<string, unknown> | undefined)?.tasks;
+    return Array.isArray(tasks) ? tasks.length : 1;
+  }
+  if (call.workflow === WORKFLOW_NAME) return 2;
+  return 1;
+}
+
+/**
+ * Record that a dispatch started.
+ *
+ * Called for EVERY `subagent` call, task or not. Task-linked runs are additionally recorded by
+ * lane-worktree, which is what gives them a task, a worktree and a lane; but tying the interval to
+ * that record is why a dispatch with no task used to leave no trace at all.
+ *
+ * The run identity is not known yet — it arrives in the tool result — so the interval is started
+ * here and attributed there, keyed by the one id both halves carry.
+ */
+function beginDispatch(host: PiRuntimeHost, runtime: RuntimeContext, event: { toolCallId?: unknown; input?: unknown }): void {
+  const state = HOSTS.get(host);
+  if (!state || runtime.isChild) return;
+  const callId = typeof event.toolCallId === "string" ? event.toolCallId : "";
+  if (!callId) return;
+  const input = event.input;
+  const async = (input as Record<string, unknown> | null)?.async !== false;
+  state.pending.set(callId, {
+    startedAt: Date.now(),
+    async,
+    children: childrenOfCall(input),
+    ...(typeof (input as Record<string, unknown> | null)?.workflow === "string"
+      ? { workflow: String((input as Record<string, unknown>).workflow) }
+      : {}),
+  });
+}
+
+/**
+ * Attribute a finished `tool_call` to its run and close or open its interval.
+ *
+ * The two halves settle differently and the difference is not cosmetic: an asynchronous dispatch's
+ * result is a *launch receipt*, so the run is still going and the interval stays open; a foreground
+ * dispatch or a failed launch is over when the result lands. Treating a receipt as an end would make
+ * every async dispatch look like a zero-length one — which would then be counted as serial work.
+ */
+function settleDispatch(host: PiRuntimeHost, runtime: RuntimeContext, event: { toolCallId?: unknown; details?: unknown; isError?: unknown }): void {
+  const state = HOSTS.get(host);
+  if (!state || runtime.isChild) return;
+  const callId = typeof event.toolCallId === "string" ? event.toolCallId : "";
+  const record = callId === "" ? undefined : state.pending.get(callId);
+  if (!record) return;
+  state.pending.delete(callId);
+  const root = runtime.configRoots.root(runtime.cwd);
+  if (root === null) return;
+
+  const details = event.details;
+  const runId = details !== null && typeof details === "object" && typeof (details as { runId?: unknown }).runId === "string"
+    ? (details as { runId: string }).runId
+    : "";
+  const failed = event.isError === true;
+  // Counted here, not at the call: a refused or failed dispatch started nothing, and calling it a
+  // dispatch would let a session that delegates nothing look like one that does.
+  if (failed) {
+    // And it gets no interval either: a dispatch that never ran has no place on a timeline, and
+    // writing one would let a refused call prove "overlap" with a real run.
+    state.facts.notStarted += 1;
+    return;
+  }
+  const id = runId !== "" ? runId : `call:${callId}`;
+  state.facts.dispatches += 1;
+  state.facts.children += record.children;
+  state.facts.lastDispatchAt = record.startedAt;
+  const settled = !record.async;
+  const now = new Date().toISOString();
+  recordLaunchLink(root, {
+    runId: id,
+    taskRef: "",
+    ...(record.workflow === undefined ? {} : { workflow: record.workflow }),
+    ...(runtime.sessionId === null ? {} : { sessionId: runtime.sessionId }),
+    startedAt: new Date(record.startedAt).toISOString(),
+    ...(settled ? { settledAt: now } : {}),
+  });
+}
+
+/**
  * The one line that says whether this session's dispatches overlapped.
  *
  * Read from the recorded links at render time, so it reports what happened rather
@@ -170,6 +263,16 @@ function reportContextDefault(ctx: ModuleContext): void {
  * state, never a message: a status line delivered as a user turn rewrites the run
  * it describes.
  */
+/** What this session did, whether it dispatched or not. */
+function factsLine(host: PiRuntimeHost, state: HostState): string[] {
+  return [
+    `  = subagents: ${formatDispatchFacts({
+      ...state.facts,
+      toolAvailable: subagentToolAvailable(host),
+    })}`,
+  ];
+}
+
 function overlapLine(state: HostState): string[] {
   try {
     const runtime = state.runtime;
@@ -348,6 +451,7 @@ export const subagentsModule: WorkflowModule = {
         ? ["  ~ subagents: 本会话历史里没有 subagent（恢复旧会话），已重新声明该工具"]
         : []),
       ...(set?.failure === undefined ? [] : [`  x subagents: ${set.failure}`]),
+      ...factsLine(host, state),
       ...overlapLine(state),
     ];
   },
@@ -466,8 +570,31 @@ export const subagentsModule: WorkflowModule = {
 interface HostState {
   /** Bumped whenever the registrations we want are withdrawn or the session ends. */
   generation: number;
-  /** True when this session's restored tool list lacked `subagent` and it was re-declared. */
+  /**
+   * True when this session's restored tool list lacked `subagent` and it was re-declared.
+   */
   revivedTool?: boolean;
+  /**
+   * What this session has done, counted where the calls pass.
+   *
+   * Counted here rather than derived later: a dispatch that is counted only when it has a task is
+   * how eight hours of work with no delegation reads as nothing at all.
+   */
+  facts: {
+    toolCalls: number;
+    dispatches: number;
+    children: number;
+    /** Calls that never started a child: refused by a gate, or the launch itself failed. */
+    notStarted: number;
+    lastDispatchAt?: number;
+  };
+  /**
+   * Dispatches whose `tool_call` was seen and whose run identity has not arrived yet.
+   *
+   * The run id exists only in the tool result, so the interval has to be started first and
+   * attributed second. Keyed by `toolCallId`, which is the only id both halves share.
+   */
+  pending: Map<string, { startedAt: number; async: boolean; children: number; workflow?: string }>;
   /** The set we currently want, and the promise that builds it. */
   current: RegistrationSet | null;
   /** Hooks this module attached for this host, released on session end. */
@@ -513,6 +640,8 @@ function hostState(host: PiRuntimeHost): HostState {
     runCommandRegistered: false,
     controlCommandsRegistered: false,
     runtime: null,
+    facts: { toolCalls: 0, dispatches: 0, children: 0, notStarted: 0 },
+    pending: new Map(),
   };
   HOSTS.set(host, created);
   return created;
@@ -1076,6 +1205,18 @@ function attachObservers(host: PiRuntimeHost, state: HostState, runtime: Runtime
       });
   };
   refresh();
+  // Every tool call is counted, not only dispatches: the comparison is the fact.
+  track(state, host.on("tool_call", () => {
+    const live = HOSTS.get(host);
+    if (live && runtime.isChild === false) live.facts.toolCalls += 1;
+    return undefined;
+  }));
+  // A dispatch's interval starts here, before admission: a refused dispatch still happened, and a
+  // measurement that silently drops the refused ones would flatter the session.
+  track(state, host.on("tool_call", (event: any) => {
+    if (event?.toolName === "subagent") beginDispatch(host, runtime, event);
+    return undefined;
+  }));
   track(state, host.on("tool_call", async (event: any) => {
     if (event?.toolName !== "subagent") return;
     const workflow = event.input?.workflow;
@@ -1103,7 +1244,9 @@ function attachObservers(host: PiRuntimeHost, state: HostState, runtime: Runtime
     return undefined;
   }));
   track(state, host.on("tool_result", (event: any) => {
-    if (event?.toolName === "subagent") refresh();
+    if (event?.toolName !== "subagent") return undefined;
+    settleDispatch(host, runtime, event);
+    refresh();
     return undefined;
   }));
   // A structured native completion closes that run's dispatch interval. This is

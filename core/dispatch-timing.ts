@@ -98,3 +98,66 @@ export function formatOverlapLine(summary: OverlapSummary): string {
   if (summary.unresolved > 0) parts.push(`${summary.unresolved} 次仍在运行或时间未知（不计入串行）`);
   return `派单重叠: ${parts.join("、")}（本次会话）`;
 }
+
+/**
+ * What a session did, as opposed to what it meant to do.
+ *
+ * The measurement above answers "did dispatches overlap". This answers the question that comes
+ * before it: **did anything get dispatched at all.** A session can run hundreds of tool calls and
+ * delegate none of them, and until now nothing in this package could say so — the only mechanism
+ * that ever noticed was a message injected into the conversation, removed because a custom message
+ * reaches the model as a user turn and rewrites the work it describes.
+ *
+ * So this is a fact, read where facts are read: `/Coworkflow:status`, and whatever renders it later.
+ * It is deliberately not a warning, not a threshold, and not advice.
+ */
+export interface DispatchFacts {
+  /** Tool calls this session made, of any kind. */
+  toolCalls: number;
+  /** `subagent` calls this session made. The unit that matters for delegation. */
+  dispatches: number;
+  /** Children those calls started, when the call named them (a fanout's tasks, a workflow's steps). */
+  children: number;
+  /** Calls that started nothing: refused by a gate, or the launch failed. */
+  notStarted: number;
+  /** Epoch ms of the most recent dispatch, or absent when there has been none. */
+  lastDispatchAt?: number;
+  /** The dispatch tool, as the host reports it. `null` means the host cannot say. */
+  toolAvailable: boolean | null;
+}
+
+/** Age of the last dispatch in whole minutes, or absent when there has not been one. */
+function ageMinutes(facts: DispatchFacts, now: number): number | undefined {
+  if (facts.lastDispatchAt === undefined) return undefined;
+  const minutes = Math.floor((now - facts.lastDispatchAt) / 60_000);
+  // A clock that moved backwards is not evidence of a dispatch in the future.
+  return Number.isFinite(minutes) && minutes >= 0 ? minutes : 0;
+}
+
+/**
+ * The one line `/Coworkflow:status` renders for these facts.
+ *
+ * Three states have to stay distinguishable, because collapsing them is how this package has
+ * published wrong answers before: *the host said the tool is there*, *the host said it is not*, and
+ * *the host could not say*. `subagent` is `model-only` exposure, so a probe that leans on
+ * `ALL_TOOLS` or `tool_search` always answers "absent" — which is not an answer at all.
+ */
+export function formatDispatchFacts(facts: DispatchFacts, now: number = Date.now()): string {
+  const availability =
+    facts.toolAvailable === true
+      ? "派单工具可用（读自 getActiveTools）"
+      : facts.toolAvailable === false
+        ? "派单工具不在本会话的工具列表里（读自 getActiveTools）"
+        : "无法确定派单工具是否可用（宿主没有报告工具列表；本包不从 ALL_TOOLS / tool_search 推断）";
+  const since = ageMinutes(facts, now);
+  const parts = [`本会话工具调用 ${facts.toolCalls} 次`];
+  if (facts.dispatches === 0) {
+    parts.push("派单 0 次（全部由主会话自己做完）");
+  } else {
+    parts.push(`派单 ${facts.dispatches} 次`);
+    if (facts.children > 0) parts.push(`共启动 ${facts.children} 个子 agent`);
+  }
+  if (facts.notStarted > 0) parts.push(`${facts.notStarted} 次没有启动（被拒或失败）`);
+  if (facts.dispatches > 0 && since !== undefined) parts.push(`最近一次在 ${since} 分钟前`);
+  return `${parts.join("、")}；${availability}`;
+}

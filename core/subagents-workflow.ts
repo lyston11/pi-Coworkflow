@@ -744,6 +744,13 @@ const MAX_LINKS = 200;
 
 export interface NativeRunLink {
   runId: string;
+  /**
+   * The Trellis task this run serves, or an empty string when it serves none.
+   *
+   * Absent for a dispatch with no active task. The interval and the kind are still recorded — this is
+   * about accounting, not attribution — but a taskless run never appears in a task's lanes, because
+   * `readTaskLinks` matches on an exact task and "" matches nothing.
+   */
   missionId?: string;
   taskRef: string;
   worktree?: string;
@@ -809,8 +816,12 @@ function readLinks(root: string): NativeRunLink[] {
     return runs.filter((entry): entry is NativeRunLink => {
       if (entry === null || typeof entry !== "object") return false;
       const record = entry as Record<string, unknown>;
-      return typeof record.runId === "string" && typeof record.taskRef === "string";
-    });
+      // `taskRef` is optional now: a dispatch with no task is still a dispatch, and requiring a task
+      // here is what made an eight-hour session with no delegation count as zero work.
+      if (typeof record.runId !== "string") return false;
+      if (record.taskRef !== undefined && typeof record.taskRef !== "string") return false;
+      return true;
+    }).map((entry) => ({ ...entry, taskRef: entry.taskRef ?? "" }));
   } catch {
     return [];
   }
