@@ -13,17 +13,17 @@
  * that inherits is the default, and a built-in model here would override the
  * project's own `subagents.defaultModel` for one kind without anybody asking.
  *
- * Two things are deliberately data and not code:
+ * Three things are deliberately data and not code:
  *
  *   - the system prompt of each kind is an asset file next to this module, so a
  *     project can edit what "executor" means without touching TypeScript;
  *   - the built-in default (`executor` on, `auditor` off) is a table entry, so
  *     the panel, the gate and the status report all read the same values instead
- *     of each carrying a copy.
- *
- * The role field is the bridge to the role-scoped Trellis context: a kind maps
- * onto the existing `implement` / `check` roles so `subagent-context` keeps one
- * injection path rather than gaining a second one keyed on kind.
+ *     of each carrying a copy;
+ *   - the Trellis role a kind maps onto is declared **only** in the asset's
+ *     frontmatter (`role: implement`), read back through `parseDefinition`.
+ *     A field here would be a second declaration of the same fact, and the two
+ *     would eventually disagree about what `cw-executor` receives.
  */
 
 import { moduleAsset } from "../../core/module.ts";
@@ -35,7 +35,7 @@ import {
   type WorkflowConfig,
 } from "../../core/config.ts";
 import type { SubagentRole } from "../../core/trellis.ts";
-import { definitionDefaults, type KindDefinitionFile } from "./definitions.ts";
+import { definitionDefaults, parseDefinition, type KindDefinitionFile } from "./definitions.ts";
 
 /** The project's definitions, as `readKindDefinitions` returns them. */
 export type KindDefinitions = ReadonlyMap<string, KindDefinitionFile>;
@@ -46,8 +46,6 @@ export interface BuiltinKind {
   kind: string;
   /** How the panel and the status report name it to the user. */
   label: string;
-  /** The Trellis role its context comes from. */
-  role: SubagentRole;
   /** What the owner shows in the agent list. */
   description: string;
   /** Asset holding the system prompt, relative to this module. */
@@ -76,7 +74,6 @@ export const BUILTIN_KINDS: readonly BuiltinKind[] = [
   {
     kind: "executor",
     label: "执行者",
-    role: "implement",
     description: "Coworkflow 执行者：按派单做完一件已定义的工作并报告事实",
     asset: "./assets/executor.md",
     defaults: { enabled: true, maxConcurrent: DEFAULT_MAX_CONCURRENT },
@@ -84,7 +81,6 @@ export const BUILTIN_KINDS: readonly BuiltinKind[] = [
   {
     kind: "auditor",
     label: "审计者",
-    role: "check",
     description: "Coworkflow 审计者：只读复核一处改动，给出可复现的阻断项",
     asset: "./assets/auditor.md",
     defaults: { enabled: true, maxConcurrent: DEFAULT_MAX_CONCURRENT },
@@ -92,7 +88,6 @@ export const BUILTIN_KINDS: readonly BuiltinKind[] = [
   {
     kind: "researcher",
     label: "调研者",
-    role: "research",
     description: "Coworkflow 调研者：查清一个问题并给出有出处、可复现的答案",
     asset: "./assets/researcher.md",
     defaults: { enabled: true, maxConcurrent: DEFAULT_MAX_CONCURRENT },
@@ -178,17 +173,43 @@ export function builtinKind(kind: string): BuiltinKind | null {
 }
 
 /**
- * The Trellis role a kind's children are given, or `null` for a kind this package
- * does not ship.
+ * The shipped definition of a kind: its asset file, parsed exactly like a project's.
  *
- * This is the *only* kind→role mapping: `subagent-context` reads it here instead
- * of keeping a second table keyed on the agent name, which is what would let the
- * two disagree about what `cw-executor` receives.
+ * The asset *is* a definition file — frontmatter says what the kind is (`role`
+ * included), the body is its system prompt — so the role table has one source,
+ * and this package's default cannot drift from what the file beside it declares.
+ * Cached per (module, kind): the asset is static for the life of the process.
+ *
+ * A missing or unparseable asset answers `null` for its own kind only; the other
+ * kinds keep their role, which is the same per-kind isolation a bad project
+ * definition gets.
+ */
+const SHIPPED_DEFINITIONS = new Map<string, KindDefinitionFile | null>();
+
+function shippedDefinition(kind: string, moduleUrl: string = import.meta.url): KindDefinitionFile | null {
+  const key = `${moduleUrl}\u0000${kind}`;
+  if (SHIPPED_DEFINITIONS.has(key)) return SHIPPED_DEFINITIONS.get(key) ?? null;
+  const entry = builtinKind(kind);
+  const raw = entry === null ? null : moduleAsset(moduleUrl, entry.asset);
+  const parsed = raw === null ? null : parseDefinition(kind, raw);
+  const definition = parsed !== null && "definition" in parsed ? parsed.definition : null;
+  SHIPPED_DEFINITIONS.set(key, definition);
+  return definition;
+}
+
+/**
+ * The Trellis role a kind's children are given, or `null` when it declares none.
+ *
+ * This is the *only* kind→role mapping, and it reads one kind of source: a
+ * definition's `role:` frontmatter — the project's own file when it has one, else
+ * the shipped asset that stands in for it. `role: none` and "nothing declared"
+ * both mean no role context; there is no second table keyed on the agent name
+ * that could disagree with what the definition says.
  */
 export function kindRole(kind: string, definitions?: KindDefinitions): SubagentRole | null {
-  const declared = definitions?.get(kind)?.role;
-  if (declared !== undefined) return declared === "none" ? null : declared;
-  return builtinKind(kind)?.role ?? null;
+  const declared = definitions?.get(kind)?.role ?? shippedDefinition(kind)?.role;
+  if (declared === undefined) return null;
+  return declared === "none" ? null : declared;
 }
 
 /** Every agent name this package may register, whatever the project enabled. */
@@ -279,8 +300,8 @@ export function unshippedKinds(config: WorkflowConfig | null, definitions?: Kind
 
 /** The kind's system prompt, or `null` when the asset is missing from the package. */
 export function kindSystemPrompt(moduleUrl: string, kind: string): string | null {
-  const entry = builtinKind(kind);
-  if (entry === null) return null;
-  const text = moduleAsset(moduleUrl, entry.asset)?.trim();
+  // Through the same parse a project definition gets, so the frontmatter that declares
+  // the kind (its role) never leaks into what its children are told.
+  const text = shippedDefinition(kind, moduleUrl)?.prompt.trim();
   return text ? text : null;
 }

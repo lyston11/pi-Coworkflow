@@ -326,7 +326,7 @@ async function tempChildProject(): Promise<string> {
 
 test("subagent-context: repeated runs add one block, not one per run", async () => {
   const root = await tempChildProject();
-  const harness = await childHarness({ root, sessionName: "trellis-implement: demo" });
+  const harness = await childHarness({ root, sessionName: "cw-executor: demo" });
   try {
     // The host keeps one `systemPromptOptions` per run and re-renders from it.
     const event = {
@@ -350,6 +350,43 @@ test("subagent-context: repeated runs add one block, not one per run", async () 
   } finally {
     harness.close();
   }
+});
+
+test("subagent-context: a legacy trellis-<role> name no longer buys that role's context", async () => {
+  // The role is declared in the kind's definition file. A `trellis-check` session name used
+  // to be read as a check declaration; under kinds it is just a name, so a child launched
+  // that way gets the generic treatment — never another kind's curated context.
+  const root = await tempChildProject();
+  const task = join(root, ".trellis", "tasks", "10-20-demo");
+  mkdirSync(join(root, ".trellis", "spec", "frontend"), { recursive: true });
+  writeFileSync(join(root, ".trellis", "spec", "frontend", "check-only.md"), "# Check only\n\nAUDIT-ONLY-SPEC\n");
+  writeFileSync(
+    join(task, "check.jsonl"),
+    `${JSON.stringify({ file: ".trellis/spec/frontend/check-only.md", reason: "the review checklist" })}\n`,
+  );
+  const blockOf = async (sessionName: string): Promise<string> => {
+    const harness = await childHarness({ root, sessionName });
+    try {
+      const event = {
+        prompt: "Active task: .trellis/tasks/10-20-demo",
+        systemPrompt: "BASE",
+        systemPromptOptions: { contextFiles: [], sections: {} as Record<string, string> },
+      };
+      harness.run(event);
+      return event.systemPromptOptions.sections.pi_coworkflow_child ?? "";
+    } finally {
+      harness.close();
+    }
+  };
+
+  const auditor = await blockOf("cw-auditor: review the change");
+  assert.match(auditor, /role: check/, "the kind's own definition still declares check");
+  assert.match(auditor, /AUDIT-ONLY-SPEC/, "and its check.jsonl context is injected");
+
+  const legacy = await blockOf("trellis-check: review the change");
+  assert.doesNotMatch(legacy, /role: check/, "a trellis-check name is not a role declaration");
+  assert.doesNotMatch(legacy, /AUDIT-ONLY-SPEC/, "so it receives no check context");
+  assert.match(legacy, /子 agent 工作约定|subagent-context/, "it is a generic child, not an uninstructed one");
 });
 
 test("subagent-context: a generic child still gets guidance, and keeps the project's instructions", async () => {
@@ -431,7 +468,7 @@ test("subagent-context: an invalid task reference is reported, never rebound to 
     JSON.stringify({ current_task: ".trellis/tasks/10-20-demo" }),
   );
 
-  const harness = await childHarness({ root, sessionName: "trellis-implement: typo", parentSessionId: "parent-session" });
+  const harness = await childHarness({ root, sessionName: "cw-executor: typo", parentSessionId: "parent-session" });
   try {
     const event = {
       prompt: "Active task: .trellis/tasks/does-not-exist",
@@ -450,7 +487,7 @@ test("subagent-context: an invalid task reference is reported, never rebound to 
 
 test("subagent-context: the module switch and the session switch are both live", async () => {
   const root = await tempChildProject();
-  const harness = await childHarness({ root, sessionName: "trellis-check: demo" });
+  const harness = await childHarness({ root, sessionName: "cw-auditor: demo" });
   const event = () => ({
     prompt: "Active task: .trellis/tasks/10-20-demo",
     systemPrompt: "BASE",
@@ -490,7 +527,7 @@ test("subagent-context: the module switch and the session switch are both live",
 
 test("subagent-context: a host without structured options gets an idempotent prompt", async () => {
   const root = await tempChildProject();
-  const harness = await childHarness({ root, sessionName: "trellis-research: survey" });
+  const harness = await childHarness({ root, sessionName: "cw-researcher: survey" });
   try {
     const first = harness.run({ prompt: "Active task: .trellis/tasks/10-20-demo", systemPrompt: "BASE" });
     const prompt = String(first?.systemPrompt ?? "");
@@ -525,7 +562,7 @@ test("subagent-context: a host without structured options gets an idempotent pro
 
 test("subagent-context: a finished session releases its hook", async () => {
   const root = await tempChildProject();
-  const harness = await childHarness({ root, sessionName: "trellis-implement: demo" });
+  const harness = await childHarness({ root, sessionName: "cw-executor: demo" });
   const event = () => ({
     prompt: "Active task: .trellis/tasks/10-20-demo",
     systemPrompt: "BASE",
@@ -541,7 +578,7 @@ test("subagent-context: a finished session releases its hook", async () => {
   assert.deepEqual(closed.systemPromptOptions.sections, {}, "the finished session's hook is gone");
 
   // The next session in the same runtime attaches again.
-  await childHarness({ root, sessionName: "trellis-implement: demo" });
+  await childHarness({ root, sessionName: "cw-executor: demo" });
   const next = event();
   harness.run(next);
   assert.deepEqual(next.systemPromptOptions.sections, {}, "the fake host is not shared across sessions");
@@ -641,7 +678,7 @@ async function loadExtension(options: {
     },
     sendMessage() {},
     sendUserMessage() {},
-    getSessionName: () => (options.child ? "trellis-implement: demo" : undefined),
+    getSessionName: () => (options.child ? "cw-executor: demo" : undefined),
   };
 
   const { default: extension } = (await import(here("../extensions/coworkflow.ts"))) as {

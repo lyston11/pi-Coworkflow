@@ -497,19 +497,28 @@ test("workflow: a prepared context hands its kind agents to the resolver; public
 
 // ── 3. role mapping through the existing injection path ───────────────
 
-test("roles: a kind's agent name resolves to the same Trellis role as a trellis-* agent", () => {
+test("roles: a kind's role comes from its definition file, not from the agent's name", () => {
   // The session names pi-subagents actually produces, in both documented shapes.
   assert.equal(detectRole("cw-executor: implement the thing"), "implement");
   assert.equal(detectRole("cw-auditor: review the thing"), "check");
   assert.equal(detectRole("subagent-cw-executor-run-1-0"), "implement");
   assert.equal(detectRole("subagent-cw-auditor-run-2-1"), "check");
-  // The existing names keep working, and nothing else gains a role.
-  assert.equal(detectRole("trellis-implement: demo"), "implement");
-  assert.equal(detectRole("trellis-check: demo"), "check");
+  // A legacy `trellis-<role>` name is not a declaration any more: the role lives in the
+  // kind's definition, so a name-shaped guess would be a second, drifting source.
+  assert.equal(detectRole("trellis-implement: demo"), null);
+  assert.equal(detectRole("trellis-check: demo"), null);
+  assert.equal(detectRole("subagent-trellis-check-run-1-0"), null);
+  // A marker in the prompt still declares one.
+  assert.equal(detectRole("worker: tidy", undefined, "<!-- trellis-agent: check -->"), "check");
   assert.equal(detectRole("worker: tidy"), null);
   assert.equal(detectRole("cw-unknown: x"), null);
-  // The mapping is *the* kind table, so it cannot drift from what a kind means.
-  for (const entry of BUILTIN_KINDS) assert.equal(kindRole(entry.kind), entry.role);
+  // The mapping is the shipped definitions' own frontmatter, so it cannot drift from
+  // what a kind declares.
+  assert.deepEqual(
+    BUILTIN_KINDS.map((entry) => kindRole(entry.kind)),
+    ["implement", "check", "research"],
+    "each shipped asset declares its role in frontmatter",
+  );
   assert.equal(kindRole("unknown"), null);
 });
 

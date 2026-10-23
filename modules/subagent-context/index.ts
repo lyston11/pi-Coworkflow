@@ -8,14 +8,13 @@
  *
  * Where the facts come from, in order:
  *
- *   role  — the child's session name. pi-subagents names a child
- *           `subagent-<agent>-<runId>-<index>` when the intercom bridge claims
- *           it, and `<agent>: <task excerpt>` otherwise (see
- *           `src/shared/child-session-name.ts` and `subagent-prompt-runtime.ts`,
- *           which prefers the routing name). Both contain the agent name, so
- *           `trellis-implement` identifies the role without asking the model to
- *           write a marker. A `<!-- trellis-agent: <role> -->` marker in the
- *           agent definition or dispatch prompt is accepted as a fallback.
+ *   role  — the `role:` frontmatter of the kind the child was dispatched as, read
+ *           from that kind's definition file (or the shipped asset standing in for
+ *           it). A `<!-- trellis-agent: <role> -->` marker in the agent definition
+ *           or dispatch prompt is accepted as well. **The session name is not a
+ *           source**: `trellis-check` used to identify a role, and under kinds it
+ *           does not — a name is not a declaration, so a legacy agent gets the
+ *           generic child treatment instead of someone else's context.
  *   task  — the `Active task: <path>` line of the dispatch prompt, which
  *           Trellis's own dispatch protocol already requires. pi-subagents wraps
  *           the prompt, so the line arrives as `Task: Active task: <path>`;
@@ -72,16 +71,10 @@ import type { ResolvedAgentKind } from "../../core/config.ts";
 
 const ROLES: SubagentRole[] = ["implement", "check", "research"];
 /**
- * Match `trellis-<role>` anywhere in the name, including inside
- * `subagent-trellis-check-<runId>-1`, where `-` precedes it.
- */
-const AGENT_RE = /(?:^|[^A-Za-z0-9])trellis-(implement|check|research)(?![A-Za-z0-9])/;
-/**
  * A kind's registered agent name (`cw-executor`, `cw-auditor`, `cw-researcher`),
- * matched the same way. It resolves through the *same* role table as `trellis-*`:
- * a kind is how a project names a dispatcher, not a second injection path, so
- * whichever name the child was launched under it receives the role context it
- * corresponds to.
+ * matched anywhere in the session name — `subagent-cw-executor-run-1-0` included,
+ * where `-` precedes it. It resolves through the *kind's own definition*, so the
+ * role still has exactly one source; the name only says *which kind* this is.
  *
  * The alternation is generated from the shipped kind table rather than written out,
  * so a new kind needs no second edit here — but it must be an alternation and not
@@ -118,17 +111,18 @@ const GENERIC_GUIDE = [
   "- 不能创建或推进 Trellis 任务、不能改任务状态、不能合并、不能 push。",
 ].join("\n");
 
+/** A known role name, or `null`. The only caller is the dispatch-prompt marker. */
 function asRole(value: string | undefined): SubagentRole | null {
   if (!value) return null;
   return (ROLES as string[]).includes(value) ? (value as SubagentRole) : null;
 }
 
 /**
- * The role a kind's agent name stands for, from the one kind→role table.
+ * The role the kind behind a registered agent name stands for.
  *
- * `kindRole` is the single mapping (`executor → implement`, `auditor → check`), so
- * a change to what a kind means reaches both the registration and this match
- * instead of leaving two tables to disagree.
+ * The name only says *which kind* this is; the role itself is that kind's declaration —
+ * the project's definition file when it has one, else the shipped asset — read through
+ * `kindRole`, which is the single mapping `executor → implement`, `auditor → check`.
  */
 function roleOfKind(agent: string, kinds?: readonly ResolvedAgentKind[]): SubagentRole | null {
   // Through the project's table when the caller has one: a definition may rename the agent
@@ -145,9 +139,10 @@ function roleOfKind(agent: string, kinds?: readonly ResolvedAgentKind[]): Subage
 /**
  * The role this child was dispatched as, or null when it is not a Trellis role.
  *
- * `kinds` is the project's resolved kind table when the caller has read it. Without it the
- * shipped table is the only evidence, which is what a caller that has no root (a unit test,
- * or a name that is plainly `trellis-check`) still gets.
+ * Two sources, both declarations: the kind the child's agent name belongs to (its
+ * definition's `role:`), then the marker a prompt or agent definition may carry.
+ * `kinds` is the project's resolved kind table when the caller has read it; without
+ * it the shipped definitions are the only evidence.
  */
 export function detectRole(
   sessionName: string | undefined,
@@ -155,9 +150,8 @@ export function detectRole(
   ...texts: (string | undefined)[]
 ): SubagentRole | null {
   const agent = sessionName?.split(":")[0]?.trim();
-  const fromAgent =
-    asRole(agent) ?? asRole(AGENT_RE.exec(agent ?? "")?.[1]) ?? roleOfKind(agent ?? "", kinds);
-  if (fromAgent) return fromAgent;
+  const fromKind = roleOfKind(agent ?? "", kinds);
+  if (fromKind) return fromKind;
 
   for (const text of texts) {
     const marker = text ? MARKER_RE.exec(text)?.[1] : undefined;
@@ -269,10 +263,9 @@ function blockFor(prompt: ChildPrompt): string {
 /**
  * The host's prompt with this package's own contributions removed.
  *
- * Detection runs on this, not on the raw prompt. Our block names the roles
- * (`trellis-implement`, `trellis-check`, …) and the region spells the dispatch
- * line (`Active task: <任务目录>`), so a second run reading its own output would
- * find a role and a task that the parent never wrote — a generic child would turn
+ * Detection runs on this, not on the raw prompt. Our block spells a role (`role: check`)
+ * and the dispatch line (`Active task: <任务目录>`), so a second run reading its own output
+ * would find a role and a task that the parent never wrote — a generic child would turn
  * into an implement child on its second turn.
  */
 function inheritedPrompt(event: any): string {

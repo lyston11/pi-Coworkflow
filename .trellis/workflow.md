@@ -346,7 +346,7 @@ When a user request matches one of these intents inside an active task, route fi
 [codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
 - Planning or unclear requirements -> `trellis-brainstorm`.
-- Before editing -> `trellis-before-dev`; after editing -> `trellis-check`.
+- Before editing -> `trellis-before-dev`; after editing -> dispatch the audit kind (`cw-auditor`; the names this project actually exposes are whatever `/Coworkflow:status` lists).
 - Repeated debugging -> `trellis-break-loop`; spec updates -> `trellis-update-spec`.
 
 [/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
@@ -428,7 +428,7 @@ Spawn the research sub-agent:
 
 [codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
-Do the research in the main session directly and write findings into `{TASK_DIR}/research/`. `codex-inline` is the explicit mode that keeps work in the main session.
+Do the research in the main session directly and write findings into `{TASK_DIR}/research/`. `codex-inline` is the explicit mode that keeps work in the main session. When the question is separable and worth a child session, dispatch the research kind instead (`cw-researcher`; the names this project actually exposes are whatever `/Coworkflow:status` lists) and keep the findings file as the deliverable.
 
 [/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
@@ -580,11 +580,17 @@ The platform prelude auto-handles the context load requirement:
 
 [codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
-1. Load the `trellis-before-dev` skill to read project guidelines
-2. Read `{TASK_DIR}/prd.md`, then `design.md` if present, then `implement.md` if present
-3. Consult materials under `{TASK_DIR}/research/`
-4. Implement the code per reviewed artifacts
-5. Run project lint and type-check
+Dispatch the implementation to the execute kind, then accept the result in the main session:
+
+- **Agent type**: `cw-executor` (a Coworkflow kind — the names this project actually exposes are whatever `/Coworkflow:status` lists)
+- **Task description**: Implement the reviewed task artifacts, consulting materials under `{TASK_DIR}/research/`; finish by running project lint and type-check
+- **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then tell the spawned agent it is already the executor sub-agent and must implement directly, not spawn another sub-agent.
+
+The kind's context is injected by the dispatch path, not by this document:
+- `implement.jsonl` entries plus `prd.md`, `design.md` if present, and `implement.md` if present
+- Project guidelines from the `trellis-before-dev` skill
+
+Acceptance stays in the main session: read the child's structured completion, check it against `prd.md` / `design.md` / `implement.md`, and re-run lint and type-check before continuing.
 
 [/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
@@ -608,12 +614,18 @@ The check agent's job:
 
 [codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
-Load the `trellis-check` skill and verify the code per its guidance:
-- Spec compliance
+Dispatch the quality check to the audit kind, then accept the verdict in the main session:
+
+- **Agent type**: `cw-auditor` (a Coworkflow kind — the names this project actually exposes are whatever `/Coworkflow:status` lists)
+- **Task description**: Review all code changes against specs and task artifacts; fix any findings directly; ensure lint and type-check pass
+- **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then tell the spawned agent it is already the audit sub-agent and must review/fix directly, not spawn another sub-agent.
+
+The check covers:
+- Spec compliance (the task's `check.jsonl` context and the package spec index)
 - lint / type-check / tests
 - Cross-layer consistency (when changes span layers)
 
-If issues are found → fix → re-check, until green.
+A verdict is evidence, not acceptance: the main session audits the findings, confirms there is no blocking item, and re-reads the checks before Phase 3. If issues are found → fix → re-check, until green.
 
 [/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 

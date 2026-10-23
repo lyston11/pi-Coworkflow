@@ -16,7 +16,9 @@
 - 本包不因此获得调度权：不 spawn、不排队、不重试、不维护每类的运行账本。
 - 类型数量、进程、超时、产物仍归 pi-subagents。
 
-### 一类一种角色，覆盖 Trellis 的三个角色
+### 一类一种角色；role 只声明在定义文件里
+
+`role` 不是第二套身份，是「这个 kind 的子会话注入哪一档上下文」的键（`implement` / `check` / `research` / `none`）。它只有一份真相：kind 定义文件的 frontmatter。会话名不参与判定——`trellis-check` 这类名字不再获得 check 上下文。
 
 | kind | agent | Trellis 角色 | 默认 | 默认上限 |
 |---|---|---|---|---|
@@ -182,7 +184,7 @@ fleet 投影的 `key` 是不透明显示键，上游明确禁止当作 run 或 a
 
 - 不做「自动把任务分给某个类」的调度器——那是判断，不是机制。
 - 不改 pi-subagents 的任何文件，不加载第二份运行器。
-- 不改写 Trellis 拥有的 `.pi/agents/`、`.trellis/` CLI 资产。
+- 不改写 Trellis 的 CLI 与全局模板；但**本项目工作面只讲 kind**：`.pi/agents/trellis-{implement,check,research}.md` 由 `retireRoleAgents()` 删除（`trellis update` 会重建，守卫在每次 update/init 后再删），`.trellis/workflow.md` 的 Pi 块就地改成 kind 派单，其它平台块不动。
 - 不自动重试、不自动合并、不自动清理。
 
 ## 失败模式与对应要求
@@ -243,7 +245,7 @@ CLI 是给**外部 agent** 的入口：不依赖 Pi 会话、扩展宿主或任�
 - 注册（上游公开 `./agents` 导出 + `pi-subagents:runtime-agent-register:v1` 事件）：`modules/agent-kinds/registration.ts`
 - 门禁与状态：`modules/agent-kinds/index.ts`
 - 配置形状与开关解析：`core/config.ts`
-- 角色映射：`modules/subagent-context/index.ts`（映射表在 `kindRole()`，`BUILTIN_KINDS[].role`）
+- 角色映射：`modules/subagent-context/index.ts`（`kindRole()` 只读 kind 定义文件的 `role:` frontmatter；shipped 资产的 frontmatter 经 `parseDefinition` 解析后作为默认，`BUILTIN_KINDS` 不再有 role 字段）
 - 面板行：`modules/panel/settings.ts`
 - 模型面板（页面列表、每页的取值与写入）：`modules/panel/shared.ts`（`panelPages` / `modelRows` / `thinkingRows` / `modelForRef` / `stripThinkingSuffix`）、`modules/panel/models.ts`（`snapshot.kinds`、`kindsActive`、`applyKindModel`/`applyKindThinking`）、`modules/panel/models-panel.ts`（页签与表体）
 - 派单记录与 lane 展示：`modules/lane-worktree/index.ts`、`core/subagents-workflow.ts`

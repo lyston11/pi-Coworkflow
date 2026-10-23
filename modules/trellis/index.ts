@@ -20,11 +20,87 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { ModuleContext, WorkflowModule } from "../../core/module.ts";
 
 const TRELLIS_REL = ".trellis";
 const PI_EXTENSION_REL = join(".pi", "extensions", "trellis", "index.ts");
+
+/**
+ * The three role agents Trellis installs, in this fork's terms: not dispatch
+ * targets. A kind (`cw-executor` / `cw-auditor` / `cw-researcher`) covers the
+ * same role with the project's enable switch and concurrency ceiling in front
+ * of it, so keeping the flat `trellis-*` agents around is a second, ungated way
+ * to dispatch the same work.
+ *
+ * They cannot be left deleted either: `trellis update -s` skips *modified*
+ * files, and a deleted file is not a modified one — the CLI regenerates it. The
+ * guard below is the only honest fix for that gap, and it has to be idempotent
+ * because it runs on every init.
+ */
+const ROLE_AGENT_RELS = [
+  join(".pi", "agents", "trellis-implement.md"),
+  join(".pi", "agents", "trellis-check.md"),
+  join(".pi", "agents", "trellis-research.md"),
+];
+
+/**
+ * Delete the role agents that exist, and report what was there.
+ *
+ * Pure file work with no context and no CLI call, so it can run right after the
+ * aligner rewrote them and be tested without a `trellis` binary. A path listed
+ * in `kept` was either absent or could not be removed — the caller reports the
+ * count, never a failure, because nothing here is this package's file.
+ */
+export function retireRoleAgents(root: string): { removed: string[]; kept: string[] } {
+  const removed: string[] = [];
+  const kept: string[] = [];
+  for (const rel of ROLE_AGENT_RELS) {
+    const path = join(root, rel);
+    if (!existsSync(path)) {
+      kept.push(rel);
+      continue;
+    }
+    try {
+      rmSync(path, { force: true });
+      removed.push(rel);
+    } catch {
+      kept.push(rel);
+    }
+  }
+  return { removed, kept };
+}
+
+/**
+ * Run the guard and say so out loud.
+ *
+ * The message names the rebuild, because the next `trellis update` will put the
+ * files back and the user should not read that as a regression: every init runs
+ * this again. `dry` reports the same fact without touching anything, so
+ * `--trellis-update --dry-run` describes the aligner honestly.
+ */
+export function retireRoleAgentsAndReport(ctx: ModuleContext): void {
+  if (ctx.dry) {
+    const present = ROLE_AGENT_RELS.filter((rel) => existsSync(join(ctx.root, rel)));
+    ctx.report(
+      "updated",
+      present.length > 0
+        ? `会移除 ${present.length} 个角色 agent（${present.join("、")}）；trellis-* 不再作为派单目标，kind（cw-*）覆盖同一角色`
+        : "角色 agent 已不存在（.pi/agents/trellis-*.md 均无）",
+    );
+    return;
+  }
+  const { removed, kept } = retireRoleAgents(ctx.root);
+  if (removed.length === 0) {
+    ctx.report("ok", `角色 agent 已不存在（保留 ${kept.length} 个空位）：trellis-* 不再作为派单目标，kind（cw-*）覆盖同一角色`);
+    return;
+  }
+  ctx.report(
+    "updated",
+    `已移除 ${removed.length} 个角色 agent（${removed.join("、")}）；trellis-* 不再生成，\`trellis update\` 会重建，下次 init 会再移除`,
+  );
+}
 
 function run(
   command: string,
@@ -118,6 +194,11 @@ function runUpdate(ctx: ModuleContext): void {
   }
   const tail = (applied.out || applied.err).split("\n").slice(-6).join("\n");
   ctx.report("updated", `已跑 \`trellis update -s\`（保留本地改动）\n${tail}`);
+
+  // Straight after the aligner, and only after a *successful* one: this is the
+  // one command that regenerates the role agents, so this is the moment the
+  // guard has something to do.
+  retireRoleAgentsAndReport(ctx);
 }
 
 export const trellisModule: WorkflowModule = {
@@ -139,6 +220,8 @@ export const trellisModule: WorkflowModule = {
         return;
       }
       ctx.report("created", "trellis init --pi -y（.trellis/、.pi/、.agents/skills/、AGENTS.md）");
+      // A fresh install writes the role agents too, so the same guard applies.
+      retireRoleAgentsAndReport(ctx);
       return;
     }
 
