@@ -110,10 +110,10 @@ function unregisterHook(ctx: ModuleContext): void {
 /**
  * Remove this module's `after_start` entry, whatever the surrounding formatting.
  *
- * Works on lines rather than on one exact block: `trellis update` reformats
- * `config.yaml`, and a string match against the block this module wrote stops
- * matching the moment it does — which left the hook running while the module
- * reported itself off. The marker line identifies the registration; the command
+ * Works on lines rather than on one exact block: a human (or another tool)
+ * reformats `config.yaml`, and a string match against the block this module wrote
+ * stops matching the moment it does — which left the hook running while the
+ * module reported itself off. The marker line identifies the registration; the command
  * line identifies the entry; an emptied `after_start:` key and an emptied
  * `hooks:` section are removed with it, because an empty key is not valid for
  * Trellis. Returns null when the entry is not where this module put it, so a
