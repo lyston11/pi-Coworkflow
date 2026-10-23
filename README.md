@@ -21,14 +21,35 @@ pi install https://github.com/lyston11/pi-Coworkflow      # 跟随默认分支
 pi install /path/to/pi-Coworkflow                         # 本地开发
 ```
 
+装之前**不需要任何前置工具**：Trellis 那套范式文件随本包一起发布，由 `/Coworkflow:init` 直接渲染（见下）。
+
 扩展是**用户级**装的，装完任何项目都有这些命令；但**每个项目要自己决定采用**：
 
 ```bash
-/Coworkflow:init      # 本项目采用（首次会装上全部模块），可加 --dry-run 先看
+/Coworkflow:init      # 本项目采用（首次会装上全部模块并渲染 Trellis 资产），可加 --dry-run 先看
 /Coworkflow:start     # 本会话加载（否则会话就是原生 Pi）
 ```
 
 没采用的项目里，这个扩展什么都不做：不安装、不注入、不记账。
+
+### 模板与 CLI 的分工
+
+**Trellis 资产是模板，不是 CLI 的产物。** 本包自带 `.trellis/`（`workflow.md`、`config.yaml`、`agents/`、`scripts/`）
+与 `.pi/`（`agents/`、`extensions/trellis/`、`prompts/`）的模板，`/Coworkflow:init` 按它们渲染到项目里。
+所以安装流程是「装这一个包 → init」，**没有「先装全局 `trellis` CLI → 先 `trellis init`」那一步**。
+
+| 要用的东西 | 谁提供 |
+|---|---|
+| `.trellis/`、`.pi/` 的范式文件（workflow、Trellis 脚本、agent 定义、Pi 扩展） | **本包随附的模板**，`/Coworkflow:init` 渲染 |
+| `tasks/`、`spec/`、`workspace/` 等项目记录 | 项目自己；模板不写、不覆盖 |
+| `trellis mem`、`trellis channel` | 全局 `trellis` CLI（`@mindfoldhq/trellis`）。**本包不自带这两个**，没装就用不了 |
+
+也就是说 `trellis` CLI 是**可选项**：缺了既不影响安装，也不影响派单、面板、lane 与任务脚本。
+缺了它就只有 `trellis mem` / `trellis channel` 这两项不可用——本包不假装自带它们。
+
+**不要手工跑 `trellis update`。** 它会把范式文件换回上游版本，使项目一半是本仓模板、一半是上游、
+而且没有任何一次运行会把它们重新对齐。要刷新范式就再跑一次 `/Coworkflow:init`（幂等，用户数据不动）。
+老项目里残留的 `trellis-*` 角色 agent 由 init 的迁移步骤清掉；新装项目的模板不产出它们。
 
 ## 三层状态
 
@@ -492,7 +513,7 @@ worktree 是**已提交文件**的检出，而本包的 Trellis 状态（`.trell
 
 | id | 类型 | 负责 | 关闭时 |
 |---|---|---|---|
-| `trellis` | 安装 | 改版 Trellis 本体；已有项目**只报告不重写** | 只报告，不删（Trellis 资产归 CLI 管） |
+| `trellis` | 安装 | 渲染本包的 Trellis 资产模板；`tasks/` `spec/` `workspace/` 与项目自己的 `config.yaml` **永不覆盖** | 只报告，不删 |
 | `worktree` | 安装 | 任务隔离的**机制**：`auto_worktree.py` + `config.yaml` 的 `hooks.after_start` | 移除注册（脚本保留） |
 | `agents` | 安装 | 两份指令文件：`AGENTS.md` 受管区（主会话）+ 子 agent 约定 | 移除受管区与约定，其余不动 |
 | `subagents` | 安装 | 复用已装的 pi-subagents，缺失时才项目级安装 | 移除 `projectRootResolution` |
@@ -582,7 +603,7 @@ pi-Coworkflow/
 ### 项目信任（Pi 的安全边界）
 
 Pi 把 `.pi/settings.json`、`.pi/extensions`、`.pi/agents` 等当作**受信任资源**：没有信任决定就不加载。
-未受信任的项目里 `.pi/agents/trellis-*.md` 发现不了，`.pi/extensions/trellis/` 不加载。
+未受信任的项目里 `.pi/agents/` 下的 agent 定义发现不了，`.pi/extensions/trellis/` 不加载。
 
 **`/Coworkflow:init` 会替你给信任**——这是本包唯一写用户级文件的地方（`~/.pi/agent/trust.json`，
 路径遵循 `PI_CODING_AGENT_DIR` / `PI_CONFIG_DIR`）。在一个项目里跑 init 本身就是「我要在这里用这套」的
@@ -662,7 +683,7 @@ npm test              # 224 项，node --test，无第三方依赖
 - `stop` 的能力探测、接受≠终止、畸形回复是协议错误（`run-control.test.ts`）
 - 尾部读的边界、半行容忍、无定时器（`child-tail.test.ts`）
 - 公开 cost/fleet 的解码与「不完整不冒充完整」（`observability.test.ts`、`usage.test.ts`）
-- `trellis update` 重排 `config.yaml` 后 `after_start` 仍能被移除（worktree 用例）
+- `config.yaml` 被重排后 `after_start` 注册仍能被移除（worktree 用例）
 - 配置根按会话缓存、git 失败不被当成当前目录（`config-root.test.ts`）
 - 新模块默认值：gate 默认关、观察默认开、显式值优先（`switch-default.test.ts`）
 

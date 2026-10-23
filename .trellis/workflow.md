@@ -146,8 +146,9 @@ python3 ./.trellis/scripts/get_context.py --mode phase --step <X.Y>  # detailed 
   Editing checklist:
     - When you change a [workflow-state:STATUS] block, also check the
       matching phase's `[required · once]` walkthrough steps for sync
-    - Run `trellis update` after editing to push the new bodies to
-      downstream user projects (block-level managed replacement)
+    - This repo owns the template: after editing, run `/Coworkflow:init` in a
+      downstream project (or re-render `templates/trellis/`) to push the new
+      bodies. There is no external generator to call.
     - Full runtime contract:
       .trellis/spec/cli/backend/workflow-state-contract.md
 -->
@@ -744,7 +745,7 @@ All tag blocks live in the `## Phase Index` section above, immediately after eac
 
 ### Changing the per-turn prompt text
 
-Directly edit the body of the corresponding `[workflow-state:STATUS]` block. After editing, run `trellis update` (if you're a template maintainer) or restart your AI session (if you're customizing your own project) — no script changes required.
+Directly edit the body of the corresponding `[workflow-state:STATUS]` block. After editing, either edit the bundled template under `templates/trellis/` (if you maintain this repo) or restart your AI session (if you're customizing your own project) — no script changes required.
 
 ### Adding a custom status
 

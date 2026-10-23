@@ -30,7 +30,7 @@
 
 默认值是**项目改的起点，不是本包设的上限**：三种 kind 都默认开、都从 5 起，具体数字由 `/Coworkflow:settings` 决定。按 kind 定死不同的小数字（执行者 3、审计者 1）等于替主会话做了拆分决定——它读到的是「只准有一个审计者」，而没有任何人做过这个决定。上限的作用是「别一次铺开太多」，不是分配权限。
 
-Trellis 自己拥有的 `.pi/agents/trellis-*.md` 不删除、不改写（那是 `trellis update` 的地盘），只是不再作为本项目的推荐派单目标。
+`.pi/agents/trellis-*.md` 不再由本包模板产出（老项目里残留的由迁移步骤清掉，见「不做的事」），`trellis-*` 只是不再作为本项目的推荐派单目标。
 
 ### 每个 kind 自己的模型与思考等级
 
@@ -184,7 +184,7 @@ fleet 投影的 `key` 是不透明显示键，上游明确禁止当作 run 或 a
 
 - 不做「自动把任务分给某个类」的调度器——那是判断，不是机制。
 - 不改 pi-subagents 的任何文件，不加载第二份运行器。
-- 不改写 Trellis 的 CLI 与全局模板；但**本项目工作面只讲 kind**：`.pi/agents/trellis-{implement,check,research}.md` 由 `retireRoleAgents()` 删除（`trellis update` 会重建，守卫在每次 update/init 后再删），`.trellis/workflow.md` 的 Pi 块就地改成 kind 派单，其它平台块不动。
+- 不改写 Trellis 的 CLI 与全局模板；**但本包自带 Trellis 资产模板，本项目工作面只讲 kind**：模板不产出 `.pi/agents/trellis-{implement,check,research}.md`，老项目里残留的由 `retireRoleAgents()` 在迁移时删除，`.trellis/workflow.md` 的 Pi 块在模板里就写成 kind 派单，其它平台块不动。全局 `trellis` CLI 是可选的（只有 `trellis mem` / `trellis channel` 需要，本包不自带），也不用 `trellis update` 对齐——手工跑它会把范式换回上游版本，与本包模板混成两种真相。
 - 不自动重试、不自动合并、不自动清理。
 
 ## 失败模式与对应要求

@@ -228,10 +228,10 @@ export function buildSettingRows(control: WorkflowControl, commandCtx: any): Set
   });
   rows.push({
     section: "维护",
-    label: "Trellis 范式对齐",
-    value: "trellis update -s",
-    detail: "升级未被本地改动的 Trellis 文件，保留本地改动与所有任务记录",
-    act: () => control.init("--trellis-update"),
+    label: "Trellis 模板渲染",
+    value: "templates/trellis/",
+    detail: "按包内模板写 .trellis/、.pi/、.agents/skills/；内容相同即跳过，tasks/spec/workspace 不动",
+    act: () => control.init(""),
   });
 
   // ── 状态 ────────────────────────────────────────────────────────────────

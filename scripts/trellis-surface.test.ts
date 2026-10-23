@@ -3,11 +3,10 @@
  *
  * Two things broke silently before and must not again:
  *
- *   - `.pi/agents/trellis-*.md` came back after `trellis update`, because `-s`
- *     protects *modified* files and a deleted file is not a modified one. The
- *     guard has to run on every init, so it has to be idempotent: second run
- *     deletes nothing, reports nothing alarming, and leaves every other agent
- *     definition alone.
+ *   - An old project still carried `.pi/agents/trellis-*.md` after the surface
+ *     moved to kinds. The guard that clears them is migration cleanup, so it has
+ *     to be idempotent: a second run deletes nothing, reports nothing alarming,
+ *     and leaves every other agent definition alone.
  *   - `.trellis/workflow.md` carries eleven platforms in one file. Editing the
  *     Pi blocks is the whole task; touching a Claude Code / Kiro / Gemini block
  *     would silently change how those platforms dispatch. The non-Pi text is
@@ -163,63 +162,36 @@ test("trellis: the role-agent guard deletes the three trellis-* agents and is id
   assert.deepEqual(retireRoleAgents(root), second, "repeated runs must be identical");
 });
 
-test("trellis: the guard reports the removal and names the rebuild it will undo", async () => {
+test("trellis: the guard is the migration cleanup, so a render removes the old role agents", async () => {
   const { createContext } = (await import("../core/module.ts")) as typeof import("../core/module.ts");
-  const { retireRoleAgentsAndReport } = (await import("../modules/trellis/index.ts")) as typeof import(
+  const { renderTemplate } = (await import("../modules/trellis/index.ts")) as typeof import(
     "../modules/trellis/index.ts"
   );
-  const reports = (dry: boolean, root: string): string[] => {
-    const lines: string[] = [];
-    const ctx = createContext({
-      root,
-      prefix: "",
-      dry,
-      report: (status, message) => lines.push(`${status}:${message}`),
-    });
-    retireRoleAgentsAndReport(ctx);
-    return lines;
-  };
+  const root = tempProject();
+  for (const name of ROLE_AGENTS) writeFileSync(join(root, ".pi", "agents", name), `# ${name}\n`);
+  writeFileSync(
+    join(root, ".trellis", "workflow.md"),
+    "[codex-inline, Pi]\n- **Agent type**: `trellis-implement`\n[/codex-inline, Pi]\n",
+  );
 
-  // Dry: the fact is described, nothing is deleted.
-  const dryRoot = tempProject();
-  for (const name of ROLE_AGENTS) writeFileSync(join(dryRoot, ".pi", "agents", name), "# role\n");
-  const dryLine = only(reports(true, dryRoot));
-  assert.match(dryLine, /^updated:会移除 3 个角色 agent/);
-  for (const name of ROLE_AGENTS) assert.equal(existsSync(join(dryRoot, ".pi", "agents", name)), true);
+  const lines: string[] = [];
+  renderTemplate(
+    createContext({ root, prefix: "", dry: false, report: (status, message) => lines.push(`${status}:${message}`) }),
+  );
 
-  // Real: removed, and the report says `trellis update` puts them back.
-  const line = only(reports(false, dryRoot));
-  assert.match(line, /^updated:已移除 3 个角色 agent/);
-  assert.match(line, /trellis update/);
-  assert.match(line, /下次 init 会再移除/);
+  for (const name of ROLE_AGENTS) assert.equal(existsSync(join(root, ".pi", "agents", name)), false);
+  const joined = lines.join("\n");
+  assert.match(joined, /已从旧 Trellis 产物升级到本仓模板/);
+  assert.match(joined, /已移除 3 个旧角色 agent/);
+  assert.match(joined, /模板不含 trellis-\*/, "the report must say the template will not recreate them");
+  // Nothing regenerates them any more: the template is the only source.
+  assert.doesNotMatch(joined, /trellis update/);
 
-  // Already clean: one quiet line, no error, no panic.
-  const cleanLine = only(reports(false, reportFreeRoot()));
-  assert.match(cleanLine, /^ok:/);
-  assert.match(cleanLine, /已不存在/);
-});
-
-/** Exactly one report line, so the assertions below read a string. */
-function only(lines: string[]): string {
-  assert.equal(lines.length, 1);
-  const line = lines[0];
-  assert.ok(line !== undefined);
-  return line;
-}
-
-function reportFreeRoot(): string {
-  const root = mkdtempSync(join(tmpdir(), "coworkflow-trellis-clean-"));
-  mkdirSync(join(root, ".pi", "agents"), { recursive: true });
-  return root;
-}
-
-test("trellis: the guard runs after `trellis update -s` and after a fresh `trellis init`", () => {
-  const source = readFileSync(join(ROOT, "modules", "trellis", "index.ts"), "utf-8");
-  const updateAt = source.indexOf('["update", "-s"]');
-  const initAt = source.indexOf('["init", "--pi", "-y"]');
-  assert.ok(updateAt > 0 && initAt > 0, "the aligner commands moved: this test reads the module source");
-  const afterUpdate = source.indexOf("retireRoleAgentsAndReport(ctx)", updateAt);
-  const afterInit = source.indexOf("retireRoleAgentsAndReport(ctx)", initAt);
-  assert.ok(afterUpdate > updateAt, "no guard call after `trellis update -s`");
-  assert.ok(afterInit > initAt, "no guard call after `trellis init`, which writes the same agents");
+  // Already clean: no removal line at all.
+  const clean = tempProject();
+  const cleanLines: string[] = [];
+  renderTemplate(
+    createContext({ root: clean, prefix: "", dry: false, report: (status, message) => cleanLines.push(`${status}:${message}`) }),
+  );
+  assert.ok(!cleanLines.some((line) => line.includes("移除")), cleanLines.join(" | "));
 });

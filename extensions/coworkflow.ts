@@ -7,7 +7,7 @@
  * per module, and hands out the control surface the panels use. Every layer
  * lives in `modules/<id>/` and can be read, changed, or deleted on its own:
  *
- *   modules/trellis/           the modified Trellis itself (delegates to the CLI)
+ *   modules/trellis/           the modified Trellis itself (renders templates/trellis/)
  *   modules/worktree/          the after_start hook that isolates every task
  *   modules/agents/            the two instruction files: project region + child guide
  *   modules/subagents/         reuse or project-install pi-subagents
@@ -1426,7 +1426,7 @@ export default function coworkflowExtension(pi: PiRuntimeHost): void {
 
   pi.registerCommand?.(`${NS}:init`, {
     description:
-      `初始化/刷新本项目的 Coworkflow 层（模块：${moduleIds()}）；--enable/--disable <id,...> 改模块开关，--auto-enable on|off 改新会话是否自动加载，--trellis-update 代跑 \`trellis update -s\`，--prefix <p> 改 worktree 前缀，--dry-run 只报告`,
+      `初始化/刷新本项目的 Coworkflow 层（模块：${moduleIds()}）；--enable/--disable <id,...> 改模块开关，--auto-enable on|off 改新会话是否自动加载，--trellis-update 已废弃（模板由本包渲染），--prefix <p> 改 worktree 前缀，--dry-run 只报告`,
     handler: setupHandler(false),
   });
 

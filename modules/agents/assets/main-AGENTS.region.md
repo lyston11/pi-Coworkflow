@@ -11,7 +11,7 @@
 - `autoEnable` 决定**新会话是否自动跑**运行时模块；默认不自动跑，需要时用 `/Coworkflow:start` 只为当前会话打开（派发的子 agent 会跟随，因为开关按会话 id 记录）。
 - 用 `/Coworkflow:init` 安装或刷新，`/Coworkflow:init --enable <id> --disable <id>` 改模块开关，`--auto-enable on|off` 改新会话自动跑，`/Coworkflow:status` 查看当前状态。关掉某个模块会收回它写下的东西（如本区、`config.yaml` 的 `after_start` 注册）。
 - 模型与思考等级用 `/Comodels` 面板调：主会话那一页只影响本会话，子 agent 那一页写本项目 `.pi/settings.json` 的 `subagents.*`（不写全局）。
-- 项目以前用过 Trellis 也没关系：`tasks/` `spec/` `workspace/` `.runtime/` 等记录原样保留；范式（Pi 扩展、提示词、agent 定义、workflow 文档）由 `trellis update` 对齐到本仓版本，本包只加自己那一层。
+- 项目以前用过 Trellis 也没关系：`tasks/` `spec/` `workspace/` `.runtime/` 等记录原样保留；范式（Pi 扩展、提示词、agent 定义、workflow 文档、Trellis 脚本）由**本包随附的模板**渲染，不依赖全局 `trellis` CLI——那个 CLI 是可选的，只有 `trellis mem` / `trellis channel` 这类运行时功能需要它（本包不自带这两项）。**不要手工跑 `trellis update`**：它会把范式换回上游版本，与本包模板混成两种真相；要刷新就再跑一次 `/Coworkflow:init`，本包只加自己那一层。
 - 这些都是项目级的：不会写用户的全局设置。`pi-subagents` 若已安装则直接复用，否则只声明在项目的 `.pi/settings.json`。
 
 ### 任务隔离（多 agent 硬性规则）
