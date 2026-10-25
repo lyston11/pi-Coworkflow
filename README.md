@@ -666,7 +666,8 @@ Pi 把 `.pi/settings.json`、`.pi/extensions`、`.pi/agents` 等当作**受信�
 
 ```bash
 npm run typecheck     # tsc --noEmit
-npm test              # 224 项，node --test，无第三方依赖
+npm test              # node --test 回归套件
+npm run verify:dispatch # 已安装 Pi + pi-subagents 时，验证真实后台派发与注入
 ```
 
 `npm test` 覆盖的正是「失效时不会报错、只会静默给错答案」的那几处：
@@ -680,6 +681,12 @@ npm test              # 224 项，node --test，无第三方依赖
 - `config.yaml` 被重排后 `after_start` 注册仍能被移除（worktree 用例）
 - 配置根按会话缓存、git 失败不被当成当前目录（`config-root.test.ts`）
 - 新模块默认值：gate 默认关、观察默认开、显式值优先（`switch-default.test.ts`）
+
+`verify:dispatch` 使用临时 Git 仓库、独立 Pi 配置和本地测试模型，不调用外部模型服务。
+它启动四个真实后台子进程，验证上限为二时的排队、依赖和自动续派，并检查每个
+worktree 子会话最终送到模型的系统提示词是否包含 PRD、design、implement 和规范内容。
+成功后清理临时 worktree；失败时保留证据并打印目录。这个探针验证运行时接线，
+不衡量真实模型是否会主动拆分工作或选择派单。
 
 手工探针（真实写文件，慎用）：
 

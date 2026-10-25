@@ -4,7 +4,7 @@
 
 - Trellis owns task requirements, task identity, parent approval, and the task's verified integration worktree.
 - pi-subagents owns execution, native workflow child keys, missions, async attempts, public status/cost, session history attribution when possible, completion delivery, and upstream capacity.
-- Coworkflow owns a bounded public RPC adapter, project-scoped admission at this extension's launch boundaries, role context, module gates, and task-to-native identity/artifact links. It is not a second runner, scheduler, retry queue, or lifecycle ledger.
+- Coworkflow owns a bounded public RPC adapter, project-scoped admission at this extension's launch boundaries, role context, module gates, task-to-native identity/artifact links, and a session-local pending-work queue. It does not own execution, persistent scheduling, retries, or native lifecycle records.
 - `core/subagents-client.ts` is the single RPC v1 DTO decoder for ping, activity, cost, admission, and correlated replies. `core/pi-subagents.ts` owns structured completion/result/artifact projections. Consumers use these projections; they do not reinterpret raw messages or private runner files.
 - `core/subagents-workflow.ts` registers `coworkflow.implement-review` **and** `coworkflow.fanout` in one pass and stores only verified task/native mission/run IDs, explicitly returned artifact references, and the two timestamps the overlap measurement needs. Existing `.trellis/.runtime/lanes/` pointers remain readable; new observers do not manufacture identities from prose, filenames, array order, or “only pending” assumptions.
 
@@ -113,6 +113,75 @@ This package's project surface speaks kinds only. `trellis-implement` / `trellis
 Rendering is the only writer of this surface. Two sources would leave it half one thing and half another with no run reconciling them, so a refresh is another `/Coworkflow:init` (idempotent, user data untouched).
 
 `.trellis/workflow.md` comes from the same template set. Its dispatch guidance selects configured kinds and returns acceptance to the main session. User data beside it (`tasks/`, `spec/`, `workspace/`) is never overwritten by rendering.
+
+## Scenario: native dispatch and task-context acceptance
+
+### 1. Scope / trigger
+
+Changes to child identity, task routing, completion outcomes or RPC admission require
+checks at the host boundary as well as pure queue tests. A successful child receipt
+does not prove that the child received its task documents.
+
+### 2. Signatures
+
+- `settleOutcomeOf(payload): "completed" | "failed" | "stopped" | "unknown"`
+- `createDispatchQueue(deps, epoch).submit({tasks, worktree?})`
+- `resolveChildTask(root, sessionName, ...texts): TaskResolution`
+- `npm run verify:dispatch`: installed Pi and pi-subagents, real detached children,
+  a local deterministic model provider, no external model requests.
+
+### 3. Contracts
+
+`tasks` has 1–24 `{key?, kind, task, needs?}` units. Only confirmed successful
+completion satisfies `needs`. Return `started`, `queued`, `failed` and `unobserved`
+separately; state lists agree with `snapshot()` even while dispatch is disabled.
+Shutdown or an epoch change invalidates pending work; no implicit restart occurs.
+
+The injector resolves custom/wrapped names from the current kind definitions.
+`role: none` wins over inherited markers. An explicit invalid task reference stays
+invalid; a documentation placeholder permits parent-pointer fallback. Emit the
+absolute artifact directory for children whose cwd is a linked worktree.
+
+The native probe sets `PI_CODING_AGENT_DIR` to a temporary isolated directory and
+`PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT` to its installed SDK root. It loads one
+build of Coworkflow. The provider inspects normalized `context.messages` system
+messages; `context.systemPrompt` is not available at that provider boundary.
+Use the extension event's `ctx.cwd`, not `process.cwd()`, for the child workspace.
+
+### 4. Validation and error matrix
+
+| Condition | Required behavior |
+| --- | --- |
+| Paused/stopped/failed/unknown completion | Never release dependent work as success |
+| Cycle or self-cycle | Reject the submission before changing queue state |
+| Gate closes during an await | Stop launches; preserve actual completion/failure evidence |
+| Ambiguous spawn receipt | Retain reservation, report `unobserved`, never retry |
+| Explicit missing task | Report invalid reference; never use another active task |
+| Fixture loads both main and worktree builds | Invalid verification setup; isolate configuration |
+
+### 5. Good / base / bad cases
+
+Good: four children, two slots, capacity and dependency waiting, four distinct
+worktrees, four document sentinels in every child's final model request.
+Base: an unknown role receives the generic child guide.
+Bad: a green subprocess exit without document evidence is called injection success.
+
+### 6. Required tests
+
+`scripts/dispatch-host.test.ts` drives production registration, public RPC events,
+capacity, outcome classification and epoch races. `scripts/dispatch-queue.test.ts`
+covers atomic cycle rejection and result/snapshot agreement, including closed gates.
+`scripts/test.ts` covers role overrides, placeholders, invalid paths and prompt
+idempotency. `scripts/verify-dispatch.mjs` observes real processes and final system
+messages, asserts the four-child scenario, and removes its clean worktrees on success.
+
+### 7. Wrong vs correct
+
+Wrong: run a worktree extension alongside the user's globally configured main copy,
+then interpret whichever injection block was written last as the worktree's result.
+Correct: isolate the probe's agent directory, verify the loaded entry, and assert
+document contents at the final provider boundary. This validates mechanical delivery;
+whether a real model chooses to delegate remains a separate behavioral evaluation.
 
 ## Human authority and UI compatibility
 
