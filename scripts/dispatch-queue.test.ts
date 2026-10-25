@@ -92,6 +92,29 @@ function fakeOwner(limits: Record<string, number>) {
 const units = (...keys: string[]) =>
   keys.map((key) => ({ key, kind: "executor", task: `do ${key}` }));
 
+test("queue: closing the gate preserves failure and uncertain-launch reports", async () => {
+  const owner = fakeOwner({ executor: 4 });
+  let open = true;
+  const queue = createDispatchQueue({
+    ...owner.deps,
+    gate: () => open ? null : "disabled",
+    launch: async (request) => request.key === "uncertain"
+      ? { ok: false, reason: "receipt lost", disposition: "unobserved" }
+      : owner.deps.launch(request),
+  }, 1);
+  await queue.submit({ tasks: [
+    ...units("a", "uncertain"),
+    { key: "dependent", kind: "executor", task: "review a", needs: ["a"] },
+  ] });
+  open = false;
+  const result = await queue.settle(owner.runId("a"), "failed");
+  assert.deepEqual(result.failed.map(entry => entry.key), ["a", "dependent"]);
+  assert.deepEqual(result.unobserved, [{ key: "uncertain", kind: "executor", detail: "receipt lost" }]);
+  assert.deepEqual(result.failed, queue.snapshot().failed);
+  assert.deepEqual(result.unobserved, queue.snapshot().unobserved);
+  assert.equal(owner.launches.length, 1, "closed gate does not start the dependent");
+});
+
 test("queue: a ceiling of 2 with 4 units starts 2, and one completion starts the 3rd", async () => {
   const owner = fakeOwner({ executor: 2 });
   const queue = createDispatchQueue(owner.deps, 1);

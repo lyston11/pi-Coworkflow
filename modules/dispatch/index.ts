@@ -408,6 +408,8 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
         task.reason = "gated";
         result.queued.push({ key: task.key, kind: task.kind, reason: "gated" });
       }
+      result.failed = failedList();
+      result.unobserved = unobservedList();
       return result;
     }
     for (const task of tasks) {
