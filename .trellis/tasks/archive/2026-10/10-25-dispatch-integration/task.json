@@ -1,0 +1,31 @@
+{
+  "id": "dispatch-integration",
+  "name": "dispatch-integration",
+  "title": "Audit and repair Trellis dispatch integration",
+  "description": "Review and fix evidence-backed mismatches across bundled Trellis, kind context injection, admission and event-driven dispatch",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "lyston11",
+  "assignee": "lyston11",
+  "createdAt": "2026-10-25",
+  "completedAt": "2026-10-25",
+  "branch": "feat/10-25-dispatch-integration",
+  "base_branch": "main",
+  "worktree_path": "/private/tmp/wt-10-25-dispatch-integration",
+  "commit": "dac9b1b",
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "10-25-dispatch-context-fix",
+    "10-25-dispatch-lifecycle-fix"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "Integrated into main; typecheck and 335 tests passed. Native four-child dispatch/injection probe passed; see parent verification.md.",
+  "meta": {
+    "worktree_path": "/private/tmp/wt-10-25-dispatch-integration"
+  }
+}

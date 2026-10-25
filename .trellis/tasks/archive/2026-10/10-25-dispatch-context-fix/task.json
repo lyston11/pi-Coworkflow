@@ -1,0 +1,28 @@
+{
+  "id": "dispatch-context-fix",
+  "name": "dispatch-context-fix",
+  "title": "Dynamic kind context and isolated task paths",
+  "description": "Fix custom kind resolution, authoritative task paths and owned launch defaults",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "lyston11",
+  "assignee": "lyston11",
+  "createdAt": "2026-10-25",
+  "completedAt": "2026-10-25",
+  "branch": "feat/10-25-dispatch-context-fix",
+  "base_branch": "main",
+  "worktree_path": "/Users/lyston/PycharmProjects/wt-10-25-dispatch-context-fix",
+  "commit": "73ba40e",
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": "10-25-dispatch-integration",
+  "relatedFiles": [],
+  "notes": "Integrated into main; typecheck and 335 tests passed. Native four-child dispatch/injection probe passed; see parent verification.md.",
+  "meta": {
+    "worktree_path": "/Users/lyston/PycharmProjects/wt-10-25-dispatch-context-fix"
+  }
+}

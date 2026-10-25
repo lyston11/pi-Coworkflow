@@ -1,0 +1,28 @@
+{
+  "id": "dispatch-lifecycle-fix",
+  "name": "dispatch-lifecycle-fix",
+  "title": "Dispatch queue lifecycle and host wiring",
+  "description": "Fix dependency outcomes, validation, runtime gates and RPC capacity accounting",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "lyston11",
+  "assignee": "lyston11",
+  "createdAt": "2026-10-25",
+  "completedAt": "2026-10-25",
+  "branch": "feat/10-25-dispatch-lifecycle-fix",
+  "base_branch": "main",
+  "worktree_path": "/Users/lyston/PycharmProjects/wt-10-25-dispatch-lifecycle-fix",
+  "commit": "90fad57",
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": "10-25-dispatch-integration",
+  "relatedFiles": [],
+  "notes": "Integrated into main; typecheck and 335 tests passed. Native four-child dispatch/injection probe passed; see parent verification.md.",
+  "meta": {
+    "worktree_path": "/Users/lyston/PycharmProjects/wt-10-25-dispatch-lifecycle-fix"
+  }
+}
