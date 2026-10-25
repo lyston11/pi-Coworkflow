@@ -129,6 +129,55 @@ test("queue: needs keeps a unit waiting until every prerequisite is completed", 
   assert.deepEqual(second.started.map((entry) => entry.key), ["audit"], "a satisfied need starts it");
 });
 
+test("queue: a launch-failure cascade is reported as failed, never as still queued", async () => {
+  // The shape a real smoke produced: every launch is refused outright, and `d` needs
+  // `a`. The cascade fails `d` after this pass already decided it was "waiting for a
+  // prerequisite", so the response used to contradict the snapshot it came from.
+  const refused: DispatchDeps = {
+    async admit(kind: string): Promise<AdmitResult> {
+      return {
+        ok: true,
+        kind,
+        policy: { kind, agent: `cw-${kind}`, label: kind, enabled: true, maxConcurrent: 5, source: "shipped" } as never,
+        config: null,
+      };
+    },
+    async launch() {
+      return { ok: false as const, reason: "pi-subagents 拒绝了这个 spawn：缺少 provider 配置" };
+    },
+  };
+  const queue = createDispatchQueue(refused, 1);
+  const result = await queue.submit({
+    tasks: [
+      { key: "a", kind: "executor", task: "do a" },
+      { key: "b", kind: "executor", task: "do b" },
+      { key: "c", kind: "executor", task: "do c" },
+      { key: "d", kind: "executor", task: "do d", needs: ["a"] },
+    ],
+  });
+
+  assert.deepEqual(result.started, []);
+  assert.deepEqual(result.queued, [], "the cascade failed d, so nothing is still waiting");
+  assert.deepEqual(
+    result.failed.map((entry) => [entry.key, entry.reason]),
+    [
+      ["a", "pi-subagents 拒绝了这个 spawn：缺少 provider 配置"],
+      ["b", "pi-subagents 拒绝了这个 spawn：缺少 provider 配置"],
+      ["c", "pi-subagents 拒绝了这个 spawn：缺少 provider 配置"],
+      ["d", "dependency"],
+    ],
+  );
+  // The response is the snapshot, not a mid-loop guess.
+  const snapshot = queue.snapshot();
+  assert.deepEqual(result.queued, snapshot.queued);
+  assert.deepEqual(result.failed, snapshot.failed);
+  assert.deepEqual(result.unobserved, snapshot.unobserved);
+  const body = renderDispatchResult(result);
+  assert.match(body, /0 已启动 \/ 0 排队 \/ 0 启动未确认 \/ 4 失败/, body);
+  assert.match(body, /x d（kind executor）失败：dependency/, body);
+  assert.doesNotMatch(body, /… d/, "a cascade failure must not also be listed as waiting");
+});
+
 test("queue: a failed prerequisite fails its dependents instead of queueing them forever", async () => {
   const owner = fakeOwner({ executor: 2 });
   const queue = createDispatchQueue(owner.deps, 1);
@@ -182,7 +231,7 @@ test("queue: a session replacement invalidates the queue and reports what it dis
   await queue.submit({ tasks: units("a", "b", "c", "d") });
 
   const invalidated = queue.bindSession(2);
-  assert.deepEqual(invalidated, { running: 2, queued: 2 });
+  assert.deepEqual(invalidated, { running: 2, queued: 2, unobserved: 0 });
   assert.deepEqual(queue.snapshot().running, [], "the old session's runs are not this session's queue");
   const lines = queue.statusLines();
   assert.ok(lines.some((line) => line.includes("会话换代作废了上一代队列")), lines.join("\n"));
@@ -230,9 +279,151 @@ test("report: what started, what waits and why is readable without the tool resu
   const queue = createDispatchQueue(owner.deps, 1);
   const result = await queue.submit({ tasks: units("a", "b") });
   const body = renderDispatchResult(result);
-  assert.match(body, /1 已启动 \/ 1 排队 \/ 0 失败/);
+  assert.match(body, /1 已启动 \/ 1 排队 \/ 0 启动未确认 \/ 0 失败/);
   assert.match(body, /\+ a（kind executor）runId run-a/);
   assert.match(body, /… b（kind executor）排队：名额已满/);
+});
+
+// ── launches whose outcome is unknown belong in the result, not only the status ──
+
+/** A launch whose request was emitted and whose outcome nobody can prove. */
+const unconfirmedLaunch = (): DispatchDeps => ({
+  async admit(kind: string): Promise<AdmitResult> {
+    return {
+      ok: true,
+      kind,
+      policy: { kind, agent: `cw-${kind}`, label: kind, enabled: true, maxConcurrent: 5, source: "shipped" } as never,
+      config: null,
+    };
+  },
+  async launch() {
+    return { ok: false as const, reason: "spawn 超时，可能已经在跑", disposition: "unobserved" as const };
+  },
+});
+
+test("queue: an unconfirmed launch is reported in the result itself, not only in status lines", async () => {
+  const queue = createDispatchQueue(unconfirmedLaunch(), 1);
+  const result = await queue.submit({ tasks: units("a") });
+  // The defect this pins: the unit used to appear in no list at all, so the result
+  // read `0 已启动 / 0 排队 / 0 失败` for work that may well be running.
+  assert.deepEqual(result.started, []);
+  assert.deepEqual(result.failed, [], "an unconfirmed launch is not a proven failure");
+  assert.deepEqual(result.unobserved.map((entry) => entry.key), ["a"]);
+  const body = renderDispatchResult(result);
+  assert.match(body, /0 已启动 \/ 0 排队 \/ 1 启动未确认 \/ 0 失败/, body);
+  assert.match(body, /\? a（kind executor）启动未确认/, body);
+  assert.match(body, /不会重发/, body);
+  assert.deepEqual(queue.snapshot().unobserved.map((entry) => entry.key), ["a"]);
+});
+
+test("queue: a session replacement counts unconfirmed launches instead of erasing them", async () => {
+  const queue = createDispatchQueue(unconfirmedLaunch(), 1);
+  await queue.submit({ tasks: units("a", "b") });
+  const invalidated = queue.bindSession(2);
+  assert.deepEqual(invalidated, { running: 0, queued: 0, unobserved: 2 });
+  const lines = queue.statusLines().join("\n");
+  assert.match(lines, /2 启动未确认/, lines);
+  assert.doesNotMatch(lines, /dispatch: 0 运行 \/ 0 排队（/, "the replacement is not reported as a clean empty queue");
+});
+
+// ── the operation's epoch, not the queue's, decides whether it may start ──
+
+/** A queue whose admission is held open so a session replacement can land inside it. */
+function deferredAdmit(limits: Record<string, number> = { executor: 5 }) {
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const launches: LaunchRequest[] = [];
+  const deps: DispatchDeps = {
+    async admit(kind: string): Promise<AdmitResult> {
+      await held;
+      const limit = limits[kind] ?? 5;
+      return {
+        ok: true,
+        kind,
+        policy: { kind, agent: `cw-${kind}`, label: kind, enabled: true, maxConcurrent: limit, source: "shipped" } as never,
+        config: null,
+      };
+    },
+    async launch(request: LaunchRequest) {
+      launches.push(request);
+      return { ok: true as const, runId: `run-${request.key}` };
+    },
+  };
+  return { deps, launches, release: () => release() };
+}
+
+const settleTick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("queue: a replacement during an awaited admission drops that submission instead of launching", async () => {
+  const held = deferredAdmit();
+  const queue = createDispatchQueue(held.deps, 1);
+  const submission = queue.submit({ tasks: units("a") });
+  await settleTick();
+  queue.bindSession(2);
+  held.release();
+  await assert.rejects(submission, /会话已更换/, "the old submission must not be adopted by the new session");
+  assert.deepEqual(held.launches, [], "nothing launches into the session that replaced it");
+  assert.equal(queue.epoch, 2);
+  assert.deepEqual(queue.snapshot().queued, []);
+});
+
+test("queue: an old submission queued behind a deferred admission is dropped too", async () => {
+  const held = deferredAdmit();
+  const queue = createDispatchQueue(held.deps, 1);
+  // Both calls are made in epoch 1; the second is still waiting in the serial chain
+  // when the session is replaced, which is exactly the window that used to relaunch.
+  const first = queue.submit({ tasks: units("a") });
+  const second = queue.submit({ tasks: units("b") });
+  await settleTick();
+  queue.bindSession(2);
+  held.release();
+  await assert.rejects(first, /会话已更换/);
+  await assert.rejects(second, /会话已更换/);
+  assert.deepEqual(held.launches, [], "an old queued submit cannot start in the new epoch");
+});
+
+test("queue: a replacement during an awaited settlement starts nothing either", async () => {
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let deferNext = false;
+  const launches: LaunchRequest[] = [];
+  const deps: DispatchDeps = {
+    async admit(kind: string): Promise<AdmitResult> {
+      if (deferNext) await held;
+      return {
+        ok: true,
+        kind,
+        policy: { kind, agent: `cw-${kind}`, label: kind, enabled: true, maxConcurrent: 5, source: "shipped" } as never,
+        config: null,
+      };
+    },
+    async launch(request: LaunchRequest) {
+      launches.push(request);
+      return { ok: true as const, runId: `run-${request.key}` };
+    },
+  };
+  const queue = createDispatchQueue(deps, 1);
+  await queue.submit({
+    tasks: [
+      { key: "a", kind: "executor", task: "do a" },
+      { key: "b", kind: "executor", task: "do b", needs: ["a"] },
+    ],
+  });
+  assert.deepEqual(launches.map((entry) => entry.key), ["a"]);
+
+  // The completion frees the slot, so its pass awaits the admission of `b`.
+  deferNext = true;
+  const settlement = queue.settle("run-a", "completed");
+  await settleTick();
+  queue.bindSession(2);
+  release();
+  const settled = await settlement;
+  assert.deepEqual(launches.map((entry) => entry.key), ["a"], "a stale completion starts nothing in the next epoch");
+  assert.equal(settled.stale, true, "the caller can tell the operation was dropped");
 });
 
 test("tool: activation registers coworkflow.dispatch once and releases its observers on session end", () => {
