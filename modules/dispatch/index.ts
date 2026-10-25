@@ -81,6 +81,21 @@ export interface DispatchResult {
   started: { key: string; runId: string; kind: string }[];
   queued: { key: string; kind: string; reason: QueueReason }[];
   failed: { key: string; kind: string; reason: string }[];
+  /**
+   * Launches whose outcome is unknown: possibly started, never retried.
+   *
+   * Without this field such a unit appeared in no list at all, so a caller reading
+   * only the counts saw `0 已启动 / 0 排队 / 0 失败` for work that may well be running.
+   */
+  unobserved: { key: string; kind: string; detail: string }[];
+  /**
+   * Set when the session changed while this operation was awaiting something.
+   *
+   * The operation belongs to the epoch it was called in, and never to the one that
+   * replaced it: whatever it had started is reported, nothing new is started, and
+   * the submission is not adopted into the new session's queue.
+   */
+  stale?: true;
 }
 
 /**
@@ -91,12 +106,15 @@ export interface DispatchResult {
  *     keeps its place in line;
  *   - `unobserved` — the request was emitted and its outcome is unknown. That is not
  *     "no process started" and it is not a completion; the unit is reported as
- *     unconfirmed and its reservation stays held until the session ends.
+ *     unconfirmed and its reservation stays held until the session ends;
+ *   - `gated` — nothing was emitted and nothing was consumed, but the reason is a
+ *     closed switch rather than a full ceiling, so the unit keeps its place in line
+ *     under the `gated` reason instead of claiming capacity will free it.
  */
 export type LaunchOutcome = { ok: true; runId: string } | {
   ok: false;
   reason: string;
-  disposition?: "failed" | "wait" | "unobserved";
+  disposition?: "failed" | "wait" | "unobserved" | "gated";
 };
 
 /** The verdict of one observed completion. Only `completed` releases a `needs`. */
@@ -175,6 +193,8 @@ interface Task {
 export interface SessionInvalidation {
   running: number;
   queued: number;
+  /** Launches that may have started and can no longer be observed from here. */
+  unobserved: number;
 }
 
 export interface DispatchSnapshot {
@@ -233,6 +253,22 @@ function closedReason(deps: DispatchDeps): string | null {
 }
 
 /**
+ * A submission that outlived its own session.
+ *
+ * Thrown rather than returned, because the batch was *not* adopted: an empty result
+ * would read as "nothing to do", and a result with counts would attribute work to a
+ * session that never accepted it.
+ */
+function staleSubmission(startedBeforeReplacement = 0): Error {
+  const launched = startedBeforeReplacement > 0
+    ? `换代前已启动了 ${startedBeforeReplacement} 个，它们属于上一代会话。`
+    : "";
+  return new Error(
+    `会话已更换：这次提交没有并入新会话的队列，也没有自动重启。${launched}请在当前会话重新提交。`,
+  );
+}
+
+/**
  * The first dependency cycle among the units of one batch, as the keys on it.
  *
  * Only the submitted batch is walked: a prerequisite that is already in the queue
@@ -286,6 +322,10 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
     return next;
   }
 
+  function emptyResult(): DispatchResult {
+    return { started: [], queued: [], failed: [], unobserved: [] };
+  }
+
   function index(): Map<string, Task> {
     return new Map(tasks.map((task) => [task.key, task]));
   }
@@ -320,10 +360,20 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
    * Both gates are read here, not only at call time: `deps.gate()` before the
    * admission and again after it (the admission awaits public reads, and a module
    * switched off or a session replaced during that await must not launch anything).
+   *
+   * `opEpoch` is the epoch the operation was *called* in, captured before it joined
+   * the serial chain. Comparing the live epoch against it is what stops an operation
+   * that survived an awaited admission from launching into the session that replaced
+   * it: after `bindSession(new)` the queue's epoch equals the runtime's again, so a
+   * gate that only asked "do these agree?" would answer yes and let the old loop run.
    */
-  async function pass(): Promise<DispatchResult> {
+  async function pass(opEpoch: number): Promise<DispatchResult> {
+    const result = emptyResult();
+    if (currentEpoch !== opEpoch) {
+      result.stale = true;
+      return result;
+    }
     cascade();
-    const result: DispatchResult = { started: [], queued: [], failed: [] };
     const blocked = closedReason(deps);
     if (blocked !== null) {
       for (const task of tasks) {
@@ -346,6 +396,11 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
         continue;
       }
       const admitted = await deps.admit(task.kind);
+      // A session replacement during the admission ends this operation here.
+      if (currentEpoch !== opEpoch) {
+        result.stale = true;
+        return result;
+      }
       if (!admitted.ok) {
         if (admitted.failure.code === "over-ceiling") {
           task.reason = "ceiling";
@@ -357,8 +412,9 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
         }
         continue;
       }
-      // The gate again, after the awaited admission: switching a module off or
-      // replacing the session during that read must not let this launch through.
+      // The gate again, after the awaited admission: switching a module off during that
+      // read must not let this launch through. (The session-replacement half of this
+      // gate is the epoch identity check above, which the queue's own epoch cannot see.)
       if (closedReason(deps) !== null) {
         task.reason = "gated";
         result.queued.push({ key: task.key, kind: task.kind, reason: "gated" });
@@ -371,6 +427,12 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
         task: task.task,
         ...(task.worktree === true ? { worktree: true } : {}),
       });
+      // The launch itself awaits public reads: a replacement during it stops the
+      // operation before it can record anything into the new epoch's queue.
+      if (currentEpoch !== opEpoch) {
+        result.stale = true;
+        return result;
+      }
       if (!launched.ok) {
         // Capacity, not this unit: nothing started and nothing was consumed, so it
         // keeps its place in line instead of being written off as a failure.
@@ -379,11 +441,19 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
           result.queued.push({ key: task.key, kind: task.kind, reason: "ceiling" });
           continue;
         }
+        // A closed switch mid-launch: still nothing emitted, but waiting for capacity
+        // is not what lifts it, so it keeps the `gated` reason.
+        if (launched.disposition === "gated") {
+          task.reason = "gated";
+          result.queued.push({ key: task.key, kind: task.kind, reason: "gated" });
+          continue;
+        }
         // Emitted, unconfirmed: reported as such. Never retried, and never counted
         // as either success or a proven non-start.
         if (launched.disposition === "unobserved") {
           task.status = "unobserved";
           task.reason = launched.reason;
+          result.unobserved.push({ key: task.key, kind: task.kind, detail: launched.reason });
           continue;
         }
         task.status = "failed";
@@ -453,28 +523,43 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
       const report: SessionInvalidation = {
         running: tasks.filter((task) => task.status === "running").length,
         queued: tasks.filter((task) => task.status === "waiting").length,
+        // An uncertain launch is not an empty queue: the process may well be running,
+        // and it can no longer be observed from the session that replaced this one.
+        unobserved: tasks.filter((task) => task.status === "unobserved").length,
       };
       tasks = [];
       currentEpoch = nextEpoch;
       // Nothing in flight means nothing was discarded; that is not a report.
-      invalidated = report.running + report.queued > 0 ? report : null;
+      invalidated = report.running + report.queued + report.unobserved > 0 ? report : null;
       return invalidated;
     },
 
     submit(input: DispatchInput): Promise<DispatchResult> {
+      // The epoch of the *call*, not of the moment this work finally runs: an awaited
+      // admission must not carry an old submission into the next session.
+      const opEpoch = currentEpoch;
       return serial(async () => {
+        if (currentEpoch !== opEpoch) throw staleSubmission();
         const planned = validate(input);
         tasks.push(...planned.tasks);
-        return pass();
+        const result = await pass(opEpoch);
+        // A replacement during the pass discarded the batch with the rest of the old
+        // queue: reporting `0/0/0` would claim the caller's plan was never handed over.
+        if (result.stale === true) throw staleSubmission(result.started.length);
+        return result;
       });
     },
 
     settle(runId: string, outcome: SettleOutcome): Promise<DispatchResult> {
+      const opEpoch = currentEpoch;
       return serial(async () => {
+        // A completion observed for a session that is gone must not settle — or start
+        // — anything in the session that replaced it.
+        if (currentEpoch !== opEpoch) return emptyResult();
         const task = tasks.find((entry) => entry.runId === runId);
         // A duplicate observation of a run we already settled changes nothing.
         if (task !== undefined && task.status !== "running") {
-          return { started: [], queued: [], failed: [] };
+          return emptyResult();
         }
         if (task !== undefined) {
           if (outcome === "completed") {
@@ -490,8 +575,10 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
         // A completion — ours or a foreign run's — is a moment real capacity freed, so
         // waiting work gets one fresh admission here instead of waiting for the next
         // call. A foreign run is never read as success: only our own `completed` unit
-        // releases a `needs`, and admission still asks the owner what is free.
-        return pass();
+        // releases a `needs`, and admission still asks the owner what is free. A closed
+        // module switch or a replaced session is enforced inside `pass` itself, which is
+        // why recording the end above does not depend on those switches.
+        return pass(opEpoch);
       });
     },
 
@@ -531,8 +618,10 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
         );
       }
       if (snapshot.invalidated !== null) {
+        const report = snapshot.invalidated;
+        const uncertain = report.unobserved > 0 ? ` / ${report.unobserved} 启动未确认` : "";
         lines.push(
-          `  dispatch: 会话换代作废了上一代队列（${snapshot.invalidated.running} 运行 / ${snapshot.invalidated.queued} 排队）：` +
+          `  dispatch: 会话换代作废了上一代队列（${report.running} 运行 / ${report.queued} 排队${uncertain}）：` +
           "那些 run 仍属于旧会话，不在这里当作空队列",
         );
       }
@@ -583,6 +672,7 @@ async function spawnViaRpc(
   host: PiRuntimeHost,
   runtime: RuntimeContext,
   request: LaunchRequest,
+  gate?: () => string | null,
 ): Promise<LaunchOutcome> {
   const epoch = runtime.sessionEpoch;
   const bridge = attachSubagents(host, { epoch, events: host.events });
@@ -597,9 +687,17 @@ async function spawnViaRpc(
     // consumed, so the unit stays in line for the next completion.
     return { ok: false, reason: admission.reason, disposition: "wait" };
   }
+  // The bridge read awaits public state, so the switch that was open when the queue
+  // asked is not necessarily open now. Nothing has been emitted at this point, which
+  // is the one moment a reservation can be dropped on proof rather than on a guess.
   if (runtime.sessionEpoch !== epoch) {
     bridge.release(launchId);
-    return { ok: false, reason: "会话在启动期间更换，未把这次启动算进本会话", disposition: "wait" };
+    return { ok: false, reason: "会话在启动期间更换，未把这次启动算进本会话", disposition: "gated" };
+  }
+  const closed = gate === undefined ? null : gate();
+  if (closed !== null) {
+    bridge.release(launchId);
+    return { ok: false, reason: closed, disposition: "gated" };
   }
 
   const reply = await bridge.client.spawn(
@@ -615,7 +713,7 @@ async function spawnViaRpc(
   );
   if (runtime.sessionEpoch !== epoch) {
     bridge.release(launchId);
-    return { ok: false, reason: "会话在启动期间更换，未把这次启动算进本会话", disposition: "wait" };
+    return { ok: false, reason: "会话在启动期间更换，未把这次启动算进本会话", disposition: "gated" };
   }
   if (!reply.ok) {
     if (reply.ambiguous) {
@@ -628,9 +726,11 @@ async function spawnViaRpc(
     return { ok: false, reason: reply.message };
   }
   if (reply.data.runId === null) {
-    // The client already reports this as ambiguous; kept as a guard so an owner that
-    // answers without a run id can never be mistaken for a confirmed launch.
-    bridge.release(launchId);
+    // Possibly emitted, with no run id to prove otherwise. `bind` with a null id is the
+    // shared bridge's own way of keeping such a reservation (its alias, if one was
+    // tracked, is what a later status read can identify); releasing it here would
+    // hand the capacity of a live process to the next queued unit.
+    bridge.bind(launchId, reply.data.runId);
     return {
       ok: false,
       reason: "pi-subagents 的 spawn 回复没有运行确认；这次派单可能已经在跑，本扩展不会重发，请用 status 查证后再决定",
@@ -681,18 +781,21 @@ function queueFor(host: PiRuntimeHost, runtime: RuntimeContext): DispatchQueue {
   const state = hostState(host);
   state.runtime = runtime;
   if (state.queue === null) {
+    // Every automatic start asks the current switches: a module closed, or a
+    // session replaced, stops the queue from starting anything on its own. The same
+    // answer is asked again *after* the launch's own capacity read, where a launch
+    // that has not emitted yet can still be withdrawn.
+    const gate = (): string | null => {
+      if (!runtime.enabled || runtime.isChild) return "本会话没有加载 Coworkflow";
+      if (!runtime.control.moduleEnabled("dispatch")) return "dispatch 模块已关闭，当前不会自动启动";
+      if (!runtime.control.moduleEnabled("agent-kinds")) return "agent-kinds 已关闭，当前不会自动启动";
+      if (state.queue !== null && state.queue.epoch !== runtime.sessionEpoch) return "会话已更换";
+      return null;
+    };
     const deps: DispatchDeps = {
       admit: (kind) => admitDispatch(host, state, runtime, kind),
-      launch: (request) => spawnViaRpc(host, runtime, request),
-      // Every automatic start asks the current switches: a module closed, or a
-      // session replaced, stops the queue from starting anything on its own.
-      gate: () => {
-        if (!runtime.enabled || runtime.isChild) return "本会话没有加载 Coworkflow";
-        if (!runtime.control.moduleEnabled("dispatch")) return "dispatch 模块已关闭";
-        if (!runtime.control.moduleEnabled("agent-kinds")) return "agent-kinds 已关闭";
-        if (state.queue !== null && state.queue.epoch !== runtime.sessionEpoch) return "会话已更换";
-        return null;
-      },
+      launch: (request) => spawnViaRpc(host, runtime, request, gate),
+      gate,
     };
     state.queue = createDispatchQueue(deps, runtime.sessionEpoch);
   }
@@ -705,20 +808,24 @@ function observeCompletion(host: PiRuntimeHost, runId: string, outcome: SettleOu
   const state = HOSTS.get(host);
   if (!state?.queue || !state.runtime) return;
   const { runtime, queue } = state as { runtime: RuntimeContext; queue: DispatchQueue };
+  // A notice that names no state is not evidence of anything: it must not complete a
+  // unit, fail one, or start one — and it must not release the capacity reservation
+  // its run may still be holding. Releasing on an unknown payload invents a free slot.
+  if (outcome === "unknown") return;
   // A completion the owner reported releases that run's capacity reservation, which
   // is precisely the event the shared bridge reserves for `releaseRun`.
   existingSubagentsBridge(host)?.releaseRun(runId);
-  // A notice that names no state is not evidence of anything: it must not complete a
-  // unit, fail one, or start one.
-  if (outcome === "unknown") return;
-  if (!runtime.enabled || runtime.isChild) return;
-  if (!runtime.control.moduleEnabled("dispatch") || !runtime.control.moduleEnabled("agent-kinds")) return;
+  if (runtime.isChild) return;
   if (queue.epoch !== runtime.sessionEpoch) {
     // A callback from a session that is gone may only invalidate: it must never start
     // work in the session that replaced it.
     queue.bindSession(runtime.sessionEpoch);
     return;
   }
+  // The end is recorded even when a module switch currently forbids *starts*: the run
+  // really ended, and dropping that would leave the unit running forever while losing
+  // the completion, so re-enabling the module could never recover it. `pass` is what
+  // decides whether anything may launch, and it refuses while a switch is closed.
   void queue.settle(runId, outcome).catch(() => {});
 }
 
@@ -760,11 +867,12 @@ const QUEUED_REASON_TEXT: Record<QueueReason, string> = {
   gated: "派单已被关闭或会话已更换，当前不会自动启动",
 };
 
-/** The model-facing report: what started, what waits, and why anything failed. */
+/** The model-facing report: what started, what waits, what is unconfirmed, and why anything failed. */
 export function renderDispatchResult(result: DispatchResult): string {
   const lines: string[] = [];
   lines.push(
-    `dispatch: ${result.started.length} 已启动 / ${result.queued.length} 排队 / ${result.failed.length} 失败`,
+    `dispatch: ${result.started.length} 已启动 / ${result.queued.length} 排队 / ` +
+    `${result.unobserved.length} 启动未确认 / ${result.failed.length} 失败`,
   );
   for (const entry of result.started) lines.push(`  + ${entry.key}（kind ${entry.kind}）runId ${entry.runId}`);
   for (const entry of result.queued) {
@@ -772,7 +880,15 @@ export function renderDispatchResult(result: DispatchResult): string {
       `  … ${entry.key}（kind ${entry.kind}）排队：${QUEUED_REASON_TEXT[entry.reason]}`,
     );
   }
+  for (const entry of result.unobserved) {
+    lines.push(`  ? ${entry.key}（kind ${entry.kind}）启动未确认：${entry.detail}`);
+  }
   for (const entry of result.failed) lines.push(`  x ${entry.key}（kind ${entry.kind}）失败：${entry.reason}`);
+  if (result.unobserved.length > 0) {
+    lines.push(
+      "启动未确认的单元可能已经在跑：本扩展不会重发，它们的容量仍算占用；先用 status 查证，再决定是否重新提交。",
+    );
+  }
   if (result.queued.length > 0) {
     lines.push("排队中的单元由 pi-subagents 的完成事件驱动，没有轮询；本会话的队列不写盘，会话换代后作废并报告。");
   }

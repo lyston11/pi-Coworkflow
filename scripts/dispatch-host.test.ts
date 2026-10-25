@@ -87,6 +87,16 @@ interface Harness {
   setModule(id: string, on: boolean): void;
   setEpoch(epoch: number): void;
   setLimits(limits: { kinds?: Record<string, number>; total?: number | null }): void;
+  /** Hold every `status` reply until released, so a test can change state mid-read. */
+  deferStatus(): void;
+  /** How many `status` requests are waiting on that hold. */
+  deferredStatusReads(): number;
+  /** Answer the oldest held `status` request against the state as it is now. */
+  releaseStatus(): void;
+  /** Stop holding `status` replies; anything still held stays held. */
+  resumeStatus(): void;
+  /** Make a spawned run visible to the owner's projections (default: immediately visible). */
+  reveal(runId: string): void;
   close(): void;
 }
 
@@ -106,15 +116,29 @@ function tempProject(config: Record<string, unknown> = {}): string {
   return root;
 }
 
-function harness(options: { spawn?: "confirmed" | "ambiguous"; runs?: Run[] } = {}): Harness {
+function harness(options: { spawn?: "confirmed" | "ambiguous"; runs?: Run[]; hideSpawned?: boolean } = {}): Harness {
   const root = tempProject();
   const runs: Run[] = (options.runs ?? []).map((run) => ({ ...run }));
+  /** Runs the owner started but does not show in its projections yet (a real lag window). */
+  const hidden: Run[] = [];
   const requests: Record<string, unknown>[] = [];
   let spawnCount = 0;
   const confirmed = options.spawn !== "ambiguous";
+  const hideSpawned = options.hideSpawned === true;
   let serial = 0;
+  let statusDeferred = false;
+  const heldStatus: Record<string, unknown>[] = [];
 
   const listeners = new Map<string, Set<(data: unknown) => void>>();
+
+  function deliverReply(request: Record<string, unknown>, answer: Record<string, unknown>): void {
+    queueMicrotask(() => {
+      for (const handler of listeners.get(`subagents:rpc:v1:reply:${String(request.requestId)}`) ?? []) {
+        handler(answer);
+      }
+    });
+  }
+
   const bus = {
     emit(channel: string, data: unknown) {
       if (channel !== "subagents:rpc:v1:request") {
@@ -125,11 +149,7 @@ function harness(options: { spawn?: "confirmed" | "ambiguous"; runs?: Run[] } = 
       requests.push(request);
       const answer = respond(request);
       if (answer === undefined) return;
-      queueMicrotask(() => {
-        for (const handler of listeners.get(`subagents:rpc:v1:reply:${String(request.requestId)}`) ?? []) {
-          handler(answer);
-        }
-      });
+      deliverReply(request, answer);
     },
     on(channel: string, handler: (data: unknown) => void) {
       const set = listeners.get(channel) ?? new Set();
@@ -140,6 +160,32 @@ function harness(options: { spawn?: "confirmed" | "ambiguous"; runs?: Run[] } = 
       };
     },
   };
+
+  function statusReply(request: Record<string, unknown>): Record<string, unknown> {
+    return {
+      version: 1,
+      requestId: request.requestId,
+      success: true,
+      data: {
+        text: "ok",
+        fleet: {
+          version: 1,
+          entries: runs.map((run, index) => ({ key: `fleet-${index + 1}`, agent: run.agent, startedAt: index })),
+          totalActive: runs.length,
+          omitted: 0,
+          topLevelAsyncCapacity: { used: runs.length, limit: 10 },
+        },
+        asyncSnapshot: {
+          kind: "pi-subagents.async-status-snapshot",
+          version: 1,
+          generatedAt: 1,
+          caps: { maxRuns: 100, maxChildrenPerNode: 50, maxDepth: 4, maxStringLength: 1000, maxSerializedBytes: 100000 },
+          omitted: { runs: 0, children: 0, byteLimitExceeded: false },
+          runs: runs.map((run) => ({ kind: "subagent", id: run.runId, label: "child", state: run.state, agent: run.agent })),
+        },
+      },
+    };
+  }
 
   function respond(request: Record<string, unknown>): Record<string, unknown> | undefined {
     const reply = (data: unknown) => ({ version: 1, requestId: request.requestId, success: true, data });
@@ -158,24 +204,13 @@ function harness(options: { spawn?: "confirmed" | "ambiguous"; runs?: Run[] } = 
       });
     }
     if (request.method === "status") {
-      return reply({
-        text: "ok",
-        fleet: {
-          version: 1,
-          entries: runs.map((run, index) => ({ key: `fleet-${index + 1}`, agent: run.agent, startedAt: index })),
-          totalActive: runs.length,
-          omitted: 0,
-          topLevelAsyncCapacity: { used: runs.length, limit: 10 },
-        },
-        asyncSnapshot: {
-          kind: "pi-subagents.async-status-snapshot",
-          version: 1,
-          generatedAt: 1,
-          caps: { maxRuns: 100, maxChildrenPerNode: 50, maxDepth: 4, maxStringLength: 1000, maxSerializedBytes: 100000 },
-          omitted: { runs: 0, children: 0, byteLimitExceeded: false },
-          runs: runs.map((run) => ({ kind: "subagent", id: run.runId, label: "child", state: run.state, agent: run.agent })),
-        },
-      });
+      // A held reply is answered later by `releaseStatus`, against the state at that
+      // moment — never by calling back into `respond`, which would hold it again.
+      if (statusDeferred) {
+        heldStatus.push(request);
+        return undefined;
+      }
+      return statusReply(request);
     }
     if (request.method === "spawn") {
       spawnCount += 1;
@@ -183,7 +218,8 @@ function harness(options: { spawn?: "confirmed" | "ambiguous"; runs?: Run[] } = 
       if (!confirmed) return reply({ text: "spawned", details: { asyncDir: "/tmp/ambiguous" } });
       serial += 1;
       const runId = `run-spawn-${serial}`;
-      runs.push({ runId, agent: String(params.agent), state: "running" });
+      const run: Run = { runId, agent: String(params.agent), state: "running" };
+      (hideSpawned ? hidden : runs).push(run);
       return reply({ text: "spawned", details: { runId } });
     }
     return undefined;
@@ -262,6 +298,24 @@ function harness(options: { spawn?: "confirmed" | "ambiguous"; runs?: Run[] } = 
     finish(runId) {
       const index = runs.findIndex((run) => run.runId === runId);
       if (index !== -1) runs.splice(index, 1);
+      const late = hidden.findIndex((run) => run.runId === runId);
+      if (late !== -1) hidden.splice(late, 1);
+    },
+    reveal(runId) {
+      const index = hidden.findIndex((run) => run.runId === runId);
+      if (index !== -1) runs.push(...hidden.splice(index, 1));
+    },
+    deferStatus() {
+      statusDeferred = true;
+    },
+    deferredStatusReads: () => heldStatus.length,
+    releaseStatus() {
+      const request = heldStatus.shift();
+      if (request === undefined) return;
+      deliverReply(request, statusReply(request));
+    },
+    resumeStatus() {
+      statusDeferred = false;
     },
     status: () => dispatchModule.runtimeStatus!(host) ?? [],
     spawns: () => spawnCount,
@@ -297,6 +351,15 @@ function harness(options: { spawn?: "confirmed" | "ambiguous"; runs?: Run[] } = 
 /** Count of spawn requests the client has emitted — the retry check. */
 const spawnRequests = (requests: Record<string, unknown>[]): number =>
   requests.filter((request) => request.method === "spawn").length;
+
+/** Let the host's own promise chains run until `condition` holds. */
+async function until(condition: () => boolean, tries = 50): Promise<void> {
+  for (let attempt = 0; attempt < tries; attempt += 1) {
+    if (condition()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail("the host never reached the awaited read this test defers");
+}
 
 // ── B1: paused / stopped / unknown are never completion ──────────────
 
@@ -537,6 +600,121 @@ test("host: an old-epoch completion invalidates but never launches into the new 
   }
 });
 
+test("host: a notice with no state does not release the capacity of a run it cannot prove ended", { skip }, async () => {
+  // This owner starts runs but does not show them in its projections yet, which is the
+  // real window in which the launch reservation is the *only* record of the slot.
+  const h = harness({ hideSpawned: true });
+  try {
+    h.setLimits({ kinds: { executor: 5 }, total: 1 });
+    const first = await h.call({ tasks: [{ key: "a", kind: "executor", task: "do a" }] });
+    assert.equal(first.details.started.length, 1, first.text);
+    const runId = first.details.started[0].runId as string;
+
+    // `success: undefined` and no state: no evidence that anything ended.
+    await h.asyncComplete({ runId, success: undefined });
+
+    const second = await h.call({ tasks: [{ key: "b", kind: "executor", task: "do b" }] });
+    assert.deepEqual(
+      second.details.started,
+      [],
+      "an unknown notice must not hand a still-running process's project slot to the next unit",
+    );
+    assert.deepEqual(second.details.queued.map((entry: any) => [entry.key, entry.reason]), [["b", "ceiling"]]);
+    assert.equal(h.spawns(), 1, "no second spawn on invented capacity");
+  } finally {
+    h.close();
+  }
+});
+
+test("host: a completion that arrives while dispatch is off is recorded, not discarded", { skip }, async () => {
+  const h = harness();
+  try {
+    h.setLimits({ kinds: { executor: 1 } });
+    const first = await h.call({
+      tasks: [
+        { key: "build", kind: "executor", task: "build it" },
+        { key: "audit", kind: "executor", task: "audit it", needs: ["build"] },
+      ],
+    });
+    const runId = first.details.started[0].runId as string;
+    h.finish(runId);
+    h.setModule("dispatch", false);
+    await h.asyncComplete({ runId, state: "complete", success: true });
+
+    // The closed switch stops the *start*, which is its job.
+    assert.equal(h.spawns(), 1, "a closed module really does stop the automatic start");
+    // And the end itself was recorded: had it been dropped, `build` would still count as
+    // running forever and its completion would be gone for good.
+    const closed = h.status().join("\n");
+    assert.match(closed, /0 运行 \/ 1 排队/, closed);
+    assert.doesNotMatch(closed, /1 运行/, closed);
+
+    h.setModule("dispatch", true);
+    // Re-enabling needs no replay and no polling: the next observation of the queue —
+    // here the parent's next submission — sees the prerequisite already completed.
+    const second = await h.call({
+      tasks: [{ key: "audit-tail", kind: "executor", task: "tail", needs: ["audit"] }],
+    });
+    assert.equal(h.spawns(), 2, "audit starts from the completion recorded while dispatch was off");
+    assert.match(second.text, /1 已启动 \/ 1 排队/, second.text);
+  } finally {
+    h.close();
+  }
+});
+
+test("host: a module switch during the awaited project-capacity read stops the launch", { skip }, async () => {
+  const h = harness();
+  try {
+    h.setLimits({ kinds: { executor: 5 }, total: 1 });
+    h.deferStatus();
+    const call = h.call({ tasks: [{ key: "a", kind: "executor", task: "do a" }] });
+
+    // First held read: the kind's live count. Then the launch's own project-total read.
+    await until(() => h.deferredStatusReads() === 1);
+    h.releaseStatus();
+    await until(() => h.deferredStatusReads() === 1);
+
+    // The switch closes *between* the queue's last gate and the spawn.
+    h.setModule("dispatch", false);
+    h.releaseStatus();
+    h.resumeStatus();
+    const result = await call;
+
+    assert.equal(h.spawns(), 0, "a switch closed during the capacity read still stops the launch");
+    assert.deepEqual(result.details.started, []);
+    assert.deepEqual(result.details.failed, [], "a closed switch is not this unit's failure");
+    assert.deepEqual(result.details.queued.map((entry: any) => [entry.key, entry.reason]), [["a", "gated"]]);
+
+    // The withdrawn launch released its reservation: the project's single slot is
+    // provably free again (nothing was emitted), so the next unit starts.
+    h.setModule("dispatch", true);
+    const second = await h.call({ tasks: [{ key: "b", kind: "executor", task: "do b" }] });
+    assert.equal(second.details.started.length, 1, second.text);
+    assert.equal(h.spawns(), 1);
+  } finally {
+    h.close();
+  }
+});
+
+test("host: a session replacement counts an unconfirmed launch instead of erasing it", { skip }, async () => {
+  const h = harness({ spawn: "ambiguous" });
+  try {
+    h.setLimits({ kinds: { executor: 1 } });
+    await h.call({
+      tasks: [
+        { key: "build", kind: "executor", task: "build it" },
+        { key: "audit", kind: "executor", task: "audit it", needs: ["build"] },
+      ],
+    });
+    h.setEpoch(2);
+    const lines = h.status().join("\n");
+    assert.match(lines, /会话换代作废了上一代队列（0 运行 \/ 1 排队 \/ 1 启动未确认）/, lines);
+    assert.match(lines, /那些 run 仍属于旧会话/, lines);
+  } finally {
+    h.close();
+  }
+});
+
 // ── the shared project-capacity bridge ───────────────────────────────
 
 test("host: the project-wide total blocks a launch that the kind ceiling would allow", { skip }, async () => {
@@ -579,6 +757,16 @@ test("host: an ambiguous spawn is reported as unconfirmed, never retried, never 
     });
     assert.deepEqual(first.details.started, [], "an unconfirmed launch is not reported as started");
     assert.deepEqual(first.details.failed, [], "and it is not reported as a failed launch either");
+    // Not only in the status lines: the tool response itself must show the unit that
+    // may already be running, with its reservation still held and no retry offered.
+    assert.deepEqual(
+      first.details.unobserved.map((entry: any) => entry.key),
+      ["build"],
+      "an unconfirmed launch is neither started, queued nor failed — it has its own entry",
+    );
+    assert.match(first.text, /1 启动未确认/, first.text);
+    assert.match(first.text, /\? build（kind executor）启动未确认/, first.text);
+    assert.match(first.text, /不会重发/, first.text);
     assert.equal(spawnRequests(h.requests), 1, "spawn is not idempotent: exactly one emission");
     assert.equal(h.spawns(), 1);
 
