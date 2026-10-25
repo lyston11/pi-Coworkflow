@@ -23,23 +23,41 @@
  *     improve by waiting is a failure here too (`disabled`, `unregistered`,
  *     `unknown-count`, `session-gone`); only `over-ceiling` becomes "queued",
  *     because that is the one refusal a completion can lift.
- *   - **Dependencies are data.** `needs: [key…]` is satisfied only by `completed`
- *     prerequisites. A failed prerequisite fails its dependents with reason
- *     `dependency` — waiting cannot fix it.
+ *   - **Dependencies are data.** `needs: [key…]` is satisfied only by a *positively*
+ *     `completed` prerequisite. A failed prerequisite fails its dependents with
+ *     reason `dependency` — waiting cannot fix it. A cycle is refused at submission
+ *     rather than left waiting forever.
+ *   - **Only success releases a need.** `paused` / `stopped` / `failed` notices and
+ *     payloads that say nothing are never treated as completion: one classifier reads
+ *     both observation paths.
+ *   - **Capacity is the owner's, and the launch path is shared.** A queued launch goes
+ *     through the same public bridge reservation a direct dispatch uses, because an RPC
+ *     spawn never reaches this package's `tool_call` hook.
+ *   - **A closed gate stops automatic starts.** Module switches and session replacement
+ *     are re-read immediately before each launch, including after an awaited read.
  *   - **A new session invalidates the queue, and says so.** Reporting the new
  *     session as an empty queue would claim "nothing was in flight", which is the
  *     opposite of what happened to the runs the old session had started.
  */
 
+import { randomUUID } from "node:crypto";
+
 import type { PiRuntimeHost, RuntimeContext, Unsubscribe, WorkflowModule } from "../../core/module.ts";
 import { readConfig } from "../../core/config.ts";
 import { decodeNativeCompletions } from "../../core/pi-subagents.ts";
-import { attachSubagents } from "../../core/subagents-client.ts";
+import { attachSubagents, existingSubagentsBridge } from "../../core/subagents-client.ts";
 import { RUN_BUDGET_MS, checkpointFor } from "../../core/subagents-workflow.ts";
 import { admitOne, agentKindsState, type AdmitFailure, type AdmitResult } from "../agent-kinds/index.ts";
 
-/** Why a unit is waiting. Only these two can be lifted by something else happening. */
-export type QueueReason = "ceiling" | "dependency";
+/**
+ * Why a unit is waiting.
+ *
+ * `ceiling` (a slot or the project's shared total) and `dependency` (a prerequisite
+ * is not completed yet) can be lifted by something happening. `gated` is the third: a
+ * module switch or session replacement currently forbids automatic starts, and only a
+ * state change lifts it — never a timer.
+ */
+export type QueueReason = "ceiling" | "dependency" | "gated";
 
 /** One work unit as the caller hands it over. */
 export interface DispatchTaskInput {
@@ -65,8 +83,51 @@ export interface DispatchResult {
   failed: { key: string; kind: string; reason: string }[];
 }
 
-/** What one launch produced: the owner's run id, or a reason it did not start. */
-export type LaunchOutcome = { ok: true; runId: string } | { ok: false; reason: string };
+/**
+ * What one launch produced: the owner's run id, or a reason it did not start.
+ *
+ * `disposition` is what stops the queue from lying about a non-start:
+ *   - `wait` — nothing was started and nothing was consumed (capacity), so the unit
+ *     keeps its place in line;
+ *   - `unobserved` — the request was emitted and its outcome is unknown. That is not
+ *     "no process started" and it is not a completion; the unit is reported as
+ *     unconfirmed and its reservation stays held until the session ends.
+ */
+export type LaunchOutcome = { ok: true; runId: string } | {
+  ok: false;
+  reason: string;
+  disposition?: "failed" | "wait" | "unobserved";
+};
+
+/** The verdict of one observed completion. Only `completed` releases a `needs`. */
+export type SettleOutcome = "completed" | "failed" | "stopped";
+
+const COMPLETED_STATES = new Set(["complete", "completed"]);
+const STOPPED_STATES = new Set(["paused", "stopped", "detached", "interrupted"]);
+const FAILED_STATES = new Set(["failed", "failure", "error", "rejected", "cancelled", "canceled", "partial", "aborted"]);
+
+/**
+ * One classifier for every completion route.
+ *
+ * The owner reports a run's end in two documented shapes — the async event's
+ * `state`/`success` and `subagent-notify`'s `details.runs[].status` — and both name
+ * ends that are *not* success (`paused`, `stopped`, `partial`). Reading either one as
+ * "completed" would start a dependent on work nobody finished, so the verdict is
+ * decided here once and `unknown` means "no evidence", never "fine".
+ */
+export function settleOutcomeOf(payload: unknown): SettleOutcome | "unknown" {
+  const record = payload !== null && typeof payload === "object" ? (payload as Record<string, unknown>) : null;
+  if (record === null) return "unknown";
+  const declared = typeof record.state === "string" ? record.state : typeof record.status === "string" ? record.status : "";
+  const state = declared.trim().toLowerCase();
+  // An explicit failure outranks a contradictory success flag: the conservative
+  // reading is the one that does not release a dependency.
+  if (record.success === false) return "failed";
+  if (STOPPED_STATES.has(state)) return "stopped";
+  if (FAILED_STATES.has(state)) return "failed";
+  if (COMPLETED_STATES.has(state)) return "completed";
+  return "unknown";
+}
 
 export interface LaunchRequest {
   key: string;
@@ -81,9 +142,22 @@ export interface LaunchRequest {
 export interface DispatchDeps {
   admit(kind: string): Promise<AdmitResult>;
   launch(request: LaunchRequest): Promise<LaunchOutcome>;
+  /**
+   * Whether an automatic start is allowed right now, with the reason when it is not.
+   *
+   * Read immediately before every launch *and* again after an awaited admission: a
+   * module switched off, or a session replaced, during that read must not start work.
+   */
+  gate?(): string | null;
 }
 
-type TaskStatus = "waiting" | "running" | "completed" | "failed";
+/**
+ * `unobserved` is a launch whose outcome is unknown: the request was emitted and we
+ * have neither the owner's run id nor proof that nothing started. It is deliberately
+ * neither `running` (that would claim we can watch it) nor `failed` (that would claim
+ * it did not run and would fail its dependents on a guess).
+ */
+type TaskStatus = "waiting" | "running" | "completed" | "failed" | "unobserved";
 
 interface Task {
   key: string;
@@ -108,6 +182,8 @@ export interface DispatchSnapshot {
   running: { key: string; kind: string; runId: string }[];
   queued: { key: string; kind: string; reason: QueueReason }[];
   failed: { key: string; kind: string; reason: string }[];
+  /** Launches whose outcome is unknown: possibly started, never counted as success. */
+  unobserved: { key: string; kind: string; detail: string }[];
   completed: number;
   invalidated: SessionInvalidation | null;
 }
@@ -122,7 +198,7 @@ export interface DispatchQueue {
   bindSession(epoch: number): SessionInvalidation | null;
   submit(input: DispatchInput): Promise<DispatchResult>;
   /** One observed completion: release the slot, then start what now fits. */
-  settle(runId: string, outcome: "completed" | "failed"): Promise<DispatchResult>;
+  settle(runId: string, outcome: SettleOutcome): Promise<DispatchResult>;
   snapshot(): DispatchSnapshot;
   /** `/Coworkflow:status` lines: current counts, or what a replacement discarded. */
   statusLines(): string[];
@@ -148,6 +224,47 @@ export function failureReason(failure: AdmitFailure): string {
     case "over-ceiling":
       return "超过并发上限";
   }
+}
+
+/** The gate as a boolean answer: `null` means an automatic start is allowed. */
+function closedReason(deps: DispatchDeps): string | null {
+  if (typeof deps.gate !== "function") return null;
+  return deps.gate();
+}
+
+/**
+ * The first dependency cycle among the units of one batch, as the keys on it.
+ *
+ * Only the submitted batch is walked: a prerequisite that is already in the queue
+ * cannot point back at a key that did not exist when it was accepted (an unknown key
+ * fails its dependent there), so a cycle can only be within the batch — plus the
+ * self-cycle a single unit can write for itself.
+ */
+function findCycle(planned: readonly Task[]): string[] | null {
+  const byKey = new Map(planned.map((task) => [task.key, task]));
+  const visiting = new Set<string>();
+  const finished = new Set<string>();
+  const path: string[] = [];
+  const walk = (key: string): string[] | null => {
+    if (finished.has(key)) return null;
+    if (visiting.has(key)) return [...path.slice(path.indexOf(key)), key];
+    visiting.add(key);
+    path.push(key);
+    for (const need of byKey.get(key)?.needs ?? []) {
+      if (!byKey.has(need)) continue;
+      const cycle = walk(need);
+      if (cycle !== null) return cycle;
+    }
+    path.pop();
+    visiting.delete(key);
+    finished.add(key);
+    return null;
+  };
+  for (const task of planned) {
+    const cycle = walk(task.key);
+    if (cycle !== null) return cycle;
+  }
+  return null;
 }
 
 /**
@@ -199,10 +316,23 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
    * Order is insertion order, and each unit is decided against the state at that
    * moment: an admission refusal for one unit never skips another kind's unit, and
    * a unit that just started raises the count the next `admitOne` reads.
+   *
+   * Both gates are read here, not only at call time: `deps.gate()` before the
+   * admission and again after it (the admission awaits public reads, and a module
+   * switched off or a session replaced during that await must not launch anything).
    */
   async function pass(): Promise<DispatchResult> {
     cascade();
     const result: DispatchResult = { started: [], queued: [], failed: [] };
+    const blocked = closedReason(deps);
+    if (blocked !== null) {
+      for (const task of tasks) {
+        if (task.status !== "waiting") continue;
+        task.reason = "gated";
+        result.queued.push({ key: task.key, kind: task.kind, reason: "gated" });
+      }
+      return result;
+    }
     for (const task of tasks) {
       if (task.status === "failed") {
         result.failed.push({ key: task.key, kind: task.kind, reason: String(task.reason ?? "failed") });
@@ -227,6 +357,13 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
         }
         continue;
       }
+      // The gate again, after the awaited admission: switching a module off or
+      // replacing the session during that read must not let this launch through.
+      if (closedReason(deps) !== null) {
+        task.reason = "gated";
+        result.queued.push({ key: task.key, kind: task.kind, reason: "gated" });
+        continue;
+      }
       const launched = await deps.launch({
         key: task.key,
         kind: task.kind,
@@ -235,6 +372,20 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
         ...(task.worktree === true ? { worktree: true } : {}),
       });
       if (!launched.ok) {
+        // Capacity, not this unit: nothing started and nothing was consumed, so it
+        // keeps its place in line instead of being written off as a failure.
+        if (launched.disposition === "wait") {
+          task.reason = "ceiling";
+          result.queued.push({ key: task.key, kind: task.kind, reason: "ceiling" });
+          continue;
+        }
+        // Emitted, unconfirmed: reported as such. Never retried, and never counted
+        // as either success or a proven non-start.
+        if (launched.disposition === "unobserved") {
+          task.status = "unobserved";
+          task.reason = launched.reason;
+          continue;
+        }
         task.status = "failed";
         task.reason = launched.reason;
         result.failed.push({ key: task.key, kind: task.kind, reason: task.reason });
@@ -282,6 +433,13 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
       }
       planned.push({ key, kind, task, needs: [...new Set(needs)], status: "waiting", ...(input.worktree === true ? { worktree: true } : {}) });
     });
+    // Refused before anything is queued: a cycle can never be satisfied, and leaving
+    // it in the queue would render as "waiting for its prerequisite" forever while
+    // also occupying those keys. The submission is atomic — nothing is adopted.
+    const cycle = findCycle(planned);
+    if (cycle !== null) {
+      throw new Error(`工作单元依赖成环：${cycle.join(" → ")}（needs 不能互相等待，也不能等自己）。`);
+    }
     return { tasks: planned, ...(input.worktree === true ? { worktree: true } : {}) };
   }
 
@@ -311,19 +469,28 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
       });
     },
 
-    settle(runId: string, outcome: "completed" | "failed"): Promise<DispatchResult> {
+    settle(runId: string, outcome: SettleOutcome): Promise<DispatchResult> {
       return serial(async () => {
-        const task = tasks.find((entry) => entry.runId === runId && entry.status === "running");
-        // An unobserved or foreign run is not silently "a slot freed": it simply is
-        // not ours, so nothing starts on the strength of it.
-        if (task === undefined) return { started: [], queued: [], failed: [] };
-        if (outcome === "completed") {
-          task.status = "completed";
-          delete task.reason;
-        } else {
-          task.status = "failed";
-          task.reason = "run 失败";
+        const task = tasks.find((entry) => entry.runId === runId);
+        // A duplicate observation of a run we already settled changes nothing.
+        if (task !== undefined && task.status !== "running") {
+          return { started: [], queued: [], failed: [] };
         }
+        if (task !== undefined) {
+          if (outcome === "completed") {
+            task.status = "completed";
+            delete task.reason;
+          } else {
+            // `stopped`/`paused` is not success: the dependents must not start on it,
+            // and saying "failed" here would misdescribe what happened.
+            task.status = "failed";
+            task.reason = outcome === "stopped" ? "run 被停止或暂停" : "run 失败";
+          }
+        }
+        // A completion — ours or a foreign run's — is a moment real capacity freed, so
+        // waiting work gets one fresh admission here instead of waiting for the next
+        // call. A foreign run is never read as success: only our own `completed` unit
+        // releases a `needs`, and admission still asks the owner what is free.
         return pass();
       });
     },
@@ -341,6 +508,10 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
             : []),
         failed: tasks.flatMap((task) =>
           task.status === "failed" ? [{ key: task.key, kind: task.kind, reason: String(task.reason ?? "failed") }] : []),
+        unobserved: tasks.flatMap((task) =>
+          task.status === "unobserved"
+            ? [{ key: task.key, kind: task.kind, detail: String(task.reason ?? "未确认") }]
+            : []),
         completed: tasks.filter((task) => task.status === "completed").length,
         invalidated,
       };
@@ -354,6 +525,11 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
       const lines = [
         `  dispatch: ${snapshot.running.length} 运行 / ${snapshot.queued.length} 排队${reasons ? `（${reasons}）` : ""}`,
       ];
+      for (const entry of snapshot.unobserved) {
+        lines.push(
+          `  ? dispatch: ${entry.key}（kind ${entry.kind}）启动未确认：${entry.detail}`,
+        );
+      }
       if (snapshot.invalidated !== null) {
         lines.push(
           `  dispatch: 会话换代作废了上一代队列（${snapshot.invalidated.running} 运行 / ${snapshot.invalidated.queued} 排队）：` +
@@ -396,8 +572,12 @@ function hostState(host: PiRuntimeHost): HostState {
  *
  * The budget and the hand-over checkpoint are project policy, not per-unit
  * judgement, so they are attached here instead of being asked of the caller. A
- * lost reply is reported as a failed unit rather than retried: `spawn` is not
+ * lost reply is reported as an unconfirmed launch rather than retried: `spawn` is not
  * idempotent, and re-sending would be the one thing this package must never do.
+ *
+ * The project-wide capacity reservation is taken on the same public bridge a direct
+ * dispatch uses. An RPC spawn never passes through this package's `tool_call` hook, so
+ * a per-kind ceiling alone would let the project's own total be exceeded.
  */
 async function spawnViaRpc(
   host: PiRuntimeHost,
@@ -408,22 +588,56 @@ async function spawnViaRpc(
   const bridge = attachSubagents(host, { epoch, events: host.events });
   const root = runtime.configRoots.root(runtime.cwd);
   const budget = (root === null ? null : readConfig(root)?.subagentRunBudgetMs) ?? RUN_BUDGET_MS;
-  const reply = await bridge.client.spawn({
-    agent: request.agent,
-    task: request.task,
-    context: "fresh",
-    timeoutMs: budget,
-    checkpointBeforeDeadlineMs: checkpointFor(budget),
-    ...(request.worktree === true ? { worktree: true } : {}),
-  });
-  if (runtime.sessionEpoch !== epoch) return { ok: false, reason: "会话在启动期间更换，未把这次启动算进本会话" };
-  if (!reply.ok) return { ok: false, reason: reply.message };
+
+  const launchId = `coworkflow-dispatch-${request.key}-${randomUUID()}`;
+  const totalLimit = runtime.control.moduleEnabled("capacity") ? runtime.control.subagentConcurrency() : null;
+  const admission = await bridge.admit(launchId, totalLimit);
+  if (!admission.admit) {
+    // The project's total is full, not the kind's: nothing started and no slot was
+    // consumed, so the unit stays in line for the next completion.
+    return { ok: false, reason: admission.reason, disposition: "wait" };
+  }
+  if (runtime.sessionEpoch !== epoch) {
+    bridge.release(launchId);
+    return { ok: false, reason: "会话在启动期间更换，未把这次启动算进本会话", disposition: "wait" };
+  }
+
+  const reply = await bridge.client.spawn(
+    {
+      agent: request.agent,
+      task: request.task,
+      context: "fresh",
+      timeoutMs: budget,
+      checkpointBeforeDeadlineMs: checkpointFor(budget),
+      ...(request.worktree === true ? { worktree: true } : {}),
+    },
+    (alias) => bridge.trackAlias(launchId, alias),
+  );
+  if (runtime.sessionEpoch !== epoch) {
+    bridge.release(launchId);
+    return { ok: false, reason: "会话在启动期间更换，未把这次启动算进本会话", disposition: "wait" };
+  }
+  if (!reply.ok) {
+    if (reply.ambiguous) {
+      // Emitted and unconfirmed: the reservation stays held on the alias until the
+      // session ends, exactly as the shared bridge does for a direct dispatch.
+      bridge.hold(launchId, reply.ambiguous.alias);
+      return { ok: false, reason: reply.message, disposition: "unobserved" };
+    }
+    bridge.release(launchId);
+    return { ok: false, reason: reply.message };
+  }
   if (reply.data.runId === null) {
+    // The client already reports this as ambiguous; kept as a guard so an owner that
+    // answers without a run id can never be mistaken for a confirmed launch.
+    bridge.release(launchId);
     return {
       ok: false,
       reason: "pi-subagents 的 spawn 回复没有运行确认；这次派单可能已经在跑，本扩展不会重发，请用 status 查证后再决定",
+      disposition: "unobserved",
     };
   }
+  bridge.bind(launchId, reply.data.runId);
   return { ok: true, runId: reply.data.runId };
 }
 
@@ -444,14 +658,17 @@ export async function admitDispatch(
 ): Promise<AdmitResult> {
   const admitted = await admitOne(host, agentKindsState(host), runtime, { kind, count: 1 });
   if (!admitted.ok) return admitted;
+  // Unconfirmed launches count against the ceiling too: treating one as free would
+  // admit work on capacity nobody proved was available.
   const local = state.queue?.snapshot().running.filter((entry) => entry.kind === kind).length ?? 0;
-  if (local >= admitted.policy.maxConcurrent) {
+  const unknown = state.queue?.snapshot().unobserved.filter((entry) => entry.kind === kind).length ?? 0;
+  if (local + unknown >= admitted.policy.maxConcurrent) {
     return {
       ok: false,
       failure: {
         code: "over-ceiling",
         limit: admitted.policy.maxConcurrent,
-        occupancy: local,
+        occupancy: local + unknown,
         requested: 1,
       },
     };
@@ -467,6 +684,15 @@ function queueFor(host: PiRuntimeHost, runtime: RuntimeContext): DispatchQueue {
     const deps: DispatchDeps = {
       admit: (kind) => admitDispatch(host, state, runtime, kind),
       launch: (request) => spawnViaRpc(host, runtime, request),
+      // Every automatic start asks the current switches: a module closed, or a
+      // session replaced, stops the queue from starting anything on its own.
+      gate: () => {
+        if (!runtime.enabled || runtime.isChild) return "本会话没有加载 Coworkflow";
+        if (!runtime.control.moduleEnabled("dispatch")) return "dispatch 模块已关闭";
+        if (!runtime.control.moduleEnabled("agent-kinds")) return "agent-kinds 已关闭";
+        if (state.queue !== null && state.queue.epoch !== runtime.sessionEpoch) return "会话已更换";
+        return null;
+      },
     };
     state.queue = createDispatchQueue(deps, runtime.sessionEpoch);
   }
@@ -475,20 +701,28 @@ function queueFor(host: PiRuntimeHost, runtime: RuntimeContext): DispatchQueue {
 }
 
 /** Settle one run from either observation path; a stale observation changes nothing. */
-function observeCompletion(host: PiRuntimeHost, runId: string, outcome: "completed" | "failed"): void {
+function observeCompletion(host: PiRuntimeHost, runId: string, outcome: SettleOutcome | "unknown"): void {
   const state = HOSTS.get(host);
-  if (state?.queue === null || state?.queue === undefined) return;
-  void state.queue.settle(runId, outcome).catch(() => {});
+  if (!state?.queue || !state.runtime) return;
+  const { runtime, queue } = state as { runtime: RuntimeContext; queue: DispatchQueue };
+  // A completion the owner reported releases that run's capacity reservation, which
+  // is precisely the event the shared bridge reserves for `releaseRun`.
+  existingSubagentsBridge(host)?.releaseRun(runId);
+  // A notice that names no state is not evidence of anything: it must not complete a
+  // unit, fail one, or start one.
+  if (outcome === "unknown") return;
+  if (!runtime.enabled || runtime.isChild) return;
+  if (!runtime.control.moduleEnabled("dispatch") || !runtime.control.moduleEnabled("agent-kinds")) return;
+  if (queue.epoch !== runtime.sessionEpoch) {
+    // A callback from a session that is gone may only invalidate: it must never start
+    // work in the session that replaced it.
+    queue.bindSession(runtime.sessionEpoch);
+    return;
+  }
+  void queue.settle(runId, outcome).catch(() => {});
 }
 
 /** The completion payload's own verdict, without reading prose. */
-function outcomeOf(payload: unknown): "completed" | "failed" {
-  const record = payload !== null && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
-  if (record.success === false) return "failed";
-  const state = typeof record.state === "string" ? record.state : typeof record.status === "string" ? record.status : "";
-  return state === "failed" || state === "stopped" || state === "rejected" || state === "cancelled" ? "failed" : "completed";
-}
-
 const PARAMETERS = {
   type: "object",
   additionalProperties: false,
@@ -519,6 +753,13 @@ const PARAMETERS = {
   },
 } as const;
 
+/** What each waiting reason means, in the words the model and the user read. */
+const QUEUED_REASON_TEXT: Record<QueueReason, string> = {
+  ceiling: "名额已满，完成一个就自动启动它",
+  dependency: "前置单元未完成",
+  gated: "派单已被关闭或会话已更换，当前不会自动启动",
+};
+
 /** The model-facing report: what started, what waits, and why anything failed. */
 export function renderDispatchResult(result: DispatchResult): string {
   const lines: string[] = [];
@@ -528,7 +769,7 @@ export function renderDispatchResult(result: DispatchResult): string {
   for (const entry of result.started) lines.push(`  + ${entry.key}（kind ${entry.kind}）runId ${entry.runId}`);
   for (const entry of result.queued) {
     lines.push(
-      `  … ${entry.key}（kind ${entry.kind}）排队：${entry.reason === "ceiling" ? "名额已满，完成一个就自动启动它" : "前置单元未完成"}`,
+      `  … ${entry.key}（kind ${entry.kind}）排队：${QUEUED_REASON_TEXT[entry.reason]}`,
     );
   }
   for (const entry of result.failed) lines.push(`  x ${entry.key}（kind ${entry.kind}）失败：${entry.reason}`);
@@ -549,7 +790,8 @@ export const dispatchModule: WorkflowModule = {
    * the exact correlation an RPC spawn gets when the owner advertises it, and the
    * settled notification (`message_end` → native completions) is the path that
    * existed before it. Neither polls; whichever arrives first settles the run and
-   * the second one finds nothing to do.
+   * the second one finds nothing to do. Both read the same classifier, so neither
+   * can call a paused or stopped run a success.
    */
   activate(host: PiRuntimeHost, runtime: RuntimeContext): void {
     if (runtime.isChild) return;
@@ -561,12 +803,15 @@ export const dispatchModule: WorkflowModule = {
       const off = host.events?.on(ASYNC_COMPLETE_EVENT, (payload: unknown) => {
         const record = payload !== null && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
         const runId = typeof record.runId === "string" ? record.runId : typeof record.id === "string" ? record.id : "";
-        if (runId) observeCompletion(host, runId, outcomeOf(record));
+        if (runId) observeCompletion(host, runId, settleOutcomeOf(record));
       });
       if (typeof off === "function") state.listeners.push(off);
       const settled = host.on?.("message_end", (event: any) => {
         for (const completion of decodeNativeCompletions(event?.message)) {
-          observeCompletion(host, completion.runId, completion.status === "failed" ? "failed" : "completed");
+          // `decodeNativeCompletions` deliberately also reports `paused`/`stopped`,
+          // because they are ends; whether one of them is *success* is this
+          // classifier's question, and the answer for both is no.
+          observeCompletion(host, completion.runId, settleOutcomeOf({ status: completion.status }));
         }
         return undefined;
       });
