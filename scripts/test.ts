@@ -485,6 +485,178 @@ test("subagent-context: an invalid task reference is reported, never rebound to 
   }
 });
 
+test("subagent-context: the documented placeholder is not a task reference, so the parent's task still applies", async () => {
+  // The dispatch protocol is documented with a placeholder — this package's own managed
+  // region writes `Active task: <任务目录>`, Trellis writes
+  // ``Active task: <task path from task.py current>``. A child that copied one of those
+  // lines named no task; reading it as a (bad) reference used to cancel the parent
+  // pointer, leaving the child with no role context and the wrong thing to blame.
+  const root = await tempChildProject();
+  const { setSessionFlag } = (await import(here("../core/trellis.ts"))) as typeof import("../core/trellis.ts");
+  setSessionFlag(root, "parent-session", true);
+  mkdirSync(join(root, ".trellis", ".runtime", "sessions"), { recursive: true });
+  writeFileSync(
+    join(root, ".trellis", ".runtime", "sessions", "pi_parent-session.json"),
+    JSON.stringify({ current_task: ".trellis/tasks/10-20-demo" }),
+  );
+
+  const harness = await childHarness({ root, sessionName: "cw-executor: placeholder", parentSessionId: "parent-session" });
+  try {
+    const event = {
+      prompt: [
+        "按下面的协议派单：",
+        "Active task: <任务目录>",
+        "其余照旧。",
+      ].join("\n"),
+      systemPrompt: "BASE",
+      systemPromptOptions: { contextFiles: [], sections: {} as Record<string, string> },
+    };
+    harness.run(event);
+    const block = event.systemPromptOptions.sections.pi_coworkflow_child ?? "";
+    assert.match(block, /Active task: \.trellis\/tasks\/10-20-demo/, "the parent's task is used");
+    assert.doesNotMatch(block, /不存在/, "a placeholder is not reported as a bad reference");
+    assert.doesNotMatch(block, /<任务目录>/, "and the placeholder is never echoed as the task");
+    assert.match(block, /Do the thing/, "the role context is really injected, not just the header");
+
+    // A real reference followed by a punctuation mark is still that reference, and it is
+    // the one the child gets — the parent's task does not win over an explicit name.
+    mkdirSync(join(root, ".trellis", "tasks", "10-20-other"), { recursive: true });
+    const punctuated = {
+      prompt: "Active task: .trellis/tasks/10-20-other，然后按它工作。",
+      systemPrompt: "BASE",
+      systemPromptOptions: { contextFiles: [], sections: {} as Record<string, string> },
+    };
+    harness.run(punctuated);
+    const punctuatedBlock = punctuated.systemPromptOptions.sections.pi_coworkflow_child ?? "";
+    assert.match(punctuatedBlock, /^Active task: \.trellis\/tasks\/10-20-other$/m, "the punctuation is not part of the name");
+  } finally {
+    harness.close();
+  }
+});
+
+test("subagent-context: a placeholder line alone names no task at all", async () => {
+  // No parent pointer to fall back to: the honest answer is "no task", not "a task that
+  // does not exist". A role child still gets its (task-less) context.
+  const root = await tempChildProject();
+  const harness = await childHarness({ root, sessionName: "cw-executor: placeholder" });
+  try {
+    const event = {
+      prompt: "Active task: <task path from task.py current>",
+      systemPrompt: "BASE",
+      systemPromptOptions: { contextFiles: [], sections: {} as Record<string, string> },
+    };
+    harness.run(event);
+    const block = event.systemPromptOptions.sections.pi_coworkflow_child ?? "";
+    assert.match(block, /Active task: \(none\)/, "the line is reported as naming nothing");
+    assert.doesNotMatch(block, /不存在/, "and not as an invalid reference");
+  } finally {
+    harness.close();
+  }
+});
+
+test("subagent-context: a project-defined kind's role resolves from a wrapped session name", async () => {
+  // The role is the kind's own declaration; the name only says *which kind*. A renamed
+  // or custom kind therefore has to resolve from the live table — a fixed list of the
+  // three shipped names silently gave these children the generic treatment.
+  const root = await tempChildProject();
+  mkdirSync(join(root, ".pi", "Coworkflow", "agents"), { recursive: true });
+  writeFileSync(
+    join(root, ".pi", "Coworkflow", "agents", "builder.md"),
+    ["---", "agent: cw-builder", "role: implement", "description: builds the thing", "---", "", "You build it.", ""].join("\n"),
+  );
+  const blockOf = async (sessionName: string): Promise<string> => {
+    const harness = await childHarness({ root, sessionName });
+    try {
+      const event = {
+        prompt: "Active task: .trellis/tasks/10-20-demo",
+        systemPrompt: "BASE",
+        systemPromptOptions: { contextFiles: [], sections: {} as Record<string, string> },
+      };
+      harness.run(event);
+      return event.systemPromptOptions.sections.pi_coworkflow_child ?? "";
+    } finally {
+      harness.close();
+    }
+  };
+
+  const wrapped = await blockOf("subagent-cw-builder-3f2a-1-0: build the thing");
+  assert.match(wrapped, /role: implement/, "the wrapped name resolves through the live kind table");
+  assert.match(wrapped, /Do the thing/, "and the implement context really is injected");
+
+  const plain = await blockOf("cw-builder: build the thing");
+  assert.match(plain, /role: implement/, "the dispatch spelling of the same name resolves too");
+
+  // A name the table does not know is not a near miss: `cw-builderx` is a generic child.
+  const nearMiss = await blockOf("cw-builderx: build the thing");
+  assert.doesNotMatch(nearMiss, /role: implement/, "a longer name is not a kind's name");
+});
+
+test("subagent-context: a kind that declared role none is not overruled by a role marker", async () => {
+  // `role: none` is a declaration, not an absence: a marker that arrives in an inherited
+  // prompt must not hand that child some other role's curated context.
+  const root = await tempChildProject();
+  const task = join(root, ".trellis", "tasks", "10-20-demo");
+  mkdirSync(join(root, ".trellis", "spec", "frontend"), { recursive: true });
+  writeFileSync(join(root, ".trellis", "spec", "frontend", "check-only.md"), "# Check only\n\nAUDIT-ONLY-SPEC\n");
+  writeFileSync(
+    join(task, "check.jsonl"),
+    `${JSON.stringify({ file: ".trellis/spec/frontend/check-only.md", reason: "the review checklist" })}\n`,
+  );
+  mkdirSync(join(root, ".pi", "Coworkflow", "agents"), { recursive: true });
+  writeFileSync(
+    join(root, ".pi", "Coworkflow", "agents", "worker.md"),
+    ["---", "agent: cw-worker", "role: none", "description: a plain worker", "---", "", "You do one piece of work.", ""].join("\n"),
+  );
+  const harness = await childHarness({ root, sessionName: "cw-worker: audit the diff" });
+  try {
+    const event = {
+      prompt: ["Active task: .trellis/tasks/10-20-demo", "<!-- trellis-agent: check -->"].join("\n"),
+      systemPrompt: "BASE",
+      systemPromptOptions: { contextFiles: [], sections: {} as Record<string, string> },
+    };
+    harness.run(event);
+    const block = event.systemPromptOptions.sections.pi_coworkflow_child ?? "";
+    assert.doesNotMatch(block, /role: check/, "role: none is the kind's answer");
+    assert.doesNotMatch(block, /AUDIT-ONLY-SPEC/, "so no check context is injected");
+    assert.match(block, /子 agent 工作约定/, "it is a generic child, not an uninstructed one");
+  } finally {
+    harness.close();
+  }
+});
+
+test("subagent-context: the injected task also names the main checkout's absolute directory", async () => {
+  // The child's cwd may be a lane worktree, where a path relative to the main checkout
+  // does not exist — and the task artifacts it is told to read live in the main checkout.
+  const root = await tempChildProject();
+  const task = join(root, ".trellis", "tasks", "10-20-demo");
+  const harness = await childHarness({ root, sessionName: "cw-executor: demo" });
+  try {
+    const event = {
+      prompt: "Active task: .trellis/tasks/10-20-demo",
+      systemPrompt: "BASE",
+      systemPromptOptions: { contextFiles: [], sections: {} as Record<string, string> },
+    };
+    harness.run(event);
+    const block = event.systemPromptOptions.sections.pi_coworkflow_child ?? "";
+    assert.match(block, /Active task: \.trellis\/tasks\/10-20-demo/, "the protocol reference stays as written");
+    assert.ok(block.includes(`\`${task}\``), `the absolute directory is present: ${task}`);
+
+    // The absolute form this module itself prints is a reference too: a parent that copied
+    // it must not have the reference dropped and replaced by the parent's pointer.
+    const absolute = {
+      prompt: `Active task: ${task}`,
+      systemPrompt: "BASE",
+      systemPromptOptions: { contextFiles: [], sections: {} as Record<string, string> },
+    };
+    harness.run(absolute);
+    const absoluteBlock = absolute.systemPromptOptions.sections.pi_coworkflow_child ?? "";
+    assert.match(absoluteBlock, /Active task: \.trellis\/tasks\/10-20-demo/, "an absolute reference resolves");
+    assert.doesNotMatch(absoluteBlock, /不存在/, "and is not reported as invalid");
+  } finally {
+    harness.close();
+  }
+});
+
 test("subagent-context: the module switch and the session switch are both live", async () => {
   const root = await tempChildProject();
   const harness = await childHarness({ root, sessionName: "cw-auditor: demo" });

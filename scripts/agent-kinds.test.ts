@@ -48,7 +48,8 @@ import {
   loadRuntimeAgentContract,
   type DesiredKind,
 } from "../modules/agent-kinds/registration.ts";
-import { agentKindsModule, decodeFanoutCall, decodeKindDispatch, decodeUngovernedLaunch, kindRegistrationPlan, resolveDispatchKind, syncAgentKinds } from "../modules/agent-kinds/index.ts";
+import { agentKindsModule, applyDispatchDefaults, decodeFanoutCall, decodeKindDispatch, decodeUngovernedLaunch, kindRegistrationPlan, kindWorkflowAgents, resolveDispatchKind, syncAgentKinds } from "../modules/agent-kinds/index.ts";
+import { readKindDefinitions } from "../modules/agent-kinds/definitions.ts";
 import { capacityModule } from "../modules/capacity/index.ts";
 
 const here = (rel: string): string => new URL(rel, import.meta.url).pathname;
@@ -1005,6 +1006,77 @@ test("gate: the project-wide limit and the per-kind limit both hold, and neither
   }
 });
 
+test("defaults: an owned launch is background whether async is omitted or false", () => {
+  // Upstream follows `asyncByDefault` when `async` is omitted, and a project that turned it
+  // off gets a foreground child that blocks the main session. "A child never blocks the
+  // parent" is this package's rule, so the field is written rather than assumed.
+  const omitted = { agent: "cw-executor", task: "work" } as Record<string, unknown>;
+  const omittedFilled = applyDispatchDefaults(omitted, undefined);
+  assert.equal(omitted.async, true, "an omitted async is written as true");
+  assert.ok(omittedFilled.includes("async-default"), "counted as a filled default");
+  assert.ok(!omittedFilled.includes("async"), "not as a foreground dispatch rewritten");
+
+  const foreground = { agent: "cw-executor", task: "work", async: false } as Record<string, unknown>;
+  const filled = applyDispatchDefaults(foreground, undefined);
+  assert.equal(foreground.async, true, "an explicit foreground request is rewritten");
+  assert.ok(filled.includes("async"), "and reported as the rewrite it is");
+
+  // Everything else still follows the caller: its own context and budget win.
+  const explicit = {
+    agent: "cw-executor",
+    task: "work",
+    async: true,
+    options: { context: "fork", timeoutMs: 123456 },
+  } as Record<string, unknown>;
+  const kept = applyDispatchDefaults(explicit, 60000);
+  assert.equal(explicit.async, true);
+  assert.deepEqual(explicit.options, {
+    context: "fork",
+    timeoutMs: 123456,
+    checkpointBeforeDeadlineMs: checkpointFor(123456),
+  });
+  assert.ok(!kept.includes("async") && !kept.includes("async-default"), "nothing was rewritten");
+});
+
+test("gate: a caller that omits async still gets a background launch", { skip }, async () => {
+  const h = gateHarness({ kinds: { executor: { enabled: true } } });
+  try {
+    await syncAgentKinds(h.host, h.runtime);
+    const omitted: Record<string, unknown> = { agent: "cw-executor", task: "work" };
+    assert.equal(await h.call(omitted), undefined, "admitted");
+    assert.equal(omitted.async, true, "the gate wrote the field the caller left out");
+    const foreground: Record<string, unknown> = { agent: "cw-executor", task: "work", async: false };
+    assert.equal(await h.call(foreground), undefined, "admitted");
+    assert.equal(foreground.async, true, "and an explicit false is rewritten too");
+  } finally {
+    h.close();
+  }
+});
+
+test("workflow agents: the kind's resolved role decides the step, not the shipped kind's role", { skip }, async () => {
+  // A project definition may give a kind its own role. Reading the shipped kind's role
+  // instead launched the implement step with an agent whose children receive check context —
+  // the same kind, two answers, from two places.
+  const h = gateHarness({ kinds: { executor: { enabled: false } } });
+  try {
+    mkdirSync(join(h.root, ".pi", "Coworkflow", "agents"), { recursive: true });
+    writeFileSync(
+      join(h.root, ".pi", "Coworkflow", "agents", "builder.md"),
+      ["---", "agent: cw-builder", "role: implement", "description: builds the thing", "---", "", "You build it.", ""].join("\n"),
+    );
+    await syncAgentKinds(h.host, h.runtime);
+    const kinds = resolveKinds(readConfig(h.root), readKindDefinitions(h.root).definitions);
+    assert.equal(kinds.find((entry) => entry.kind === "builder")?.role, "implement", "the file's role is resolved");
+    assert.deepEqual(
+      kindWorkflowAgents(h.host, kinds),
+      { implementAgent: "cw-builder", reviewAgent: "cw-auditor" },
+      "the enabled and registered kind drives the implement step, the shipped auditor keeps the review step",
+    );
+  } finally {
+    h.close();
+  }
+});
+
 test("gate: it runs only in the parent session and only while the layer is on", { skip }, async () => {
   const h = gateHarness({ kinds: { executor: { enabled: true, maxConcurrent: 1 } } });
   try {
@@ -1285,7 +1357,7 @@ test("gate: the mechanical fields a dispatch needs are filled in, and explicit v
   try {
     const bare: Record<string, any> = { agent: "cw-executor", task: "x" };
     assert.equal(await harness.call(bare), undefined);
-    assert.equal(bare.async, undefined, "an absent async is already background and stays absent");
+    assert.equal(bare.async, true, "an absent async is written as true: upstream's asyncByDefault may be false");
     assert.equal(bare.options.context, "fresh", "context defaults to a fresh child");
     assert.equal(typeof bare.options.timeoutMs, "number");
     assert.ok(bare.options.timeoutMs > 0);
@@ -1328,10 +1400,11 @@ test("gate: a foreground dispatch is put in the background, and the rewrite is r
     assert.equal(await harness.call(fanout), undefined);
     assert.equal(fanout.async, true, "a fanout cannot block the main session either");
 
-    // A call that is already background is left alone, and nothing is counted for it.
-    const background = { agent: "cw-executor", task: "x" };
+    // A call that already asked for background is left at that value: the field is present,
+    // and no rewrite is counted for it.
+    const background = { agent: "cw-executor", task: "x", async: true };
     assert.equal(await harness.call(background), undefined);
-    assert.equal("async" in background, false, "no redundant field is added");
+    assert.equal(background.async, true, "an explicit background request is unchanged");
 
     // Reported as a fact, so "why did my child not block?" has an answer.
     const status = agentKindsModule.runtimeStatus!(harness.host) ?? [];

@@ -284,11 +284,18 @@ export function applyDispatchDefaults(
   const call = input as Record<string, unknown>;
   const filled: string[] = [];
 
-  // Only an explicit `false` is a request to block; an absent field already means "background",
-  // and adding it would make every dispatch look rewritten in the status line.
-  if (call.async === false) {
+  // Background is not left to the caller or to upstream's default. `asyncByDefault` is a
+  // project setting upstream honours, so an omitted `async` starts *foreground* (blocking the
+  // main session) in a project that turned it off; an explicit `false` asks for exactly that.
+  // Both are rewritten here, because "a child never blocks the parent" is this package's rule,
+  // not a preference the dispatch site has to remember.
+  //
+  // The two rewrites are counted apart: `async` is the one the status line reports as
+  // "a foreground dispatch turned into a background one", which an omitted field is not.
+  if (call.async !== true) {
+    const wasExplicit = call.async === false;
     call.async = true;
-    filled.push("async");
+    filled.push(wasExplicit ? "async" : "async-default");
   }
 
   const budget = budgetMs ?? RUN_BUDGET_MS;
@@ -1104,8 +1111,13 @@ function registrationReason(snapshot: Snapshot | null, kind: string): string {
  * A kind replaces a fixed agent name *only* when it is both enabled and actually
  * registered in this session's agent list — an enabled-but-unregistered kind would
  * make the fixed workflow fail with "unknown agent", which is a worse answer than
- * running the built-in pair. Roles come from the one `kindRole` table, so this and
+ * running the built-in pair. Roles come from the resolved entry, so this and
  * `subagent-context` cannot disagree about what a kind receives.
+ *
+ * `entry.role` and not `kindRole(entry.kind)`: the latter reads the *shipped* kind's
+ * default, so a project definition that declared `role: check` (or changed it away)
+ * would be ignored here while the injected context followed the file — the workflow
+ * would then hand the implement step to the agent whose children get check context.
  *
  * `undefined` means "keep the built-in default", never "no agent".
  */
@@ -1117,8 +1129,8 @@ export function kindWorkflowAgents(
   const chosen: { implementAgent?: string; reviewAgent?: string } = {};
   for (const entry of kinds) {
     if (!entry.enabled || !live.has(entry.kind)) continue;
-    if (kindRole(entry.kind) === "implement") chosen.implementAgent = entry.agent;
-    else if (kindRole(entry.kind) === "check") chosen.reviewAgent = entry.agent;
+    if (entry.role === "implement") chosen.implementAgent = entry.agent;
+    else if (entry.role === "check") chosen.reviewAgent = entry.agent;
   }
   return chosen;
 }

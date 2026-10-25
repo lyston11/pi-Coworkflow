@@ -11,10 +11,11 @@
  *   role  — the `role:` frontmatter of the kind the child was dispatched as, read
  *           from that kind's definition file (or the shipped asset standing in for
  *           it). A `<!-- trellis-agent: <role> -->` marker in the agent definition
- *           or dispatch prompt is accepted as well. **The session name is not a
- *           source**: `trellis-check` used to identify a role, and under kinds it
- *           does not — a name is not a declaration, so a legacy agent gets the
- *           generic child treatment instead of someone else's context.
+ *           or dispatch prompt is accepted as well — but only when no kind claims
+ *           the name: a kind that declared `role: none` has answered, and a marker
+ *           must not overrule its own definition. **The session name is not the
+ *           source of a role**: only the kind behind that name is, so `trellis-check`
+ *           gets the generic child treatment instead of someone else's context.
  *   task  — the `Active task: <path>` line of the dispatch prompt, which
  *           Trellis's own dispatch protocol already requires. pi-subagents wraps
  *           the prompt, so the line arrives as `Task: Active task: <path>`;
@@ -23,11 +24,16 @@
  *           when the child named no task at all. A task reference that *is*
  *           present and does not resolve is reported as invalid instead of being
  *           replaced by the parent's task, which is how a generic child used to
- *           end up implementing whatever the parent had open.
+ *           end up implementing whatever the parent had open. A reference must
+ *           have a reference's shape to count: the documented protocol line is
+ *           written with a placeholder (`Active task: <任务目录>`), and reading a
+ *           placeholder as a real reference used to cancel that fallback.
  *
  * Everything is read from the main checkout, not the child's cwd: a lane
  * worktree only carries whatever was committed, while the task artifacts the
- * parent is still editing live in the main checkout.
+ * parent is still editing live in the main checkout. That is also why the block
+ * prints the task's absolute directory next to the protocol's relative reference:
+ * a child whose cwd is a worktree cannot open the relative one.
  *
  * ## How the prompt is built
  *
@@ -64,26 +70,12 @@ import {
   taskRefForDisplay,
   type SubagentRole,
 } from "../../core/trellis.ts";
-import { BUILTIN_KINDS, kindRole, resolveKinds } from "../agent-kinds/defaults.ts";
+import { resolveKinds } from "../agent-kinds/defaults.ts";
 import { readKindDefinitions } from "../agent-kinds/definitions.ts";
 import { readConfig } from "../../core/config.ts";
 import type { ResolvedAgentKind } from "../../core/config.ts";
 
 const ROLES: SubagentRole[] = ["implement", "check", "research"];
-/**
- * A kind's registered agent name (`cw-executor`, `cw-auditor`, `cw-researcher`),
- * matched anywhere in the session name — `subagent-cw-executor-run-1-0` included,
- * where `-` precedes it. It resolves through the *kind's own definition*, so the
- * role still has exactly one source; the name only says *which kind* this is.
- *
- * The alternation is generated from the shipped kind table rather than written out,
- * so a new kind needs no second edit here — but it must be an alternation and not
- * an open `[a-z-]+` pattern: a session name like `subagent-cw-executor-run-1-0`
- * would otherwise capture `executor-run-1-0` and resolve to no role at all.
- */
-const KIND_AGENT_RE = new RegExp(
-  `(?:^|[^A-Za-z0-9])cw-(${BUILTIN_KINDS.map((entry) => entry.kind).join("|")})(?![A-Za-z0-9])`,
-);
 const MARKER_RE = /<!--\s*trellis-agent:\s*(implement|check|research)\s*-->/;
 /**
  * The task path after `Active task:`, anywhere in the text. It must not be
@@ -92,6 +84,42 @@ const MARKER_RE = /<!--\s*trellis-agent:\s*(implement|check|research)\s*-->/;
  */
 const ACTIVE_TASK_RE = /Active task:\s*([^\s`'"\n]+)/;
 const TASK_PATH_RE = /\.trellis\/tasks\/[A-Za-z0-9._-]+/;
+/**
+ * What a task *reference* looks like, as opposed to prose that merely follows the
+ * words `Active task:`.
+ *
+ * The dispatch protocol is documented with a placeholder — this package's own
+ * managed region says `Active task: <任务目录>`, Trellis's `workflow.md` says
+ * ``Active task: <task path from task.py current>``. A placeholder is not a
+ * reference. Reading one as a reference made it a *bad* reference, which cancelled
+ * the parent-pointer fallback and told the child its parent had named a task that
+ * does not exist: the child then got no role context at all and blamed the parent.
+ * Only shapes `resolveTaskDir` can resolve are references; anything else means the
+ * child named no task, so the fallback applies. A real but wrong path
+ * (`.trellis/tasks/typo`) keeps its shape and stays invalid, by design.
+ */
+const TASK_REF_PREFIX =
+  /^\/[^\s`'"<>]*?\.trellis\/tasks\/[A-Za-z0-9._-]+|^(?:\.trellis\/)?tasks\/[A-Za-z0-9._-]+|^[A-Za-z0-9._-]+/;
+
+/**
+ * The task reference a captured `Active task:` value *starts with*, or null.
+ *
+ * A capture runs to the next whitespace, so it carries whatever the dispatch prompt wrote
+ * after the path — a Chinese comma and the rest of the sentence, a closing `**`, a trailing
+ * slash. Only the reference-shaped prefix is the reference. A placeholder
+ * (`<任务目录>`, `<task path from task.py current>`) starts with none of those shapes and
+ * therefore names nothing, which is what lets the parent-pointer fallback apply.
+ *
+ * An absolute reference is one of the shapes: a parent that copied the directory this module
+ * itself prints must not have its reference dropped and replaced by the parent's pointer.
+ */
+function leadingTaskRef(value: string): string | null {
+  const text = value.replace(/[`'"]/g, "").trim().replace(/^\.\//, "");
+  const matched = TASK_REF_PREFIX.exec(text)?.[0];
+  if (matched === undefined) return null;
+  // `.` and `..` are how a path starts, never a task name.
+  return /^\.+$/.test(matched) ? null : matched;
+}
 
 /** The section name Pi renders (and diffs) for this module's contribution. */
 export const SECTION = "pi_coworkflow_child";
@@ -118,22 +146,38 @@ function asRole(value: string | undefined): SubagentRole | null {
 }
 
 /**
- * The role the kind behind a registered agent name stands for.
+ * The kind a registered agent name belongs to, if any.
  *
  * The name only says *which kind* this is; the role itself is that kind's declaration —
- * the project's definition file when it has one, else the shipped asset — read through
- * `kindRole`, which is the single mapping `executor → implement`, `auditor → check`.
+ * the project's definition file when it has one, else the shipped asset — which is why
+ * this resolves against the table the caller passed (the live one) instead of a fixed
+ * list of names: a definition may rename the agent (`agent: cw-builder`), and a static
+ * alternation over the shipped kinds then finds nothing and the child silently loses
+ * its context.
+ *
+ * Two spellings carry the name: the agent segment of the dispatch session name
+ * (`cw-executor: <task>`), and the wrapped one the managed region documents
+ * (`subagent-cw-executor-<runId>-<i>`). The second is matched as a whole segment,
+ * longest agent name first, so `cw-builder-team` cannot be shadowed by `cw-builder`.
  */
-function roleOfKind(agent: string, kinds?: readonly ResolvedAgentKind[]): SubagentRole | null {
-  // Through the project's table when the caller has one: a definition may rename the agent
-  // (`agent: cw-builder`) or declare a different role, and a name-shaped guess would then
-  // inject the wrong context — or none, silently.
-  if (kinds !== undefined) {
-    const entry = kinds.find((candidate) => candidate.agent === agent);
-    if (entry !== undefined) return entry.role ?? null;
+function kindOf(agent: string, kinds: readonly ResolvedAgentKind[]): ResolvedAgentKind | undefined {
+  const exact = kinds.find((candidate) => candidate.agent === agent);
+  if (exact !== undefined) return exact;
+  if (!agent) return undefined;
+  const names = kinds
+    .map((candidate) => candidate.agent)
+    .filter((name) => name !== "")
+    .sort((left, right) => right.length - left.length);
+  for (const name of names) {
+    const at = agent.indexOf(name);
+    if (at === -1) continue;
+    const before = at === 0 ? "" : agent[at - 1] ?? "";
+    const after = agent[at + name.length] ?? "";
+    if (!/[A-Za-z0-9]/.test(before) && !/[A-Za-z0-9]/.test(after)) {
+      return kinds.find((candidate) => candidate.agent === name);
+    }
   }
-  const kind = KIND_AGENT_RE.exec(agent)?.[1];
-  return kind === undefined ? null : kindRole(kind);
+  return undefined;
 }
 
 /**
@@ -142,16 +186,20 @@ function roleOfKind(agent: string, kinds?: readonly ResolvedAgentKind[]): Subage
  * Two sources, both declarations: the kind the child's agent name belongs to (its
  * definition's `role:`), then the marker a prompt or agent definition may carry.
  * `kinds` is the project's resolved kind table when the caller has read it; without
- * it the shipped definitions are the only evidence.
+ * it the shipped definitions are the only evidence, because a project definition is
+ * exactly what the caller must pass to be seen.
+ *
+ * A kind that declares `role: none` has answered: its children are generic children,
+ * and a marker in an inherited prompt must not hand them someone else's context.
  */
 export function detectRole(
   sessionName: string | undefined,
   kinds?: readonly ResolvedAgentKind[],
   ...texts: (string | undefined)[]
 ): SubagentRole | null {
-  const agent = sessionName?.split(":")[0]?.trim();
-  const fromKind = roleOfKind(agent ?? "", kinds);
-  if (fromKind) return fromKind;
+  const agent = sessionName?.split(":")[0]?.trim() ?? "";
+  const kind = kindOf(agent, kinds ?? resolveKinds(null));
+  if (kind !== undefined) return kind.role ?? null;
 
   for (const text of texts) {
     const marker = text ? MARKER_RE.exec(text)?.[1] : undefined;
@@ -167,8 +215,11 @@ export function taskReference(
   ...texts: (string | undefined)[]
 ): string | null {
   for (const text of texts) {
-    const ref = text ? ACTIVE_TASK_RE.exec(text)?.[1] : undefined;
-    if (ref) return ref.replace(/[`'"]/g, "").trim() || null;
+    const captured = text ? ACTIVE_TASK_RE.exec(text)?.[1] : undefined;
+    // A placeholder is not a reference: keep looking, so a documented
+    // `Active task: <任务目录>` in one text cannot hide a real reference in another.
+    const ref = captured === undefined ? null : leadingTaskRef(captured);
+    if (ref !== null) return ref;
   }
   const fromName = TASK_PATH_RE.exec(sessionName ?? "")?.[0];
   return fromName ?? null;
@@ -216,6 +267,21 @@ interface ChildPrompt {
   context: string;
 }
 
+/**
+ * The task as the child should see it.
+ *
+ * The protocol's relative reference stays first, exactly as written in `AGENTS.md`; the
+ * absolute directory follows it because the child's cwd may be a lane worktree, where a
+ * path relative to the main checkout points at a directory that does not exist. Files the
+ * child writes there would also land in the worktree instead of the parent-owned task.
+ */
+function activeTaskLines(ref: string, dir: string): string[] {
+  return [
+    `Active task: ${ref}`,
+    `任务目录（绝对路径：\`${dir}\`；cwd 在 worktree 时也用它读 prd/design/implement）`,
+  ];
+}
+
 function blockFor(prompt: ChildPrompt): string {
   const { role, task, displayRef } = prompt;
   const lines = [`<!-- pi-Coworkflow:subagent-context -->`];
@@ -234,7 +300,7 @@ function blockFor(prompt: ChildPrompt): string {
     lines.push(
       `## Trellis 子任务上下文（role: ${role}）`,
       "",
-      task.kind === "task" ? `Active task: ${displayRef}` : "Active task: (none)",
+      ...(task.kind === "task" ? activeTaskLines(displayRef, task.dir) : ["Active task: (none)"]),
       "",
       prompt.context,
       "",
@@ -242,7 +308,7 @@ function blockFor(prompt: ChildPrompt): string {
   } else if (task.kind === "task") {
     // No role marker, but the parent named a task: tell the child, without
     // pretending it has an implement/check context it never asked for.
-    lines.push(`## Trellis 任务`, "", `Active task: ${displayRef}`, "");
+    lines.push(`## Trellis 任务`, "", ...activeTaskLines(displayRef, task.dir), "");
   }
 
   // The guide goes in for every child — a generic agent included — and after the
