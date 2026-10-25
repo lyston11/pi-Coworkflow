@@ -82,43 +82,16 @@ const MARKER_RE = /<!--\s*trellis-agent:\s*(implement|check|research)\s*-->/;
  * anchored to the line start: pi-subagents wraps the dispatch prompt, so the
  * line arrives as `Task: Active task: .trellis/tasks/<name>`.
  */
-const ACTIVE_TASK_RE = /Active task:\s*([^\s`'"\n]+)/;
+const ACTIVE_TASK_RE = /Active task:\s*([^\s`'"\n]+)/g;
 const TASK_PATH_RE = /\.trellis\/tasks\/[A-Za-z0-9._-]+/;
-/**
- * What a task *reference* looks like, as opposed to prose that merely follows the
- * words `Active task:`.
- *
- * The dispatch protocol is documented with a placeholder — this package's own
- * managed region says `Active task: <任务目录>`, Trellis's `workflow.md` says
- * ``Active task: <task path from task.py current>``. A placeholder is not a
- * reference. Reading one as a reference made it a *bad* reference, which cancelled
- * the parent-pointer fallback and told the child its parent had named a task that
- * does not exist: the child then got no role context at all and blamed the parent.
- * Only shapes `resolveTaskDir` can resolve are references; anything else means the
- * child named no task, so the fallback applies. A real but wrong path
- * (`.trellis/tasks/typo`) keeps its shape and stays invalid, by design.
- */
-const TASK_REF_PREFIX =
-  /^\/[^\s`'"<>]*?\.trellis\/tasks\/[A-Za-z0-9._-]+|^(?:\.trellis\/)?tasks\/[A-Za-z0-9._-]+|^[A-Za-z0-9._-]+/;
 
-/**
- * The task reference a captured `Active task:` value *starts with*, or null.
- *
- * A capture runs to the next whitespace, so it carries whatever the dispatch prompt wrote
- * after the path — a Chinese comma and the rest of the sentence, a closing `**`, a trailing
- * slash. Only the reference-shaped prefix is the reference. A placeholder
- * (`<任务目录>`, `<task path from task.py current>`) starts with none of those shapes and
- * therefore names nothing, which is what lets the parent-pointer fallback apply.
- *
- * An absolute reference is one of the shapes: a parent that copied the directory this module
- * itself prints must not have its reference dropped and replaced by the parent's pointer.
- */
+/** Ignore documentation placeholders, but retain invalid explicit paths for validation. */
 function leadingTaskRef(value: string): string | null {
-  const text = value.replace(/[`'"]/g, "").trim().replace(/^\.\//, "");
-  const matched = TASK_REF_PREFIX.exec(text)?.[0];
-  if (matched === undefined) return null;
-  // `.` and `..` are how a path starts, never a task name.
-  return /^\.+$/.test(matched) ? null : matched;
+  if (value.startsWith("<")) return null;
+  // Trailing prose/Markdown is not part of the reference. Do not truncate path
+  // segments: doing so could turn an invalid explicit path into a different task.
+  const ref = value.split(/[，。；,;*]/, 1)[0]?.replace(/^\.\//, "");
+  return ref || null;
 }
 
 /** The section name Pi renders (and diffs) for this module's contribution. */
@@ -164,20 +137,8 @@ function kindOf(agent: string, kinds: readonly ResolvedAgentKind[]): ResolvedAge
   const exact = kinds.find((candidate) => candidate.agent === agent);
   if (exact !== undefined) return exact;
   if (!agent) return undefined;
-  const names = kinds
-    .map((candidate) => candidate.agent)
-    .filter((name) => name !== "")
-    .sort((left, right) => right.length - left.length);
-  for (const name of names) {
-    const at = agent.indexOf(name);
-    if (at === -1) continue;
-    const before = at === 0 ? "" : agent[at - 1] ?? "";
-    const after = agent[at + name.length] ?? "";
-    if (!/[A-Za-z0-9]/.test(before) && !/[A-Za-z0-9]/.test(after)) {
-      return kinds.find((candidate) => candidate.agent === name);
-    }
-  }
-  return undefined;
+  const names = [...kinds].sort((left, right) => right.agent.length - left.agent.length);
+  return names.find((candidate) => candidate.agent !== "" && agent.startsWith(`subagent-${candidate.agent}-`));
 }
 
 /**
@@ -215,11 +176,10 @@ export function taskReference(
   ...texts: (string | undefined)[]
 ): string | null {
   for (const text of texts) {
-    const captured = text ? ACTIVE_TASK_RE.exec(text)?.[1] : undefined;
-    // A placeholder is not a reference: keep looking, so a documented
-    // `Active task: <任务目录>` in one text cannot hide a real reference in another.
-    const ref = captured === undefined ? null : leadingTaskRef(captured);
-    if (ref !== null) return ref;
+    for (const match of (text ?? "").matchAll(ACTIVE_TASK_RE)) {
+      const ref = leadingTaskRef(match[1]!);
+      if (ref !== null) return ref;
+    }
   }
   const fromName = TASK_PATH_RE.exec(sessionName ?? "")?.[0];
   return fromName ?? null;

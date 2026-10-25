@@ -529,6 +529,19 @@ test("subagent-context: the documented placeholder is not a task reference, so t
     harness.run(punctuated);
     const punctuatedBlock = punctuated.systemPromptOptions.sections.pi_coworkflow_child ?? "";
     assert.match(punctuatedBlock, /^Active task: \.trellis\/tasks\/10-20-other$/m, "the punctuation is not part of the name");
+
+    punctuated.prompt = "Active task: <任务目录>\nActive task: .trellis/tasks/10-20-other";
+    punctuated.systemPromptOptions.sections = {};
+    harness.run(punctuated);
+    assert.match(punctuated.systemPromptOptions.sections.pi_coworkflow_child ?? "", /^Active task: \.trellis\/tasks\/10-20-other$/m,
+      "a placeholder cannot hide a later explicit task in the same prompt");
+
+    punctuated.prompt = "Active task: /outside-this-project/no-such-task";
+    punctuated.systemPromptOptions.sections = {};
+    harness.run(punctuated);
+    const invalid = punctuated.systemPromptOptions.sections.pi_coworkflow_child ?? "";
+    assert.match(invalid, /不存在/, "an explicit invalid absolute path is still reported");
+    assert.doesNotMatch(invalid, /Do the thing/, "invalid paths cannot fall back to the parent's task");
   } finally {
     harness.close();
   }
@@ -589,6 +602,8 @@ test("subagent-context: a project-defined kind's role resolves from a wrapped se
   // A name the table does not know is not a near miss: `cw-builderx` is a generic child.
   const nearMiss = await blockOf("cw-builderx: build the thing");
   assert.doesNotMatch(nearMiss, /role: implement/, "a longer name is not a kind's name");
+  assert.doesNotMatch(await blockOf("cw-builder-other: build the thing"), /role: implement/,
+    "a hyphenated unrelated agent must not borrow a kind's context");
 });
 
 test("subagent-context: a kind that declared role none is not overruled by a role marker", async () => {

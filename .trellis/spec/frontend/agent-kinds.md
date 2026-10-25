@@ -184,7 +184,7 @@ fleet 投影的 `key` 是不透明显示键，上游明确禁止当作 run 或 a
 
 - 不做「自动把任务分给某个类」的调度器——那是判断，不是机制。
 - 不改 pi-subagents 的任何文件，不加载第二份运行器。
-- 不改写 Trellis 的 CLI 与全局模板；**但本包自带 Trellis 资产模板，本项目工作面只讲 kind**：模板不产出 `.pi/agents/trellis-{implement,check,research}.md`，老项目里残留的由 `retireRoleAgents()` 在迁移时删除，`.trellis/workflow.md` 的 Pi 块在模板里就写成 kind 派单，其它平台块不动。范式文件由本包模板渲染，没有第二个来源；要刷新就重跑 `/Coworkflow:init`。
+- 本包自带并维护 Trellis 资产模板，工作面以 kind 为操作对象。模板不产出旧角色 agent，老项目残留由迁移清理；刷新使用 `/Coworkflow:init`。
 - 不自动重试、不自动合并、不自动清理。
 
 ## 失败模式与对应要求
@@ -227,7 +227,9 @@ fleet 投影的 `key` 是不透明显示键，上游明确禁止当作 run 或 a
 
 CLI 是给**外部 agent** 的入口：不依赖 Pi 会话、扩展宿主或任何常驻进程，任何能跑 shell 的 agent 都能用。两条约定不可动摇——**退出码是结论**（0 成功 / 1 被拒绝且文件未改动 / 2 用法或找不到 / 3 内部错误），`--json` 让机器读结果而不用解析散文。它用 `mainCheckout` 解析项目根：在 task worktree 里执行会写到主检出，因为 worktree 只有已提交文件，写在里面没有 gate 会读到。不做「只在内存里注册」的通路——那种 kind 在 `/reload` 后会消失，正好违背这个端口的承诺；也**不做目录监听**：刷新点是 `/reload` 与命令本身，轮询是另一种成本。
 
-`subagent-context` 的角色解析也读这张表：定义可以改名（`agent: cw-reviewer`）或改 role（`role: none`），靠名字猜会注入错上下文或什么都不注入。
+`subagent-context` 与工作流选人都使用解析后的 kind 定义：定义可以改名（`agent: cw-reviewer`）或改 role（`role: none`）。支持的会话名包装必须匹配当前定义表，不能只识别随包的三个名字。显式 `none` 不得被提示词中的 marker 覆盖。
+
+任务工件属于主检出；注入展示其绝对路径，linked worktree 中的子会话按该路径读取。文档占位符不是 `Active task` 引用，但真实的无效任务引用必须报错，不能回退到另一个当前任务。自有 kind 派单缺少 `async` 时也写入 `true`，保证后台运行不受上游默认值影响。
 
 ## 面板的一条硬规则：不动光标按 Enter 必须写回原值
 
