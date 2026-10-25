@@ -116,7 +116,7 @@ function tempProject(config: Record<string, unknown> = {}): string {
   return root;
 }
 
-function harness(options: { spawn?: "confirmed" | "ambiguous"; runs?: Run[]; hideSpawned?: boolean } = {}): Harness {
+function harness(options: { spawn?: "confirmed" | "ambiguous" | "refused"; runs?: Run[]; hideSpawned?: boolean } = {}): Harness {
   const root = tempProject();
   const runs: Run[] = (options.runs ?? []).map((run) => ({ ...run }));
   /** Runs the owner started but does not show in its projections yet (a real lag window). */
@@ -215,6 +215,15 @@ function harness(options: { spawn?: "confirmed" | "ambiguous"; runs?: Run[]; hid
     if (request.method === "spawn") {
       spawnCount += 1;
       const params = request.params as Record<string, unknown>;
+      // An explicit refusal: the owner answered, and its answer was no.
+      if (options.spawn === "refused") {
+        return {
+          version: 1,
+          requestId: request.requestId,
+          success: false,
+          error: { code: "spawn-failed", message: "pi-subagents 拒绝了这个 spawn：缺少 provider 配置" },
+        };
+      }
       if (!confirmed) return reply({ text: "spawned", details: { asyncDir: "/tmp/ambiguous" } });
       serial += 1;
       const runId = `run-spawn-${serial}`;
@@ -691,6 +700,44 @@ test("host: a module switch during the awaited project-capacity read stops the l
     const second = await h.call({ tasks: [{ key: "b", kind: "executor", task: "do b" }] });
     assert.equal(second.details.started.length, 1, second.text);
     assert.equal(h.spawns(), 1);
+  } finally {
+    h.close();
+  }
+});
+
+test("host: a refused spawn cascades in the tool response, matching the status snapshot", { skip }, async () => {
+  const h = harness({ spawn: "refused" });
+  try {
+    h.setLimits({ kinds: { executor: 5 } });
+    const result = await h.call({
+      tasks: [
+        { key: "a", kind: "executor", task: "do a" },
+        { key: "b", kind: "executor", task: "do b" },
+        { key: "c", kind: "executor", task: "do c" },
+        { key: "d", kind: "executor", task: "do d", needs: ["a"] },
+      ],
+    });
+
+    assert.equal(result.isError, true, result.text);
+    assert.deepEqual(result.details.started, []);
+    assert.deepEqual(
+      result.details.queued,
+      [],
+      "d was failed by the cascade; reporting it as queued contradicts the queue",
+    );
+    assert.deepEqual(
+      result.details.failed.map((entry: any) => entry.key),
+      ["a", "b", "c", "d"],
+    );
+    assert.match(result.text, /0 已启动 \/ 0 排队 \/ 0 启动未确认 \/ 4 失败/, result.text);
+    assert.match(result.text, /x d（kind executor）失败：dependency/, result.text);
+    assert.doesNotMatch(result.text, /… d/, "and it is not also offered as waiting");
+
+    // What the caller was told and what the status panel shows are the same state.
+    const lines = h.status().join("\n");
+    for (const key of ["a", "b", "c", "d"]) assert.match(lines, new RegExp(`x dispatch: ${key}`), lines);
+    assert.match(lines, /0 运行 \/ 0 排队/, lines);
+    assert.equal(spawnRequests(h.requests), 3, "one emission per unit that was tried, no retries");
   } finally {
     h.close();
   }

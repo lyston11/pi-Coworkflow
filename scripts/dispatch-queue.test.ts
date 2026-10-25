@@ -129,6 +129,55 @@ test("queue: needs keeps a unit waiting until every prerequisite is completed", 
   assert.deepEqual(second.started.map((entry) => entry.key), ["audit"], "a satisfied need starts it");
 });
 
+test("queue: a launch-failure cascade is reported as failed, never as still queued", async () => {
+  // The shape a real smoke produced: every launch is refused outright, and `d` needs
+  // `a`. The cascade fails `d` after this pass already decided it was "waiting for a
+  // prerequisite", so the response used to contradict the snapshot it came from.
+  const refused: DispatchDeps = {
+    async admit(kind: string): Promise<AdmitResult> {
+      return {
+        ok: true,
+        kind,
+        policy: { kind, agent: `cw-${kind}`, label: kind, enabled: true, maxConcurrent: 5, source: "shipped" } as never,
+        config: null,
+      };
+    },
+    async launch() {
+      return { ok: false as const, reason: "pi-subagents 拒绝了这个 spawn：缺少 provider 配置" };
+    },
+  };
+  const queue = createDispatchQueue(refused, 1);
+  const result = await queue.submit({
+    tasks: [
+      { key: "a", kind: "executor", task: "do a" },
+      { key: "b", kind: "executor", task: "do b" },
+      { key: "c", kind: "executor", task: "do c" },
+      { key: "d", kind: "executor", task: "do d", needs: ["a"] },
+    ],
+  });
+
+  assert.deepEqual(result.started, []);
+  assert.deepEqual(result.queued, [], "the cascade failed d, so nothing is still waiting");
+  assert.deepEqual(
+    result.failed.map((entry) => [entry.key, entry.reason]),
+    [
+      ["a", "pi-subagents 拒绝了这个 spawn：缺少 provider 配置"],
+      ["b", "pi-subagents 拒绝了这个 spawn：缺少 provider 配置"],
+      ["c", "pi-subagents 拒绝了这个 spawn：缺少 provider 配置"],
+      ["d", "dependency"],
+    ],
+  );
+  // The response is the snapshot, not a mid-loop guess.
+  const snapshot = queue.snapshot();
+  assert.deepEqual(result.queued, snapshot.queued);
+  assert.deepEqual(result.failed, snapshot.failed);
+  assert.deepEqual(result.unobserved, snapshot.unobserved);
+  const body = renderDispatchResult(result);
+  assert.match(body, /0 已启动 \/ 0 排队 \/ 0 启动未确认 \/ 4 失败/, body);
+  assert.match(body, /x d（kind executor）失败：dependency/, body);
+  assert.doesNotMatch(body, /… d/, "a cascade failure must not also be listed as waiting");
+});
+
 test("queue: a failed prerequisite fails its dependents instead of queueing them forever", async () => {
   const owner = fakeOwner({ executor: 2 });
   const queue = createDispatchQueue(owner.deps, 1);

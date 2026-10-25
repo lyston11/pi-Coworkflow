@@ -330,6 +330,33 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
     return new Map(tasks.map((task) => [task.key, task]));
   }
 
+  /**
+   * The queue's own lists, read from the tasks as they are.
+   *
+   * One definition for both the snapshot and a pass's result: a tool response that
+   * contradicts the snapshot it was just taken against — "queued: dependency" for a
+   * unit the cascade had already failed, or a launch failure missing from `failed` —
+   * is worse than no counts at all.
+   */
+  function waitingList(): { key: string; kind: string; reason: QueueReason }[] {
+    return tasks.flatMap((task) =>
+      task.status === "waiting"
+        ? [{ key: task.key, kind: task.kind, reason: (task.reason ?? "dependency") as QueueReason }]
+        : []);
+  }
+
+  function failedList(): { key: string; kind: string; reason: string }[] {
+    return tasks.flatMap((task) =>
+      task.status === "failed" ? [{ key: task.key, kind: task.kind, reason: String(task.reason ?? "failed") }] : []);
+  }
+
+  function unobservedList(): { key: string; kind: string; detail: string }[] {
+    return tasks.flatMap((task) =>
+      task.status === "unobserved"
+        ? [{ key: task.key, kind: task.kind, detail: String(task.reason ?? "未确认") }]
+        : []);
+  }
+
   /** Fail every waiting unit whose prerequisite failed (or does not exist). */
   function cascade(): void {
     const byKey = index();
@@ -466,9 +493,17 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
       delete task.reason;
       result.started.push({ key: task.key, runId: launched.runId, kind: task.kind });
     }
-    // A unit that failed during this pass may have waiting dependents that the
-    // opening cascade could not see yet.
+    // A unit that failed during this pass may have waiting dependents the opening
+    // cascade could not see yet. They are failed here, and that failure has to reach
+    // the caller: a unit this pass already reported as `queued dependency` when it was
+    // started is `failed dependency` by the time the pass returns, and the response
+    // must say what is true when it is read, not what was true mid-loop.
     cascade();
+    // `started` stays this pass's launch receipts (those are events, not state); the
+    // three state lists are re-read from the queue itself.
+    result.queued = waitingList();
+    result.failed = failedList();
+    result.unobserved = unobservedList();
     return result;
   }
 
@@ -589,16 +624,9 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
           task.status === "running" && task.runId !== undefined
             ? [{ key: task.key, kind: task.kind, runId: task.runId }]
             : []),
-        queued: tasks.flatMap((task) =>
-          task.status === "waiting"
-            ? [{ key: task.key, kind: task.kind, reason: (task.reason ?? "dependency") as QueueReason }]
-            : []),
-        failed: tasks.flatMap((task) =>
-          task.status === "failed" ? [{ key: task.key, kind: task.kind, reason: String(task.reason ?? "failed") }] : []),
-        unobserved: tasks.flatMap((task) =>
-          task.status === "unobserved"
-            ? [{ key: task.key, kind: task.kind, detail: String(task.reason ?? "未确认") }]
-            : []),
+        queued: waitingList(),
+        failed: failedList(),
+        unobserved: unobservedList(),
         completed: tasks.filter((task) => task.status === "completed").length,
         invalidated,
       };
