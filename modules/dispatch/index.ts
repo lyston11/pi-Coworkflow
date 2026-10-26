@@ -1,5 +1,5 @@
 /**
- * Module: the queued dispatch channel (`coworkflow.dispatch`).
+ * Module: the queued dispatch channel (`coworkflow_dispatch`).
  *
  * Handing over ten work units one call at a time is what makes a parent session
  * serial and slow: the model dispatches until a ceiling refuses, then has to
@@ -667,7 +667,11 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
 
 /** The owner's exact completion event, advertised as `events.asyncComplete`. */
 const ASYNC_COMPLETE_EVENT = "subagent:async-complete";
-const TOOL_NAME = "coworkflow.dispatch";
+// The tool name cannot contain a dot: OpenAI's function-name grammar is
+// `^[a-zA-Z0-9_-]{1,64}$`, so `coworkflow_dispatch` makes the provider reject the
+// whole request. Gateways tend to report that rejection as an upstream 502, which
+// reads like a broken relay instead of an invalid name.
+const TOOL_NAME = "coworkflow_dispatch";
 
 interface HostState {
   runtime: RuntimeContext | null;
@@ -927,7 +931,7 @@ export function renderDispatchResult(result: DispatchResult): string {
 
 export const dispatchModule: WorkflowModule = {
   id: "dispatch",
-  title: "排队派单（coworkflow.dispatch：一次交全部工作单元，按 kind 上限排队续派）",
+  title: "排队派单（coworkflow_dispatch：一次交全部工作单元，按 kind 上限排队续派）",
 
   /**
    * Register the tool and the two completion observation paths.
@@ -1024,7 +1028,7 @@ export const dispatchModule: WorkflowModule = {
   runtimeStatus(host: PiRuntimeHost): string[] | null {
     const state = HOSTS.get(host);
     if (!state?.queue || !state.runtime) {
-      return [`  - dispatch: 本会话未激活 dispatch（coworkflow.dispatch 不可用）`];
+      return [`  - dispatch: 本会话未激活 dispatch（coworkflow_dispatch 不可用）`];
     }
     // A status render is also a valid moment to notice a session replacement: the
     // old queue's runs are not this session's, and reporting them as this session's
@@ -1033,7 +1037,7 @@ export const dispatchModule: WorkflowModule = {
     const lines = state.queue.statusLines();
     // A tool this host cannot register must not read as an available channel.
     if (!state.toolRegistered) {
-      lines.push(`  ! dispatch: 本会话的宿主没有提供 registerTool，coworkflow.dispatch 不可用`);
+      lines.push(`  ! dispatch: 本会话的宿主没有提供 registerTool，coworkflow_dispatch 不可用`);
     }
     return lines;
   },

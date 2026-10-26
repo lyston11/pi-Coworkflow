@@ -449,7 +449,7 @@ test("queue: a replacement during an awaited settlement starts nothing either", 
   assert.equal(settled.stale, true, "the caller can tell the operation was dropped");
 });
 
-test("tool: activation registers coworkflow.dispatch once and releases its observers on session end", () => {
+test("tool: activation registers coworkflow_dispatch once and releases its observers on session end", () => {
   const root = tempProject({});
   const resolver = createConfigRootResolver({ runGit: () => ({ kind: "no-repo" }) });
   const runtime = {
@@ -493,7 +493,7 @@ test("tool: activation registers coworkflow.dispatch once and releases its obser
   try {
     dispatchModule.activate!(host, runtime);
     dispatchModule.activate!(host, runtime);
-    assert.deepEqual(tools.map((tool) => tool.name), ["coworkflow.dispatch"], "one registration per session");
+    assert.deepEqual(tools.map((tool) => tool.name), ["coworkflow_dispatch"], "one registration per session");
     assert.ok(JSON.stringify(tools[0]?.parameters).includes('"needs"'), "needs is part of the tool schema");
     dispatchModule.onSessionEnd!(host, runtime);
     assert.deepEqual(listeners, [], "nothing is left observing the next session");

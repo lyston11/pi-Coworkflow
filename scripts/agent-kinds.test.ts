@@ -816,7 +816,7 @@ test("boundary decoder: only the two documented script spellings are ungovernabl
   }
 });
 
-test("gate: a script-internal launch is refused and told to use coworkflow.dispatch", { skip }, async () => {
+test("gate: a script-internal launch is refused and told to use coworkflow_dispatch", { skip }, async () => {
   const h = gateHarness();
   try {
     await syncAgentKinds(h.host, h.runtime);
@@ -826,7 +826,7 @@ test("gate: a script-internal launch is refused and told to use coworkflow.dispa
     const inline = await h.call({ workflow: true, args: { whatever: true } });
     assert.ok(inline, "a code-block workflow escapes every admission this package has");
     assert.match(inline.reason ?? "", /不经过本包的准入/);
-    assert.match(inline.reason ?? "", /coworkflow\.dispatch/);
+    assert.match(inline.reason ?? "", /coworkflow_dispatch/);
     assert.match(inline.reason ?? "", /没有启动任何子进程/);
 
     // The script-path form: the file is read, and only a script that actually starts children is refused.
@@ -838,7 +838,7 @@ test("gate: a script-internal launch is refused and told to use coworkflow.dispa
     const file = await h.call({ workflow: "./launch.js", args: {} });
     assert.ok(file, "a script that starts its own children is the shape this gate cannot admit");
     assert.match(file.reason ?? "", /runs\.run/);
-    assert.match(file.reason ?? "", /coworkflow\.dispatch/);
+    assert.match(file.reason ?? "", /coworkflow_dispatch/);
     assert.equal(await h.call({ workflow: "./pure.js" }), undefined, "a script that starts nothing is not refused");
     assert.equal(await h.call({ workflow: "./absent.js" }), undefined, "an unreadable script is unknown, not a guess");
 

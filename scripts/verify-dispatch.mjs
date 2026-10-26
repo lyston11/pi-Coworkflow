@@ -125,7 +125,7 @@ try {
     sessionManager: SessionManager.create(fixture, join(fixture, "sessions")) }));
   await session.bindExtensions({ onError: error => errors.push(error) });
   const tools = loaded.flatMap(e => [...e.tools.values()]);
-  const tool = tools.find(t => (t.definition ?? t).name === "coworkflow.dispatch");
+  const tool = tools.find(t => (t.definition ?? t).name === "coworkflow_dispatch");
   assert.ok(tool, "native host registers the queue tool");
   const task = `Active task: ${taskDir}\nRead-only probe: reply PROBE_COMPLETED without tools.`;
   const result = await (tool.definition ?? tool).execute("probe", { worktree: true, tasks: [

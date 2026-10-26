@@ -1,5 +1,5 @@
 /**
- * `coworkflow.dispatch` as the *host* wires it, not the queue alone.
+ * `coworkflow_dispatch` as the *host* wires it, not the queue alone.
  *
  * The queue unit tests inject `DispatchDeps`, which is the right way to pin the
  * scheduling rules but says nothing about the two paths that actually run:
@@ -283,8 +283,8 @@ function harness(options: { spawn?: "confirmed" | "ambiguous" | "refused"; runs?
     root,
     requests,
     async call(params) {
-      const tool = tools.find((entry) => entry.name === "coworkflow.dispatch");
-      assert.ok(tool, "coworkflow.dispatch is registered on the host");
+      const tool = tools.find((entry) => entry.name === "coworkflow_dispatch");
+      assert.ok(tool, "coworkflow_dispatch is registered on the host");
       const result = await tool.execute("call-1", params);
       const text = (result.content ?? []).map((part: any) => String(part.text ?? "")).join("\n");
       return { ...(result.isError ? { isError: true as const } : {}), details: result.details, text };

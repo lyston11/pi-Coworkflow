@@ -48,7 +48,7 @@
  * decides: the script calls the owner's `runs.run` from the sandbox. That is refused
  * where it can be identified — `workflow: true`, or a script file whose text contains a
  * launch call — with a reason that says it skips admission and names
- * `coworkflow.dispatch`, the channel that does queue and admit. Named resources are
+ * `coworkflow_dispatch`, the channel that does queue and admit. Named resources are
  * judged by their arguments; an unreadable script is unknown and passes through.
  * Claiming coverage of a path we cannot see would be the dishonest half-degradation
  * this module exists to remove.
@@ -99,7 +99,7 @@ const PARALLEL_WORKFLOW = "parallel";
  * A constant because the refusal wording is the whole point of this boundary — a gate that says
  * "no" without saying where to go sends the model looking for another ungoverned shape.
  */
-export const DISPATCH_TOOL = "coworkflow.dispatch";
+export const DISPATCH_TOOL = "coworkflow_dispatch";
 import { KIND_PREFIX } from "../../core/config.ts";
 import {
   kindRegistryFor,
@@ -615,7 +615,7 @@ function fanoutRefusalFor(
     reason: [
       `这个 coworkflow.fanout 要启动 ${failure.requested} 个 ${kindLabel(entry.agent, entry.kind)}，但本项目的上限是 ${failure.limit}，当前已有 ${failure.occupancy} 个在运行。`,
       `整批被拦下，本次调用没有启动任何子进程：workflow 要么全跑要么不跑，只启动一部分比一个都不启动更糟。`,
-      `请减少该 kind 的任务数、等其中一个结束，或在 /Coworkflow:settings 里调高 ${entry.kind} 的上限。要用排队替代整批拒绝，请改用 coworkflow.dispatch。`,
+      `请减少该 kind 的任务数、等其中一个结束，或在 /Coworkflow:settings 里调高 ${entry.kind} 的上限。要用排队替代整批拒绝，请改用 coworkflow_dispatch。`,
     ].join(""),
   };
 }
