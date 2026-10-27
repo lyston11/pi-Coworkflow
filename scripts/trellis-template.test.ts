@@ -21,6 +21,7 @@
  */
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -28,6 +29,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { createContext } from "../core/module.ts";
+import { agentsModule, SUBAGENT_GUIDE_REL } from "../modules/agents/index.ts";
 import {
   TEMPLATE_ROOT,
   classifyTemplatePath,
@@ -211,6 +213,67 @@ test("template: rendering reproduces the repository's Trellis files byte for byt
   assert.equal(compared, rendered, "every renderable template file must be compared");
 });
 
+// ── single-session policy at the rendered and injected boundaries ─────
+
+test("instructions: direct execution is normal, delegation optional, safety retained", async () => {
+  const root = tempProject();
+  const { ctx } = contextFor(root);
+  const projectRule = "# Project\n\nKeep the project's own constraints.\n";
+  writeFileSync(join(root, "AGENTS.md"), projectRule);
+  await agentsModule.apply?.(ctx);
+
+  const parent = readFileSync(join(root, "AGENTS.md"), "utf-8");
+  const child = readFileSync(join(root, SUBAGENT_GUIDE_REL), "utf-8");
+  assert.ok(parent.startsWith(projectRule), "rendering preserves project-owned guidance");
+  assert.match(parent, /主会话默认负责端到端交付/);
+  assert.match(parent, /只有收益高于重复上下文、交接和集成成本时才派单/);
+  assert.match(parent, /不硬编码模型名称/);
+  assert.doesNotMatch(parent, /执行全部交出去|默认并行，串行要给出理由|主会话自己动手的唯一场合/);
+  for (const safety of ["files: []", "必须后台", "开关与并发上限", "禁止 `reset --hard`", "子 agent 不合并、不 push"]) {
+    assert.ok(parent.includes(safety), `delegation still preserves ${safety}`);
+  }
+  assert.match(parent, /主会话的直接写入不受子任务队列的 `files` 检查保护/);
+  assert.match(child, /可以受托提供规划、调研或审查建议/);
+  assert.match(child, /咨询任务不自行修改代码/);
+  assert.match(child, /不再派发子 agent/);
+  assert.match(child, /不操作 Git index、不提交/);
+  assert.doesNotMatch(parent + child, /gpt-6|deepseek/i, "policy must not pin the user's example models");
+});
+
+test("Pi: the real phase extractor delivers direct implementation and optional review", () => {
+  const root = tempProject();
+  renderTemplate(contextFor(root).ctx);
+  const step = (id: string, platform = "pi"): string => execFileSync(
+    process.platform === "win32" ? "python" : "python3",
+    [join(root, ".trellis", "scripts", "get_context.py"), "--mode", "phase", "--platform", platform, "--step", id],
+    { cwd: root, encoding: "utf-8", timeout: 10_000 },
+  );
+
+  const implementation = step("2.1");
+  const check = step("2.2");
+  assert.match(implementation, /Implement directly in the main session by default/);
+  assert.match(implementation, /Optional delegation/);
+  assert.match(implementation, /background execution/);
+  assert.match(implementation, /Duration alone is not a reason/);
+  assert.match(check, /Check the work directly in the main session by default/);
+  assert.match(check, /A separate reviewer is not required/);
+  assert.match(check, /do not repeat unchanged checks/);
+  assert.doesNotMatch(implementation + check, /Spawn the (implement|check) sub-agent|Dispatch the (implementation|quality check) to/);
+  assert.match(step("2.1", "claude-code"), /Spawn the implement sub-agent/, "other platform modes are unchanged");
+});
+
+test("Pi: inline fallback and routing agree with the phase details", () => {
+  const workflow = readFileSync(join(TEMPLATE_ROOT, "dot-trellis", "workflow.md"), "utf-8");
+  const fallback = workflow.match(/\[workflow-state:in_progress-inline\]\n([\s\S]*?)\[\/workflow-state:in_progress-inline\]/)?.[1];
+  assert.ok(fallback, "Pi must retain its inline fallback");
+  assert.match(fallback, /main session implements and validates by default/);
+  assert.match(fallback, /no mandatory execute\/audit pipeline/);
+  assert.match(fallback, /commit \(Phase 3\.4\)/, "direct execution still reaches task closure");
+  const pi = piBlockBodies(workflow).join("\n");
+  assert.match(pi, /implement and check directly in the main session/);
+  assert.doesNotMatch(pi, /after editing -> dispatch the audit kind|Dispatch the (implementation|quality check) to/);
+});
+
 // ── idempotency ──────────────────────────────────────────────────────
 
 test("template: a second render writes nothing and reports the project as up to date", () => {
@@ -304,7 +367,7 @@ test("template: an old install is upgraded — role agents gone, Pi block kind-o
   const pi = piBlockBodies(workflow).join("\n");
   assert.ok(pi.length > 0, "the workflow must still carry Pi blocks");
   assert.ok(!/Agent type[^\n]*trellis-/.test(pi), "the Pi blocks must no longer dispatch trellis-*");
-  assert.ok(/cw-executor/.test(workflow), "the Pi blocks must dispatch kinds instead");
+  assert.match(pi, /available project kind/, "optional Pi delegation still uses configured kinds");
 
   assert.ok(
     lines.some((line) => line.includes("已从旧 Trellis 产物升级到本仓模板")),

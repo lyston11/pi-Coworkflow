@@ -298,8 +298,8 @@ Before integrating: run `task.py preflight <name>` and hold the integration lane
      matches their step 2.1. -->
 
 [workflow-state:in_progress-inline]
-Flow: `trellis-before-dev` -> dispatch the execute kind -> dispatch the audit kind -> `trellis-update-spec` -> commit (Phase 3.4) -> `/trellis:finish-work`.
-Dispatch the execute and audit kinds; acceptance stays in the main session, which reads the child's structured completion and re-runs the checks before Phase 3.
+Flow: `trellis-before-dev` -> implement directly -> check the affected scope -> `trellis-update-spec` -> commit (Phase 3.4) -> `/trellis:finish-work`.
+The main session implements and validates by default. Delegate only when a bounded task or independent advice justifies the handoff cost; no mandatory execute/audit pipeline. Final decisions and acceptance stay in the main session.
 Read context: `prd.md` -> `design.md if present` -> `implement.md if present`, plus relevant spec/research loaded by skills.
 Before integrating: run `task.py preflight <name>` and hold the integration lane with `integration-claim`; one task integrates at a time.
 [/workflow-state:in_progress-inline]
@@ -347,7 +347,7 @@ When a user request matches one of these intents inside an active task, route fi
 [codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
 - Planning or unclear requirements -> `trellis-brainstorm`.
-- Before editing -> `trellis-before-dev`; after editing -> dispatch the audit kind (`cw-auditor`; the names this project actually exposes are whatever `/Coworkflow:status` lists).
+- Before editing -> `trellis-before-dev`; implement and check directly in the main session. An independent review is optional when risk justifies it; use an available project kind if delegating.
 - Repeated debugging -> `trellis-break-loop`; spec updates -> `trellis-update-spec`.
 
 [/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
@@ -429,7 +429,7 @@ Spawn the research sub-agent:
 
 [codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
-Do the research in the main session directly and write findings into `{TASK_DIR}/research/`. `codex-inline` is the explicit mode that keeps work in the main session. When the question is separable and worth a child session, dispatch the research kind instead (`cw-researcher`; the names this project actually exposes are whatever `/Coworkflow:status` lists) and keep the findings file as the deliverable.
+Do the research in the main session directly and write findings into `{TASK_DIR}/research/`. When a concrete question benefits from independent planning advice or separable research enough to justify a child session, optionally delegate it to an available project kind. Ask for evidence and alternatives, not an automatic implementation. The main session owns the final decision. Models and kind names come from project configuration, not this workflow.
 
 [/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
@@ -581,17 +581,14 @@ The platform prelude auto-handles the context load requirement:
 
 [codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
-Dispatch the implementation to the execute kind, then accept the result in the main session:
+Implement directly in the main session by default:
 
-- **Agent type**: `cw-executor` (a Coworkflow kind — the names this project actually exposes are whatever `/Coworkflow:status` lists)
-- **Task description**: Implement the reviewed task artifacts, consulting materials under `{TASK_DIR}/research/`; finish by running project lint and type-check
-- **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then tell the spawned agent it is already the executor sub-agent and must implement directly, not spawn another sub-agent.
-
-The kind's context is injected by the dispatch path, not by this document:
-- `implement.jsonl` entries plus `prd.md`, `design.md` if present, and `implement.md` if present
-- Project guidelines from the `trellis-before-dev` skill
-
-Acceptance stays in the main session: read the child's structured completion, check it against `prd.md` / `design.md` / `implement.md`, and re-run lint and type-check before continuing.
+- Load `trellis-before-dev`; read `prd.md`, `design.md` if present, `implement.md` if present, and relevant spec/research.
+- Work in the task's verified worktree. Implement the approved scope, then run the affected project checks (lint, type-check and tests as applicable).
+- Optional delegation: use an available project kind only for a bounded, independently checkable task or concrete planning advice when its benefit exceeds context and handoff cost. Duration alone is not a reason to delegate or choose a lower-cost model.
+- Keep model and role choices configurable; do not add a fixed planner/executor/reviewer pipeline.
+- If delegating, supply the active task, necessary context, write scope, expected output and budget. Use background execution and preserve admission, isolation and no-recursive-delegation rules.
+- Do not edit a child's occupied paths. Accept its actual deliverable in the correct worktree, and supplement evidence only where missing or invalidated by integration. Otherwise continue directly; parallelism is not a target.
 
 [/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
@@ -615,18 +612,13 @@ The check agent's job:
 
 [codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
-Dispatch the quality check to the audit kind, then accept the verdict in the main session:
+Check the work directly in the main session by default:
 
-- **Agent type**: `cw-auditor` (a Coworkflow kind — the names this project actually exposes are whatever `/Coworkflow:status` lists)
-- **Task description**: Review all code changes against specs and task artifacts; fix any findings directly; ensure lint and type-check pass
-- **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then tell the spawned agent it is already the audit sub-agent and must review/fix directly, not spawn another sub-agent.
-
-The check covers:
-- Spec compliance (the task's `check.jsonl` context and the package spec index)
-- lint / type-check / tests
-- Cross-layer consistency (when changes span layers)
-
-A verdict is evidence, not acceptance: the main session audits the findings, confirms there is no blocking item, and re-reads the checks before Phase 3. If issues are found → fix → re-check, until green.
+- Compare the diff and actual outputs with `prd.md`, `design.md` if present, `implement.md` if present, and relevant project specs.
+- Run the smallest sufficient affected checks; include cross-layer consistency when the change crosses layers. Fix findings and re-check the affected behavior.
+- Optional delegation: request an independent review from an available project kind when risk or a second perspective justifies the cost. A separate reviewer is not required for every change.
+- A child's verdict is evidence, not final acceptance. Inspect its findings and check results; do not repeat unchanged checks merely because they ran in a child. Re-run what integration changed or what lacks evidence.
+- Keep final acceptance, commits and integration in the main session.
 
 [/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 

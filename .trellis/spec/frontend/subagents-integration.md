@@ -8,6 +8,18 @@
 - `core/subagents-client.ts` is the single RPC v1 DTO decoder for ping, activity, cost, admission, and correlated replies. `core/pi-subagents.ts` owns structured completion/result/artifact projections. Consumers use these projections; they do not reinterpret raw messages or private runner files.
 - `core/subagents-workflow.ts` registers `coworkflow.implement-review` **and** `coworkflow.fanout` in one pass and stores only verified task/native mission/run IDs, explicitly returned artifact references, and the two timestamps the overlap measurement needs. Existing `.trellis/.runtime/lanes/` pointers remain readable; new observers do not manufacture identities from prose, filenames, array order, or “only pending” assumptions.
 
+## Default execution policy: single session first
+
+The main session plans, implements, validates and accepts work directly by default, including non-trivial changes. Delegation is optional when a bounded deliverable, independent planning advice, separable research or risk-driven review justifies duplicated context, handoff and integration cost. Neither elapsed time, tool counts nor serial execution triggers a duty to delegate. There is no mandatory planner/implementer/reviewer chain.
+
+Models, prompts and kinds remain configurable; no model identifiers, required roles or automatic routing engine encode this policy. A child may propose options and evidence within an advisory assignment; final decisions remain parent-owned. Long duration alone does not justify a cheaper model.
+
+When delegation is selected, preserve async execution, admission, context boundaries, write scopes, worktree safety and status/stop. Parent writes are outside the queue's `files` enforcement: never overlap a child's occupied paths. In a shared worktree only the parent stages/commits, after the relevant writers stop. Final acceptance inspects real outputs and evidence, adding checks only when missing or invalidated by integration. Native completion wakes the parent; do not poll or manufacture work while waiting.
+
+Policy has two sources that must agree: `modules/agents/assets/` and `templates/trellis/dot-trellis/workflow.md`. Pi injects the parsed phase step (2.1 first), with `in_progress-inline` as fallback; both must allow direct implementation and optional review. Update template sources and render the project copies, not just AGENTS or a fallback string. Other platforms keep their existing dispatch modes.
+
+`scripts/trellis-template.test.ts` exercises rendered parent/child instructions, real `get_context.py --mode phase --platform pi --step 2.1/2.2` output, inline routing/fallback and preserved safety text. These assert guidance delivery, not model quality or token savings.
+
 ## Task validation and native workflow
 
 `/Coworkflow:run [focus]` resolves only the currently prepared Trellis task. Before a pure, I/O-free workflow resolver is called, the host verifies canonical task/main/worktree paths, `task.json`, real Git linked-worktree membership, and the recorded task branch. Main checkout aliases, unrelated repositories, ordinary directories, stale task references and branch mismatch are rejected. Resolver arguments cannot supply arbitrary paths or scripts.
@@ -18,7 +30,7 @@ The task worktree is mandatory even when a workflow script could execute elsewhe
 
 ## Independent children (`coworkflow.fanout`) and the serial-dispatch measurement
 
-Independent work runs as one fanout, not as a loop of awaits. `coworkflow.fanout` is the default way to run N independent children: `args.tasks` is 1–8 `{ kind, task }` objects with no other per-task fields (an optional `focus` carries one shared instruction), validation mirrors `resolveImplementReview` (bounded count, non-empty bounded task, unknown fields rejected, no caller-supplied paths, and `agent` specifically rejected), child keys come from the array position (`task-1`…) so two children may be the same kind doing different work, and every child runs `context: "fresh"`, `worktree: false`, with its own `acceptance` and `outputSchema` so no child's verdict can stand in for another's.
+Once the parent chooses the named workflow for independent delegated work, it runs as one fanout, not as a loop of awaits. `coworkflow.fanout` remains an optional way to run N independent children: `args.tasks` is 1–8 `{ kind, task }` objects with no other per-task fields (an optional `focus` carries one shared instruction), validation mirrors `resolveImplementReview` (bounded count, non-empty bounded task, unknown fields rejected, no caller-supplied paths, and `agent` specifically rejected), child keys come from the array position (`task-1`…) so two children may be the same kind doing different work, and every child runs `context: "fresh"`, `worktree: false`, with its own `acceptance` and `outputSchema` so no child's verdict can stand in for another's.
 
 A task names a **kind**, never an agent: `executor` / `auditor` / `researcher` are the same kinds `/Coworkflow:settings` exposes, resolved through `agentNameFor` in `modules/agent-kinds/defaults.ts` — one mapping, so a fanout child is exactly the agent a direct kind dispatch would run. A name this package does not ship is rejected with the available kinds listed. The resolver stays pure: the host resolves the project's kind policy in memory (`fanoutPolicyFor`, which reads `resolveKinds` plus the owner's accepted registrations) and passes it in, so a task whose kind is disabled, unregistered, or whose policy could not be read **fails as that task** with the `tool_call` gate's own wording (`disabledKindMessage` / `unregisteredKindMessage` — one vocabulary, not two) and is never started, while its siblings still run.
 
@@ -26,7 +38,7 @@ The script starts every child before awaiting any of them (`runs.run` inside one
 
 Both names register in the same function and flow (`registerImplementReviewWorkflow`); one session either has the pair or reports why it has neither, and the returned handle disposes both with the same replace/dispose semantics as before. No second registration path exists, and no workflow path writes a message into the conversation.
 
-Serial dispatch of independent work is a defect this layer *measures*, not one it nags about. Each recorded task↔run link stores `startedAt` (stable across later updates of the same link, which is why `recordedAt` cannot serve) and `settledAt` (written only from an observed structured native completion). `dispatchOverlap` reads one session's links and classifies: crossing intervals are parallel; a complete interval crossing nothing is serial; missing timestamps, still-running runs and backwards clocks are **unresolved** and are never folded into the serial count. `/Coworkflow:status` renders it as one stored line (`派单重叠: 3 次并行、5 次串行（本次会话）`), read at render time, never as a message. `/Coworkflow:lanes` may reuse the same measurement.
+Dispatch overlap is descriptive evidence, not a requirement to parallelize or a score of execution quality. This layer measures observed timing, not whether the parent should have delegated. Each recorded task↔run link stores `startedAt` (stable across later updates of the same link, which is why `recordedAt` cannot serve) and `settledAt` (written only from an observed structured native completion). `dispatchOverlap` reads one session's links and classifies: crossing intervals are parallel; a complete interval crossing nothing is serial; missing timestamps, still-running runs and backwards clocks are **unresolved** and are never folded into the serial count. `/Coworkflow:status` renders it as one stored line (`派单重叠: 3 次并行、5 次串行（本次会话）`), read at render time, never as a message. `/Coworkflow:lanes` may reuse the same measurement.
 
 The conversation-injected reminder this replaces was removed and must not return: a custom message reaches the model as a **user turn**, so it disrupts and rewrites the very work it describes.
 
@@ -112,7 +124,7 @@ This package's project surface speaks kinds only. `trellis-implement` / `trellis
 
 Rendering is the only writer of this surface. Two sources would leave it half one thing and half another with no run reconciling them, so a refresh is another `/Coworkflow:init` (idempotent, user data untouched).
 
-`.trellis/workflow.md` comes from the same template set. Its dispatch guidance selects configured kinds and returns acceptance to the main session. User data beside it (`tasks/`, `spec/`, `workspace/`) is never overwritten by rendering.
+`.trellis/workflow.md` comes from the same template set. Its Pi guidance defaults to direct main-session implementation/checking; optional dispatch selects configured kinds and returns acceptance to the main session. User data beside it (`tasks/`, `spec/`, `workspace/`) is never overwritten by rendering.
 
 ## Scenario: native dispatch and task-context acceptance
 
