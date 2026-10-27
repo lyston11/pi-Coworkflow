@@ -48,6 +48,7 @@ import { decodeNativeCompletions } from "../../core/pi-subagents.ts";
 import { attachSubagents, existingSubagentsBridge } from "../../core/subagents-client.ts";
 import { RUN_BUDGET_MS, checkpointFor } from "../../core/subagents-workflow.ts";
 import { admitOne, agentKindsState, type AdmitFailure, type AdmitResult } from "../agent-kinds/index.ts";
+import { sessionTree } from "../session-worktree/index.ts";
 
 /**
  * Why a unit is waiting.
@@ -734,11 +735,22 @@ async function spawnViaRpc(
     return { ok: false, reason: closed, disposition: "gated" };
   }
 
+  // Where this unit belongs, resolved only when the project asked for session isolation:
+  // the module is a gate, so a project that never enabled it keeps the previous behaviour
+  // (children run where the parent runs) instead of being policed by an upgrade.
+  const tree = runtime.control.moduleEnabled("session-worktree") ? sessionTree(host, runtime) : null;
+  if (tree !== null && "ok" in tree) {
+    bridge.release(launchId);
+    return { ok: false, reason: tree.message, disposition: "gated" };
+  }
+  const placed = tree !== null && !("ok" in tree) ? { cwd: tree.path } : {};
+
   const reply = await bridge.client.spawn(
     {
       agent: request.agent,
       task: request.task,
       context: "fresh",
+      ...placed,
       timeoutMs: budget,
       checkpointBeforeDeadlineMs: checkpointFor(budget),
       ...(request.worktree === true ? { worktree: true } : {}),

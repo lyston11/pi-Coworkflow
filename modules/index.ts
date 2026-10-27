@@ -26,6 +26,7 @@ import { capacityModule } from "./capacity/index.ts";
 import { dispatchModule } from "./dispatch/index.ts";
 import { laneWorktreeModule } from "./lane-worktree/index.ts";
 import { panelModule } from "./panel/index.ts";
+import { sessionWorktreeModule } from "./session-worktree/index.ts";
 import { subagentContextModule } from "./subagent-context/index.ts";
 import { subagentsModule } from "./subagents/index.ts";
 import { trellisModule } from "./trellis/index.ts";
@@ -41,6 +42,7 @@ export const MODULES: WorkflowModule[] = [
   laneWorktreeModule,
   capacityModule,
   dispatchModule,
+  sessionWorktreeModule,
   panelModule,
 ];
 

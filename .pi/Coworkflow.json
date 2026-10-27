@@ -11,12 +11,14 @@
     "agent-kinds": true,
     "lane-worktree": true,
     "capacity": true,
-    "panel": true
+    "panel": true,
+    "session-worktree": true
   },
   "agentKinds": {
     "executor": {
       "enabled": true,
       "maxConcurrent": 5
     }
-  }
+  },
+  "autoEnable": true
 }
