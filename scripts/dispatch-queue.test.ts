@@ -502,3 +502,57 @@ test("tool: activation registers coworkflow_dispatch once and releases its obser
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ── declared write sets: what the queue can enforce, and what it must say out loud ──
+
+const declared = (key: string, files: string[]) => ({ key, kind: "executor", task: `do ${key}`, files });
+
+test("queue: two units declaring one file do not run at the same time", async () => {
+  const owner = fakeOwner({ executor: 4 });
+  const queue = createDispatchQueue(owner.deps, 1);
+
+  const first = await queue.submit({ tasks: [declared("a", ["src/dispatch/index.ts"]), declared("b", ["src/dispatch/index.ts"])] });
+  assert.deepEqual(first.started.map((entry) => entry.key), ["a"]);
+  assert.deepEqual(first.queued.map((entry) => [entry.key, entry.reason]), [["b", "overlap"]]);
+
+  // The completion itself releases it — no timer, no second submission.
+  owner.finish("executor");
+  const second = await queue.settle(owner.runId("a"), "completed");
+  assert.deepEqual(second.started.map((entry) => entry.key), ["b"], "the collision waits, then runs alone");
+});
+
+test("queue: disjoint declarations still run in parallel, and a declared directory covers its children", async () => {
+  const owner = fakeOwner({ executor: 4 });
+  const queue = createDispatchQueue(owner.deps, 1);
+
+  const parallel = await queue.submit({ tasks: [declared("a", ["src/dispatch/index.ts"]), declared("b", ["modules/panel/index.ts"])] });
+  assert.deepEqual(parallel.started.map((entry) => entry.key), ["a", "b"], "different files are not a collision");
+
+  const nestedQueue = createDispatchQueue(fakeOwner({ executor: 4 }).deps, 1);
+  const nested = await nestedQueue.submit({ tasks: [declared("c", ["src/dispatch"]), declared("d", ["src/dispatch/index.ts"])] });
+  assert.deepEqual(nested.started.map((entry) => entry.key), ["c"], "a declared directory covers its files");
+  assert.deepEqual(nested.queued.map((entry) => [entry.key, entry.reason]), [["d", "overlap"]]);
+});
+
+test("queue: a read-only unit declares files: [] and never collides", async () => {
+  const owner = fakeOwner({ executor: 4 });
+  const queue = createDispatchQueue(owner.deps, 1);
+
+  const result = await queue.submit({ tasks: [declared("writer", ["src/a.ts"]), declared("reader", []), declared("reader2", [])] });
+  assert.deepEqual(result.started.map((entry) => entry.key), ["writer", "reader", "reader2"]);
+  assert.equal(result.notice, undefined, "a declared write set — including an empty one — needs no warning");
+});
+
+test("queue: undeclared units stay parallel, and the report says that is the risk it is", async () => {
+  const owner = fakeOwner({ executor: 4 });
+  const queue = createDispatchQueue(owner.deps, 1);
+
+  const result = await queue.submit({ tasks: units("a", "b") });
+  assert.deepEqual(result.started.map((entry) => entry.key), ["a", "b"], "no declaration is not a refusal");
+  assert.match(result.notice ?? "", /a、b 同时在跑且都没有声明 files/);
+  assert.match(renderDispatchResult(result), /静默覆盖/, "the rendered report carries it too");
+
+  // One undeclared unit alone is not a shared-writer situation.
+  const single = await createDispatchQueue(fakeOwner({ executor: 4 }).deps, 1).submit({ tasks: units("solo") });
+  assert.equal(single.notice, undefined);
+});

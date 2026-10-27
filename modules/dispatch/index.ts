@@ -58,7 +58,7 @@ import { sessionTree } from "../session-worktree/index.ts";
  * module switch or session replacement currently forbids automatic starts, and only a
  * state change lifts it — never a timer.
  */
-export type QueueReason = "ceiling" | "dependency" | "gated";
+export type QueueReason = "ceiling" | "dependency" | "gated" | "overlap";
 
 /** One work unit as the caller hands it over. */
 export interface DispatchTaskInput {
@@ -70,6 +70,16 @@ export interface DispatchTaskInput {
   task: string;
   /** Keys that must be `completed` before this unit may start. */
   needs?: string[];
+  /**
+   * The paths this unit intends to write, relative to the working checkout.
+   *
+   * Declared so the queue can keep two units that touch the same file from running at
+   * the same time: children share one working tree, so a collision there is not a Git
+   * conflict anyone can see later — it is one child silently overwriting another. A
+   * unit that declares nothing is unknown, and unknown does not get to run beside its
+   * siblings by accident (see `parallel`).
+   */
+  files?: string[];
 }
 
 export interface DispatchInput {
@@ -80,6 +90,16 @@ export interface DispatchInput {
 
 export interface DispatchResult {
   started: { key: string; runId: string; kind: string }[];
+  /**
+   * What the caller should know about overlap that could not be enforced.
+   *
+   * Set when two or more units are running with no declared write set. They share one
+   * working tree, so a collision there would be a silent overwrite rather than a
+   * conflict; saying it in every such report is the backstop for the case declarations
+   * were forgotten. Enforced overlap (both sides declared) never reaches here — it is
+   * queued instead.
+   */
+  notice?: string;
   queued: { key: string; kind: string; reason: QueueReason }[];
   failed: { key: string; kind: string; reason: string }[];
   /**
@@ -183,6 +203,8 @@ interface Task {
   kind: string;
   task: string;
   needs: string[];
+  /** Declared write set; absent means unknown, which is not "empty". */
+  files?: string[];
   status: TaskStatus;
   /** A queue reason while waiting, a failure reason once failed. */
   reason?: QueueReason | string;
@@ -277,6 +299,24 @@ function staleSubmission(startedBeforeReplacement = 0): Error {
  * fails its dependent there), so a cycle can only be within the batch — plus the
  * self-cycle a single unit can write for itself.
  */
+/**
+ * A path both declared sets cover, or `null` when they are disjoint.
+ *
+ * Compared by path segment, so a declared directory covers everything under it:
+ * `src/dispatch` and `src/dispatch/index.ts` collide, while `src/dispatch` and
+ * `src/dispatch-extra` do not (a prefix comparison would say they collide).
+ */
+export function overlapOf(left: readonly string[], right: readonly string[]): string | null {
+  const covers = (declared: string, other: string): boolean =>
+    declared === other || other.startsWith(`${declared}/`) || declared.startsWith(`${other}/`);
+  for (const mine of left) {
+    for (const theirs of right) {
+      if (covers(mine, theirs)) return mine.length <= theirs.length ? mine : theirs;
+    }
+  }
+  return null;
+}
+
 function findCycle(planned: readonly Task[]): string[] | null {
   const byKey = new Map(planned.map((task) => [task.key, task]));
   const visiting = new Set<string>();
@@ -425,6 +465,23 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
         result.queued.push({ key: task.key, kind: task.kind, reason: "dependency" });
         continue;
       }
+      // Two children share one working tree, so two of them writing one file is a silent
+      // overwrite — Git never reports it, because there is no merge to conflict. A declared
+      // unit therefore waits for any running unit whose declared paths it intersects.
+      //
+      // Only declared-vs-declared is compared, and that is the honest limit: an undeclared
+      // unit's write set is unknown, and guessing a collision for it would block work on a
+      // supposition. What unknown concurrency gets instead is the notice below — stated in
+      // the report every time it happens, so the decision stays with the caller.
+      const clash = task.files === undefined
+        ? undefined
+        : tasks.find((other) => (other.status === "running" || other.status === "unobserved")
+            && other.files !== undefined && overlapOf(task.files!, other.files) !== null);
+      if (clash !== undefined) {
+        task.reason = "overlap";
+        result.queued.push({ key: task.key, kind: task.kind, reason: "overlap" });
+        continue;
+      }
       const admitted = await deps.admit(task.kind);
       // A session replacement during the admission ends this operation here.
       if (currentEpoch !== opEpoch) {
@@ -507,6 +564,10 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
     result.queued = waitingList();
     result.failed = failedList();
     result.unobserved = unobservedList();
+    const unknown = tasks.filter((task) => task.status === "running" && task.files === undefined).map((task) => task.key);
+    if (unknown.length > 1) {
+      Object.assign(result, { notice: `${unknown.join("、")} 同时在跑且都没有声明 files：它们共用一个工作区，写同一个文件会静默覆盖（git 不会报冲突）。下次给每个单元加 files（只读就写 files: []），重叠的会自动排队。` });
+    }
     return result;
   }
 
@@ -539,7 +600,25 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
           if (typeof value === "string" && value.trim() !== "") needs.push(value.trim());
         }
       }
-      planned.push({ key, kind, task, needs: [...new Set(needs)], status: "waiting", ...(input.worktree === true ? { worktree: true } : {}) });
+      // Declared write set. Normalised here so "src/a.ts", "./src/a.ts" and
+      // "src\\a.ts" are one path when the overlap check reads them.
+      const files: string[] = [];
+      // `files: []` is a declaration, not an omission: it says this unit writes nothing,
+      // which is what a reader/auditor kind needs to run beside writers.
+      const declaredFiles = Array.isArray(entry.files);
+      if (declaredFiles) {
+        for (const value of entry.files) {
+          if (typeof value !== "string") continue;
+          const normalised = value.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+          if (normalised !== "") files.push(normalised);
+        }
+      }
+      planned.push({
+        key, kind, task, needs: [...new Set(needs)],
+        ...(declaredFiles ? { files: [...new Set(files)] } : {}),
+        status: "waiting",
+        ...(input.worktree === true ? { worktree: true } : {}),
+      });
     });
     // Refused before anything is queued: a cycle can never be satisfied, and leaving
     // it in the queue would render as "waiting for its prerequisite" forever while
@@ -897,8 +976,7 @@ const PARAMETERS = {
           needs: {
             type: "array",
             description: "必须已 completed 的前置单元 key；前置 failed 时本单元也 failed（reason dependency）。",
-            items: { type: "string", minLength: 1 },
-          },
+            items: { type: "string", minLength: 1 },          },
         },
       },
     },
@@ -911,6 +989,7 @@ const QUEUED_REASON_TEXT: Record<QueueReason, string> = {
   ceiling: "名额已满，完成一个就自动启动它",
   dependency: "前置单元未完成",
   gated: "派单已被关闭或会话已更换，当前不会自动启动",
+  overlap: "与正在运行的单元声明了同一批文件，等它完成（同一工作区里并发写同一文件是静默覆盖，git 不会报冲突）",
 };
 
 /** The model-facing report: what started, what waits, what is unconfirmed, and why anything failed. */
@@ -935,6 +1014,7 @@ export function renderDispatchResult(result: DispatchResult): string {
       "启动未确认的单元可能已经在跑：本扩展不会重发，它们的容量仍算占用；先用 status 查证，再决定是否重新提交。",
     );
   }
+  if (result.notice) lines.push(result.notice);
   if (result.queued.length > 0) {
     lines.push("排队中的单元由 pi-subagents 的完成事件驱动，没有轮询；本会话的队列不写盘，会话换代后作废并报告。");
   }
@@ -984,7 +1064,7 @@ export const dispatchModule: WorkflowModule = {
         name: TOOL_NAME,
         label: "排队派单",
         description:
-          "一次交全部工作单元：每个单元按项目 kind 表的并发上限排队，完成一个自动启动下一个；needs 声明前置单元（全部 completed 才启动，前置 failed 则失败）。启动走上游公开 RPC spawn，完成由上游事件驱动，不轮询、不落盘。",
+          "一次交全部工作单元：每个单元按项目 kind 表的并发上限排队，完成一个自动启动下一个；needs 声明前置单元（全部 completed 才启动，前置 failed 则失败）；files 声明本单元会写哪些路径（只读单元写 files: []），两个声明重叠的单元会排队等前一个完成——它们共用一个工作区，并发写同一文件是静默覆盖，git 不会报冲突；未声明的单元仍并行，但报告会点出这一点。启动走上游公开 RPC spawn，完成由上游事件驱动，不轮询、不落盘。",
         parameters: PARAMETERS as unknown as Record<string, unknown>,
         execute: async (_toolCallId: unknown, params: any) => {
           if (!runtime.enabled || !runtime.control.moduleEnabled("dispatch")) {

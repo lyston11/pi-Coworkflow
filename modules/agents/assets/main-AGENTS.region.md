@@ -19,6 +19,7 @@
 多个 agent 共用一个工作区曾导致 `reset` 抹掉 main 上已提交的改动。并行工作必须遵守：
 
 - 一个任务一个分支 + 一个 linked worktree。`task.py start` 的 `after_start` 钩子（`.trellis/scripts/hooks/auto_worktree.py`）自动创建 `feat/<任务目录名>` 分支、在仓库旁 `../{{worktreePrefix}}<任务目录名>` 建 worktree，并把两者写入 task.json 的 `branch` / `worktree_path`。钩子成功时无输出，以 task.json 为准；写代码前必须先 `cd` 进该 worktree，不得在主检出里改业务代码。
+- **同会话并发写同一批文件：声明 `files` 才会被拦住。** 同一会话的所有子 agent 共用一个 worktree，所以两个单元写同一个文件时 git **不会报冲突**——那是静默覆盖，比冲突更糟。因此 `coworkflow_dispatch` 支持每个单元声明 `files`（它要写的路径，只读单元写 `files: []`）：两个声明重叠的单元不会同时跑，后者排队（reason `overlap`），前一个完成自动放行；目录声明覆盖其下所有文件（`src/dispatch` 与 `src/dispatch/index.ts` 冲突，与 `src/dispatch-extra` 不冲突）。未声明的单元仍并行，但每次报告都会点出「这些单元同时在跑且都没声明 files」，把风险说在明面上而不是假装管住——能强制的地方强制，不知道的地方明说。
 - **会话本身也有隔离 worktree（`session-worktree`，默认开）。** 每个 pi 会话解析出一个 worktree，所有子 agent 在其中执行，不再落在共享检出里：优先级是「你已 `cd` 进去的 linked worktree」→「活跃任务 task.json 的 worktree」→「会话 worktree `../wt-cw-<token>` / 分支 `cw/<token>`（从 `origin/HEAD` 指向的基线切出）」。分配失败（非 git 仓库、`worktree add` 失败、同名分支非本会话）时**派单被拒并写明原因**，不静默退回共享目录。新 worktree 会软链 `.trellis/{tasks,scripts,workspace,config.yaml,workflow.md}` 与 `.pi`，子 agent 因此能读 PRD、spec 与 kind 定义。父会话仍负责规划/审计，写业务代码交给子 agent。
 - 会话 worktree 的收尾是显式的：`/Coworkflow:merge` 先看 `git status` 与 `git log <基线>..HEAD`，有未提交改动或冲突就停下（不自动解冲突、不 push、不删 worktree）；合并成功后才由人确认清理。多个会话各拿各的分支，合并顺序由人定。
 - 在自己的分支上只允许 commit；禁止 `reset --hard`、`rebase`、`push -f`、切换到非本任务的分支。需要基线分支的新代码时 `git fetch` 后把上游基线 merge 进自己分支（分支名按仓库而定，常见是 `origin/main`；以 `git symbolic-ref refs/remotes/origin/HEAD` 的结果为准）。
