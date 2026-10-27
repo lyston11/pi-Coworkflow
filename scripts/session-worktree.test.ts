@@ -324,3 +324,58 @@ test("status: an unresolved session says nothing, a failure says why, and a tree
     resetSessionTree(host);
   } finally { h.close(); }
 });
+
+test("injection: one placement for every launch shape, and none for management calls", () => {
+  const h = fixture();
+  try {
+    const handlers: Record<string, (event: any) => any> = {};
+    const host: any = { on: (name: string, handler: any) => { handlers[name] = handler; return () => {}; }, registerCommand() {} };
+    const runtime = runtimeOf(h.root, "session-a");
+    sessionWorktreeModule.activate?.(host, runtime);
+    const call = handlers.tool_call;
+    assert.ok(call, "the module registers a tool_call handler");
+
+    const direct: any = { toolName: "subagent", input: { agent: "worker", task: "x" } };
+    assert.equal(call(direct), undefined);
+    assert.match(direct.input.cwd as string, /wt-cw-/, "a direct dispatch is placed");
+
+    const workflow: any = { toolName: "subagent", input: { workflow: "coworkflow.fanout", args: { tasks: [{ agent: "worker" }] } } };
+    call(workflow);
+    assert.equal((workflow.input as any).cwd, direct.input.cwd, "a named workflow lands in the same tree");
+
+    const managed: any = { toolName: "subagent", input: { action: "status", id: "r1" } };
+    call(managed);
+    assert.equal("cwd" in managed.input, false, "a management call is not rewritten");
+
+    const explicit: any = { toolName: "subagent", input: { agent: "worker", task: "x", cwd: "/somewhere/else" } };
+    call(explicit);
+    assert.equal(explicit.input.cwd, "/somewhere/else", "an explicit cwd is the caller's decision");
+
+    const other: any = { toolName: "read", input: { path: "x" } };
+    call(other);
+    assert.equal("cwd" in other.input, false, "other tools are untouched");
+    resetSessionTree(host);
+  } finally { h.close(); }
+});
+
+test("session end: an unused tree is removed, a tree with commits is kept", () => {
+  const h = fixture();
+  try {
+    const host = hostOf();
+    const runtime = runtimeOf(h.root, "session-a");
+    const tree = sessionTree(host, runtime);
+    assert.ok(!("ok" in tree));
+    sessionWorktreeModule.onSessionEnd?.(host, runtime);
+    assert.equal(existsSync(tree.path), false, "no commits, so nothing to keep");
+    assert.throws(() => h.git(["rev-parse", "--verify", "--quiet", `refs/heads/${tree.branch}`]), "and its branch is deleted");
+
+    const second = sessionTree(host, runtimeOf(h.root, "session-b"));
+    assert.ok(!("ok" in second));
+    writeFileSync(join(second.path, "work.txt"), "done\n");
+    execFileSync("git", ["-C", second.path, "add", "work.txt"], { env: ENV });
+    execFileSync("git", ["-C", second.path, "commit", "-m", "work"], { env: ENV });
+    sessionWorktreeModule.onSessionEnd?.(host, runtimeOf(h.root, "session-b"));
+    assert.ok(existsSync(second.path), "unmerged work is never deleted by a session ending");
+    assert.equal(h.git(["rev-parse", "--verify", "--quiet", `refs/heads/${second.branch}`]), h.git(["rev-parse", second.branch]));
+  } finally { h.close(); }
+});

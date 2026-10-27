@@ -433,10 +433,33 @@ export const sessionWorktreeModule: WorkflowModule = {
     return [`  - session-worktree: ${describe(tree)} · ${health}${problem}`];
   },
 
-  onSessionEnd(host: PiRuntimeHost): void {
-    HOSTS.delete(host);
+  onSessionEnd(host: PiRuntimeHost, runtime: RuntimeContext): void {
+    cleanupOnSessionEnd(host, runtime);
   },
 };
+
+/**
+ * Remove the tree this session allocated, when doing so cannot lose anything.
+ *
+ * Three conditions, all read from git rather than remembered: it is *our* allocation
+ * (not the user's checkout, not a task's), the tree is clean, and the branch has no
+ * commit the base does not already have. `branch -d` (never `-D`) is the second lock:
+ * it refuses an unmerged branch even if the count above were wrong. A tree that fails
+ * any condition is left exactly where it is — an unmerged branch is somebody's work,
+ * and a session ending is not permission to delete it.
+ */
+function cleanupOnSessionEnd(host: PiRuntimeHost, runtime: RuntimeContext): void {
+  const state = HOSTS.get(host);
+  HOSTS.delete(host);
+  const tree = state?.tree;
+  if (tree === null || tree === undefined || "ok" in tree) return;
+  if (tree.source !== "session") return;
+  const inspected = inspectTree(tree);
+  if ("ok" in inspected || inspected.dirty || inspected.ahead > 0) return;
+  const main = mainCheckout(repoRoot(tree.path));
+  const removed = git(main, ["worktree", "remove", tree.path]);
+  if (removed.ok) git(main, ["branch", "-d", tree.branch]);
+}
 
 /**
  * Merge the session branch back, or say precisely why not.
