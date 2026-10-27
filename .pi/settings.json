@@ -7,8 +7,8 @@
     "./prompts"
   ],
   "subagents": {
-    "defaultModel": "clinepass/cline-pass/deepseek-v4.1-flash-1017",
-    "defaultProvider": "clinepass",
+    "defaultModel": "deepseek-v4.1-flash",
+    "defaultProvider": "buddy2api",
     "projectRootResolution": "git-root",
     "defaultThinking": "high"
   },
