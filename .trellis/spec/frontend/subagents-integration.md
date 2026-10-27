@@ -202,6 +202,8 @@ Two properties are load-bearing:
 
 A fresh worktree symlinks `.trellis/{tasks,scripts,workspace,config.yaml,workflow.md}` and `.pi` from the main checkout — the same set and the same reason as `auto_worktree.py`: a linked worktree holds committed files only, and a child that cannot read its PRD, the spec, or the kind definitions is a child working blind. Symlinked, never copied, so there is one record rather than two histories.
 
+One limit of that symlinking is load-bearing and must not be papered over: it only fills paths the checkout does **not** already have. A project that tracks `.pi/` or `.trellis/` gets the committed copy instead, because replacing a tracked path with a symlink makes the worktree unmergeable — `git merge` refuses with `'.pi/settings.json' is beyond a symbolic link`, and `skip-worktree` does not rescue it (verified in a scratch repository, all three variants). The consequence is that the records a child reads by relative path may be the base snapshot while the parent's are live, which is why the subagent model is passed explicitly rather than discovered from the child's directory (next section).
+
 `/Coworkflow:merge` is the only path from a session branch back to the base, and it is deliberately conservative: a dirty tree is refused, zero commits ahead reports nothing to do, the merge is `--no-ff` on the base branch that is actually checked out (a detached HEAD or a different branch is refused rather than switched), a conflict stops the command with the conflicted paths and the `merge --abort` way out, and nothing is pushed or deleted. Session end never removes a worktree whose work is unmerged or uncommitted.
 
 The module declares no `newSwitchDefault`, which means on: unlike `capacity`, which refuses work a project asked for, this one *places* work the project already asks for into the checkout its own rules say it belongs in. `scripts/session-worktree.test.ts` pins the ladder, the dirty-checkout case, idempotent reuse, both refusals, the manifest, `inspectTree`, the merge preconditions and the status line.
@@ -214,3 +216,18 @@ Children of one session share one working tree, so two of them writing the same 
 - **Undeclared units are reported, not guessed at.** An unknown write set stays parallel — refusing or serializing every batch would trade a working feature for a supposition — and instead the result carries `notice`, naming the units that are running without a declaration and why that is a risk. `renderDispatchResult` prints it. Two or more such units is the trigger; one alone is not a shared-writer situation.
 
 The honest limit is the point: enforcement where the queue has knowledge, a stated fact where it does not. `scripts/dispatch-queue.test.ts` pins the overlap queue-and-release, disjoint parallelism, directory coverage, the read-only declaration, and the notice (including that it does not fire for declared units).
+
+`files` is enforced by the queue, so the tool schema that reaches the model has to carry the field — a queue-only field is a check that never runs. `scripts/dispatch-queue.test.ts` asserts both `needs` and `files` are in the registered parameters, because the overlap tests drive `createDispatchQueue` directly and would otherwise keep passing while the production entry point could not declare anything.
+
+## The child's model is resolved by the parent, not by the child
+
+`subagents.defaultModel` / `defaultProvider` live in `.pi/settings.json`, and the owner resolves them from the **child's** working directory. That is not the directory `/Comodels` writes to: the panel writes the main checkout, while children run in a session worktree cut from a commit, so a project setting that was never committed is not in it. The result was silent — children ran on a different model than the panel reported, and nothing said so.
+
+The repair puts the inherited default on the same footing the per-kind pages already had (a kind's model travels inside the registration the parent owns): `childModelFor()` in `modules/agent-kinds/index.ts` reads the declaration through `readDeclaredSubagentModel` from the parent's config root, checks it against the host's live registry, and the launch paths write the result in:
+
+- the `tool_call` gate writes `model` for **every** dispatch, kind or plain agent, and per entry for a batch (`args.tasks`), because `reviewer` and `trellis-check` read the same file;
+- `coworkflow_dispatch` resolves it in the tool `execute` and carries it on `DispatchInput.model` → `LaunchRequest.model` → the RPC `spawn`, since an RPC spawn never passes through `tool_call`.
+
+An explicit `model` in the call always wins. A declaration that cannot be resolved (malformed, absent from the registry, provider without credentials) **refuses the dispatch** with the reason instead of launching on a model nobody chose — the silent fallback is the failure being removed, so it cannot be the fallback. A host that cannot enumerate models is not evidence that a model is missing, so it passes through.
+
+Deliberately model-only: the owner also accepts a `:level` suffix, and that suffix wins over an agent definition's own `thinking`, so attaching `subagents.defaultThinking` here would silently override a kind that pinned a level. `scripts/agent-kind-models.test.ts` pins the resolution cases, the refusals, the three launch shapes, and that an explicit model survives.

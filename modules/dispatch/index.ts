@@ -47,7 +47,7 @@ import { readConfig } from "../../core/config.ts";
 import { decodeNativeCompletions } from "../../core/pi-subagents.ts";
 import { attachSubagents, existingSubagentsBridge } from "../../core/subagents-client.ts";
 import { RUN_BUDGET_MS, checkpointFor } from "../../core/subagents-workflow.ts";
-import { admitOne, agentKindsState, type AdmitFailure, type AdmitResult } from "../agent-kinds/index.ts";
+import { admitOne, agentKindsState, childModelFor, type AdmitFailure, type AdmitResult } from "../agent-kinds/index.ts";
 import { sessionTree } from "../session-worktree/index.ts";
 
 /**
@@ -86,6 +86,17 @@ export interface DispatchInput {
   tasks: readonly DispatchTaskInput[];
   /** Isolate every launched child in a managed worktree. */
   worktree?: boolean;
+  /**
+   * The child model this batch launches with, already resolved from the project's own
+   * settings.
+   *
+   * Resolved by the caller, because only the tool call has the host's registry: this
+   * channel starts children through the owner's RPC, which never passes through the
+   * `tool_call` hook that fills the model in for a direct dispatch. The child's cwd is a
+   * worktree cut from a commit, so it cannot see an uncommitted `.pi/settings.json` and
+   * would silently run on a different model than `/Comodels` showed.
+   */
+  model?: string;
 }
 
 export interface DispatchResult {
@@ -175,6 +186,8 @@ export interface LaunchRequest {
   agent: string;
   task: string;
   worktree?: boolean;
+  /** The project's subagent model, resolved by the caller; absent means "let the owner decide". */
+  model?: string;
 }
 
 /** The two side effects the queue needs, injected so the queue itself stays pure state. */
@@ -210,6 +223,8 @@ interface Task {
   reason?: QueueReason | string;
   runId?: string;
   worktree?: boolean;
+  /** The project's subagent model this unit launches with; absent means "let the owner decide". */
+  model?: string;
 }
 
 /** What a session replacement threw away, so the next report can say it happened. */
@@ -513,6 +528,7 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
         agent: admitted.policy.agent,
         task: task.task,
         ...(task.worktree === true ? { worktree: true } : {}),
+        ...(task.model === undefined ? {} : { model: task.model }),
       });
       // The launch itself awaits public reads: a replacement during it stops the
       // operation before it can record anything into the new epoch's queue.
@@ -618,6 +634,7 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
         ...(declaredFiles ? { files: [...new Set(files)] } : {}),
         status: "waiting",
         ...(input.worktree === true ? { worktree: true } : {}),
+        ...(typeof input.model === "string" && input.model.trim() !== "" ? { model: input.model.trim() } : {}),
       });
     });
     // Refused before anything is queued: a cycle can never be satisfied, and leaving
@@ -830,6 +847,9 @@ async function spawnViaRpc(
       task: request.task,
       context: "fresh",
       ...placed,
+      // Resolved by the caller: an RPC spawn never passes through the `tool_call` hook,
+      // and the child's cwd (a session worktree) does not carry the uncommitted setting.
+      ...(request.model === undefined ? {} : { model: request.model }),
       timeoutMs: budget,
       checkpointBeforeDeadlineMs: checkpointFor(budget),
       ...(request.worktree === true ? { worktree: true } : {}),
@@ -976,7 +996,13 @@ const PARAMETERS = {
           needs: {
             type: "array",
             description: "必须已 completed 的前置单元 key；前置 failed 时本单元也 failed（reason dependency）。",
-            items: { type: "string", minLength: 1 },          },
+            items: { type: "string", minLength: 1 },
+          },
+          files: {
+            type: "array",
+            description: "本单元会写的路径（仓库相对路径，目录覆盖其下全部文件）；只读单元写 []。两个声明重叠的单元不会同时跑，未声明的仍并行但报告会点出风险。",
+            items: { type: "string", minLength: 1 },
+          },
         },
       },
     },
@@ -1066,7 +1092,7 @@ export const dispatchModule: WorkflowModule = {
         description:
           "一次交全部工作单元：每个单元按项目 kind 表的并发上限排队，完成一个自动启动下一个；needs 声明前置单元（全部 completed 才启动，前置 failed 则失败）；files 声明本单元会写哪些路径（只读单元写 files: []），两个声明重叠的单元会排队等前一个完成——它们共用一个工作区，并发写同一文件是静默覆盖，git 不会报冲突；未声明的单元仍并行，但报告会点出这一点。启动走上游公开 RPC spawn，完成由上游事件驱动，不轮询、不落盘。",
         parameters: PARAMETERS as unknown as Record<string, unknown>,
-        execute: async (_toolCallId: unknown, params: any) => {
+        execute: async (_toolCallId: unknown, params: any, _signal?: unknown, _onUpdate?: unknown, ctx?: any) => {
           if (!runtime.enabled || !runtime.control.moduleEnabled("dispatch")) {
             return text("本会话没有启用 dispatch 模块：先用 /Coworkflow:start 或 .pi/Coworkflow.json 打开它。", true);
           }
@@ -1075,9 +1101,15 @@ export const dispatchModule: WorkflowModule = {
           }
           const queue = queueFor(host, runtime);
           try {
+            // The model is resolved here too: an RPC spawn bypasses the `tool_call` hook
+            // that fills it in for a direct dispatch, and the child's cwd is a worktree cut
+            // from a commit, so it cannot see an uncommitted `.pi/settings.json`.
+            const decided = childModelFor(runtime, ctx?.modelRegistry);
+            if (decided !== null && "problem" in decided) return text(decided.problem, true);
             const result = await queue.submit({
               tasks: (params?.tasks ?? []) as DispatchTaskInput[],
               ...(params?.worktree === true ? { worktree: true } : {}),
+              ...(decided === null ? {} : { model: decided.model }),
             });
             return {
               content: [{ type: "text" as const, text: renderDispatchResult(result) }],

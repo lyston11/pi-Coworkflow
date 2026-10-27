@@ -495,6 +495,9 @@ test("tool: activation registers coworkflow_dispatch once and releases its obser
     dispatchModule.activate!(host, runtime);
     assert.deepEqual(tools.map((tool) => tool.name), ["coworkflow_dispatch"], "one registration per session");
     assert.ok(JSON.stringify(tools[0]?.parameters).includes('"needs"'), "needs is part of the tool schema");
+    // The queue enforces `files`, so the one entry point that can reach it must accept it:
+    // a schema without the field made the whole overlap check unreachable from the tool.
+    assert.ok(JSON.stringify(tools[0]?.parameters).includes('"files"'), "files is part of the tool schema");
     dispatchModule.onSessionEnd!(host, runtime);
     assert.deepEqual(listeners, [], "nothing is left observing the next session");
     assert.ok((dispatchModule.runtimeStatus!(host) ?? []).length > 0, "status still answers after a session end");

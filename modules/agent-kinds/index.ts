@@ -66,6 +66,7 @@ import { isAbsolute, resolve as resolvePath } from "node:path";
 
 import type { PiRuntimeHost, RuntimeContext, Unsubscribe, WorkflowModule } from "../../core/module.ts";
 import { readConfig, type ResolvedAgentKind, type WorkflowConfig } from "../../core/config.ts";
+import { readDeclaredSubagentModel } from "../../core/model-report.ts";
 import { attachSubagents, existingSubagentsBridge } from "../../core/subagents-client.ts";
 import {
   BUILTIN_KINDS,
@@ -320,6 +321,81 @@ export function applyDispatchDefaults(
     filled.push("checkpointBeforeDeadlineMs");
   }
   return filled;
+}
+
+/**
+ * The model reference a child should launch with, or `null` for "let the owner decide".
+ *
+ * The subagent default model lives in `.pi/settings.json`, and the owner resolves it
+ * from the **child's** working directory. That is not the directory the panel writes to:
+ * a session worktree is cut from a commit, so a project setting that was never committed
+ * is not in it, and the child then runs on a different model than the one `/Comodels`
+ * showed. The kind pages never had this problem because their model travels inside the
+ * registration the parent owns; this gives the inherited default the same treatment —
+ * resolved here, from the parent's config root and its live registry, and passed to the
+ * child explicitly.
+ *
+ * `null` means the project declared nothing, so the owner's own precedence (which ends at
+ * the parent's model) stays in charge. A declared model the registry does not hold is
+ * refused rather than guessed: launching on a model the project did not choose is the
+ * silent fallback this exists to end, and the caller already reports the refusal.
+ */
+export function childModelFor(
+  runtime: RuntimeContext,
+  registry: ModelRegistryLike | undefined,
+): { model: string } | { problem: string } | null {
+  const root = runtime.configRoots.root(runtime.cwd);
+  const declared = readDeclaredSubagentModel(root);
+  if (declared === null) return null;
+  const who = declared.raw;
+  if (declared.provider === undefined || declared.id === undefined) {
+    return { problem: `本项目声明的子 agent 模型 \`${who}\` 无法解析（${declared.malformed ?? "缺少 provider 或模型 id"}）：不派单，避免子 agent 落到一个没人选过的模型上。` };
+  }
+  const reference = `${declared.provider}/${declared.id}`;
+  const available = availableModelsOf(registry);
+  if (available !== undefined) {
+    const exact = available.find((entry) => entry.provider === declared.provider && entry.id === declared.id);
+    if (exact === undefined) {
+      return { problem: `本项目声明的子 agent 模型 ${reference} 不在当前模型注册表中：不派单（改 /Comodels 的「子 agent」页，或改回继承）。` };
+    }
+    if (exact.authenticated === false) {
+      return { problem: `本项目声明的子 agent 模型 ${reference} 的 provider 没有可用凭据：不派单，否则子 agent 会在调用时失败，看起来像模型不存在。` };
+    }
+  }
+  // Model only, deliberately. The owner also documents a `:level` suffix, and it wins over
+  // an agent definition's own `thinking` — so attaching the project's default level here
+  // would silently override a kind that pinned one. `subagents.defaultThinking` keeps
+  // following the owner's own precedence instead.
+  return { model: reference };
+}
+
+/** The host's model registry, as much of it as this module asks. */
+export interface ModelRegistryLike {
+  getAvailable?(): unknown[];
+  hasConfiguredAuth?(model: unknown): boolean;
+}
+
+/**
+ * The registry's models, or `undefined` when the host cannot enumerate them.
+ *
+ * "Cannot enumerate" is not "nothing is available": a host without a registry must not
+ * turn every declared model into a refusal.
+ */
+function availableModelsOf(
+  registry: ModelRegistryLike | undefined,
+): { provider: string; id: string; authenticated?: boolean }[] | undefined {
+  if (typeof registry?.getAvailable !== "function") return undefined;
+  const models = registry.getAvailable();
+  if (!Array.isArray(models)) return undefined;
+  return models.flatMap((model) => {
+    const entry = model as { provider?: unknown; id?: unknown };
+    const provider = String(entry?.provider ?? "");
+    const id = String(entry?.id ?? "");
+    if (provider === "" || id === "") return [];
+    const authenticated =
+      typeof registry.hasConfiguredAuth === "function" ? Boolean(registry.hasConfiguredAuth(model)) : undefined;
+    return [{ provider, id, ...(authenticated === undefined ? {} : { authenticated }) }];
+  });
 }
 
 /**
@@ -978,6 +1054,7 @@ async function gate(
   state: State,
   runtime: RuntimeContext,
   event: { toolName?: unknown; input?: unknown },
+  ctx?: unknown,
 ): Promise<Refusal | undefined> {
   const on = (): boolean => !runtime.isChild && runtime.enabled && runtime.control.moduleEnabled("agent-kinds");
   if (event?.toolName !== "subagent" || !on()) return;
@@ -995,6 +1072,13 @@ async function gate(
     (script) => readScriptForGate(script, requestCwd),
   );
   if (ungoverned !== null) return ungovernedLaunchRefusal(ungoverned);
+
+  // Every launch gets the project's model, kind or not: the child's own directory is a
+  // worktree cut from a commit, so an uncommitted `.pi/settings.json` is not in it and the
+  // owner would fall back to a different model without saying so. Applied before the kind
+  // lookups below, because a plain agent (`reviewer`, `trellis-check`) reads the same file.
+  const modelRefusal = applyChildModel(event.input, runtime, ctx);
+  if (modelRefusal !== undefined) return modelRefusal;
 
   const fanout = decodeFanoutCall(event.input);
   const decoded = decodeKindDispatch(event.input);
@@ -1042,6 +1126,46 @@ async function gate(
   // Admitted: fill what the caller should not have to think about, and never let it block the
   // main session. Both rewrites are project policy, applied in one place.
   countDefaults(state, applyDispatchDefaults(event.input, admitted.config?.subagentRunBudgetMs));
+  return;
+}
+
+/**
+ * Write the project's subagent model into a dispatch, so the child does not have to find it.
+ *
+ * The owner resolves `subagents.defaultModel` from the **child's** working directory, and a
+ * session worktree is a checkout of committed files: a project setting that was never
+ * committed is not in it, so the child silently ran on a different model than `/Comodels`
+ * showed. The kind pages never had this problem — their model rides inside the registration
+ * the parent owns — and this puts the inherited default on the same footing.
+ *
+ * An explicit `model` in the call always wins: the caller said something this function does
+ * not know. A declared model that cannot be resolved refuses the dispatch instead of
+ * launching on a model nobody chose; that refusal is the same shape as every other gate's.
+ */
+function applyChildModel(
+  input: unknown,
+  runtime: RuntimeContext,
+  ctx: unknown,
+): Refusal | undefined {
+  const decided = childModelFor(runtime, (ctx as { modelRegistry?: ModelRegistryLike } | undefined)?.modelRegistry);
+  if (decided === null) return;
+  if ("problem" in decided) return { block: true, reason: decided.problem };
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return;
+  const call = input as Record<string, unknown>;
+  if (typeof call.model === "string" && call.model.trim() !== "") return;
+  const tasks = (call.args as Record<string, unknown> | undefined)?.tasks;
+  if (Array.isArray(tasks)) {
+    // A batch: each entry is its own launch, so each one needs the model. An entry that
+    // named its own keeps it.
+    for (const entry of tasks) {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const task = entry as Record<string, unknown>;
+      if (typeof task.model === "string" && task.model.trim() !== "") continue;
+      task.model = decided.model;
+    }
+    return;
+  }
+  call.model = decided.model;
   return;
 }
 
@@ -1183,7 +1307,10 @@ export const agentKindsModule: WorkflowModule = {
   activate(host: PiRuntimeHost, runtime: RuntimeContext): void {
     const state = stateFor(host);
     if (host.on && !state.listeners.has("tool_call")) {
-      state.listeners.set("tool_call", host.on("tool_call", (event: any) => gate(host, state, runtime, event)));
+      state.listeners.set(
+        "tool_call",
+        host.on("tool_call", (event: any, ctx: any) => gate(host, state, runtime, event, ctx)),
+      );
     }
     // The DIY port, registered once per host: the command writes through the same control
     // surface, and this is the programmatic door onto it.

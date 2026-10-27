@@ -32,7 +32,7 @@ import { test } from "node:test";
 
 import { createConfigRootResolver, isKindModel, isThinkingLevel, readConfig } from "../core/config.ts";
 import { exportEntry } from "../core/subagents-workflow.ts";
-import { agentKindsModule, kindRegistrationPlan, syncAgentKinds } from "../modules/agent-kinds/index.ts";
+import { agentKindsModule, childModelFor, kindRegistrationPlan, syncAgentKinds } from "../modules/agent-kinds/index.ts";
 import {
   createKindRegistry,
   disposeKindRegistrations,
@@ -457,6 +457,143 @@ test("control: an unusable model is refused with a message, and the config is un
     registryView?.clearRuntimeAgentsForPi(pi);
     listener();
     loaded.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── the project's subagent model travels with the dispatch ─────────────
+
+/**
+ * The model the child runs on must be the one `/Comodels` showed, even when the
+ * child's working directory cannot see it.
+ *
+ * `subagents.defaultModel` lives in `.pi/settings.json` and the owner resolves it from
+ * the **child's** cwd. A session worktree is a checkout of committed files, so an
+ * uncommitted project setting is simply not in it — the child silently ran on a
+ * different model while the panel kept reporting the declared one. These assertions
+ * pin the repair: the parent resolves it once, from its own config root and its live
+ * registry, and writes it into the dispatch.
+ */
+function modelRuntime(root: string): Parameters<typeof syncAgentKinds>[1] {
+  return {
+    isChild: false,
+    enabled: true,
+    cwd: root,
+    sessionId: "session-model-travel",
+    parentSessionId: null,
+    sessionEpoch: 1,
+    loadState: "auto",
+    configRoots: createConfigRootResolver({ runGit: () => ({ kind: "no-repo" }) }),
+    refresh() {},
+    control: { moduleEnabled: () => true, subagentConcurrency: () => null },
+  } as unknown as Parameters<typeof syncAgentKinds>[1];
+}
+
+const registryOf = (models: [string, string][], authenticated = true) => ({
+  getAvailable: () => models.map(([provider, id]) => ({ provider, id })),
+  hasConfiguredAuth: () => authenticated,
+});
+
+test("child model: resolved from the parent's settings, and a declared model the registry lacks is refused", () => {
+  const root = mkdtempSync(join(tmpdir(), "coworkflow-child-model-"));
+  const write = (block: Record<string, unknown> | null): void => {
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    writeFileSync(
+      join(root, ".pi", "settings.json"),
+      JSON.stringify(block === null ? {} : { subagents: block }, null, 2),
+    );
+  };
+  try {
+    const runtime = modelRuntime(root);
+    const registry = registryOf([["p", "m"]]);
+
+    // Nothing declared: the owner's own precedence stays in charge, and this adds nothing.
+    write(null);
+    assert.equal(childModelFor(runtime, registry), null);
+
+    // The two spellings a project may use both resolve to the same reference.
+    write({ defaultModel: "m", defaultProvider: "p" });
+    assert.deepEqual(childModelFor(runtime, registry), { model: "p/m" });
+    write({ defaultModel: "p/m" });
+    assert.deepEqual(childModelFor(runtime, registry), { model: "p/m" });
+
+    // A host that cannot enumerate models cannot call one missing either.
+    assert.deepEqual(childModelFor(runtime, {}), { model: "p/m" });
+
+    // A declared model nobody has is a refusal, not a silent fallback to the parent's.
+    write({ defaultModel: "p/gone" });
+    const missing = childModelFor(runtime, registry);
+    assert.ok(missing !== null && "problem" in missing);
+    assert.match(missing.problem, /不在当前模型注册表中/);
+
+    // Present but unusable is its own answer: the child would fail on the first call.
+    write({ defaultModel: "p/m" });
+    const unauthenticated = childModelFor(runtime, registryOf([["p", "m"]], false));
+    assert.ok(unauthenticated !== null && "problem" in unauthenticated);
+    assert.match(unauthenticated.problem, /没有可用凭据/);
+
+    // A bare id with no provider cannot be resolved at all.
+    write({ defaultModel: "bare" });
+    const bare = childModelFor(runtime, registry);
+    assert.ok(bare !== null && "problem" in bare);
+    assert.match(bare.problem, /无法解析/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("child model: the dispatch gate writes it into every launch shape and leaves an explicit choice alone", async () => {
+  const root = mkdtempSync(join(tmpdir(), "coworkflow-child-model-gate-"));
+  try {
+    writeKinds(root, undefined);
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    writeFileSync(join(root, ".pi", "settings.json"), JSON.stringify({ subagents: { defaultModel: "p/m" } }));
+    const runtime = modelRuntime(root);
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+    const host = {
+      on: (name: string, fn: (event: unknown, ctx: unknown) => Promise<unknown>) => {
+        handlers.set(name, fn);
+        return () => {};
+      },
+      events: { on: () => () => {}, emit() {} },
+      registerCommand() {},
+      registerTool() {},
+      getActiveTools: () => [],
+    };
+    agentKindsModule.activate?.(host as never, runtime);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const gate = handlers.get("tool_call");
+    if (gate === undefined) throw new Error("the tool_call gate is not registered");
+    const ctx = { modelRegistry: registryOf([["p", "m"]]) };
+    const call = async (input: Record<string, unknown>) =>
+      await gate({ toolName: "subagent", input }, ctx);
+
+    // A plain agent gets it too: `reviewer` reads the same settings file.
+    const plain: Record<string, unknown> = { agent: "reviewer", task: "x" };
+    assert.equal(await call(plain), undefined);
+    assert.equal(plain.model, "p/m");
+
+    // An explicit model is the caller's decision and survives untouched.
+    const explicit: Record<string, unknown> = { agent: "reviewer", task: "x", model: "own/m" };
+    await call(explicit);
+    assert.equal(explicit.model, "own/m");
+
+    // A batch: every entry that did not name a model gets it, per entry.
+    const batch: Record<string, unknown> = {
+      workflow: "coworkflow.fanout",
+      args: { tasks: [{ kind: "executor", task: "a" }, { kind: "auditor", task: "b", model: "keep/me" }] },
+    };
+    await call(batch);
+    const tasks = (batch.args as { tasks: Record<string, unknown>[] }).tasks;
+    assert.equal(tasks[0]?.model, "p/m");
+    assert.equal(tasks[1]?.model, "keep/me");
+
+    // A declaration that cannot be resolved refuses the dispatch, and says why.
+    writeFileSync(join(root, ".pi", "settings.json"), JSON.stringify({ subagents: { defaultModel: "p/gone" } }));
+    const refused = (await call({ agent: "reviewer", task: "x" })) as { block?: boolean; reason?: string } | undefined;
+    assert.equal(refused?.block, true);
+    assert.match(String(refused?.reason), /不在当前模型注册表中/);
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
