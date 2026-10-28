@@ -252,6 +252,8 @@ export interface PiRuntimeHost {
   sendUserMessage?(message: { content: string }): void;
   /** The session's display name; a child's is `<agent>: <task excerpt>`. */
   getSessionName?(): string | undefined;
+  /** Native session metadata, excluded from model messages. */
+  appendEntry?<T = unknown>(customType: string, data?: T): void;
   /**
    * The tools declared to the model right now, by name.
    *

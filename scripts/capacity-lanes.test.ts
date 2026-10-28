@@ -17,6 +17,7 @@ function harness(voidOn = false) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "coworkflow-c1-")));
   const sessionId = `c1-${root.split("/").pop()}`;
   mkdirSync(join(root, taskRef), { recursive: true });
+  writeFileSync(join(root, taskRef, "task.json"), JSON.stringify({ id: "demo", status: "in_progress" }));
   mkdirSync(join(root, ".pi"));
   writeFileSync(join(root, ".pi", "Coworkflow.json"), JSON.stringify({ version: 1, modules: {} }));
   mkdirSync(join(root, SESSIONS_DIR), { recursive: true });

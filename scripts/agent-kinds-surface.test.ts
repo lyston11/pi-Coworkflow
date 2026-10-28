@@ -30,7 +30,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -148,8 +148,9 @@ function writeKinds(root: string, kinds: Record<string, { enabled?: boolean; max
 }
 
 function tempProject(kinds?: Record<string, { enabled?: boolean; maxConcurrent?: number }>): string {
-  const root = mkdtempSync(join(tmpdir(), "coworkflow-surface-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "coworkflow-surface-")));
   mkdirSync(join(root, ".trellis", "tasks", "demo"), { recursive: true });
+  writeFileSync(join(root, ".trellis", "tasks", "demo", "task.json"), JSON.stringify({ id: "demo", status: "in_progress" }));
   writeKinds(root, kinds);
   return root;
 }
@@ -542,6 +543,7 @@ test("roles: the injected block for a cw-* child is the implement/check context,
   const root = mkdtempSync(join(tmpdir(), "coworkflow-surface-inject-"));
   const task = join(root, ".trellis", "tasks", "10-20-demo");
   mkdirSync(task, { recursive: true });
+  writeFileSync(join(task, "task.json"), JSON.stringify({ id: "demo", status: "in_progress" }));
   writeFileSync(join(task, "prd.md"), "# Requirements\n\nDo the thing.\n");
   writeFileSync(
     join(task, "implement.jsonl"),

@@ -58,12 +58,12 @@
  */
 
 import { moduleAsset, type PiRuntimeHost, type RuntimeContext, type WorkflowModule } from "../../core/module.ts";
-import { statSync } from "node:fs";
 import {
   activeTaskDir,
   buildRoleContext,
   readSubagentGuide,
-  resolveTaskDir,
+  resolveChildTask,
+  type TaskResolution,
   stripManagedRegion,
   stripManagedRegionFromPrompt,
   stripOwnInjection,
@@ -77,23 +77,6 @@ import type { ResolvedAgentKind } from "../../core/config.ts";
 
 const ROLES: SubagentRole[] = ["implement", "check", "research"];
 const MARKER_RE = /<!--\s*trellis-agent:\s*(implement|check|research)\s*-->/;
-/**
- * The task path after `Active task:`, anywhere in the text. It must not be
- * anchored to the line start: pi-subagents wraps the dispatch prompt, so the
- * line arrives as `Task: Active task: .trellis/tasks/<name>`.
- */
-const ACTIVE_TASK_RE = /Active task:\s*([^\s`'"\n]+)/g;
-const TASK_PATH_RE = /\.trellis\/tasks\/[A-Za-z0-9._-]+/;
-
-/** Ignore documentation placeholders, but retain invalid explicit paths for validation. */
-function leadingTaskRef(value: string): string | null {
-  if (value.startsWith("<")) return null;
-  // Trailing prose/Markdown is not part of the reference. Do not truncate path
-  // segments: doing so could turn an invalid explicit path into a different task.
-  const ref = value.split(/[，。；,;*]/, 1)[0]?.replace(/^\.\//, "");
-  return ref || null;
-}
-
 /** The section name Pi renders (and diffs) for this module's contribution. */
 export const SECTION = "pi_coworkflow_child";
 
@@ -164,53 +147,7 @@ export function detectRole(
   return null;
 }
 
-/** A task reference exactly as the child named it, or null when it named none. */
-export function taskReference(
-  sessionName: string | undefined,
-  ...texts: (string | undefined)[]
-): string | null {
-  for (const text of texts) {
-    for (const match of (text ?? "").matchAll(ACTIVE_TASK_RE)) {
-      const ref = leadingTaskRef(match[1]!);
-      if (ref !== null) return ref;
-    }
-  }
-  const fromName = TASK_PATH_RE.exec(sessionName ?? "")?.[0];
-  return fromName ?? null;
-}
-
-/**
- * The task directory this child should work on, resolved against `root`.
- *
- * `invalid` is a different answer from "no task": a child that was told
- * `Active task: .trellis/tasks/typo` must not be handed the parent's task
- * instead, because then it writes to a task nobody dispatched it for.
- */
-export type TaskResolution =
-  | { kind: "task"; dir: string; ref: string }
-  | { kind: "invalid"; ref: string }
-  | { kind: "none"; explicit?: boolean };
-
-export function resolveChildTask(
-  root: string,
-  sessionName: string | undefined,
-  ...texts: (string | undefined)[]
-): TaskResolution {
-  const ref = taskReference(sessionName, ...texts);
-  if (!ref) return { kind: "none" };
-  if (ref === "(none)") return { kind: "none", explicit: true };
-  const dir = resolveTaskDir(root, ref);
-  // `resolveTaskDir` resolves lexically so a caller may create a task; a child
-  // only ever reads one, so here a reference to a directory that does not exist
-  // is a bad reference (usually a typo in the dispatch prompt).
-  if (!dir) return { kind: "invalid", ref };
-  try {
-    return statSync(dir).isDirectory() ? { kind: "task", dir, ref } : { kind: "invalid", ref };
-  } catch {
-    return { kind: "invalid", ref };
-  }
-}
-
+export { taskReference, resolveChildTask } from "../../core/trellis.ts";
 /** The block this module contributes, for one run of one child. */
 interface ChildPrompt {
   /** Shared safety floor plus any distinct project supplement. */
@@ -246,7 +183,7 @@ function blockFor(prompt: ChildPrompt): string {
     // is the parent's mistake to fix, not an invitation to pick a task.
     lines.push(
       `> 派单提示词里的任务引用 \`${task.ref}\` 在本项目的 .trellis/tasks 下不存在。`,
-      "> 不要猜测或改用其它任务；先按派单提示词本身工作，并在报告里指出这个无效引用。",
+      "> 不要猜测或改用其它任务；停止执行并报告这个无效引用。工具调用已阻止。",
       "",
     );
   }
@@ -293,13 +230,25 @@ function readChildPrompt(
   sessionName: string | undefined,
   event: any,
   runtime: RuntimeContext,
+  host: PiRuntimeHost,
+  ctx: any,
 ): ChildPrompt {
   const inherited = inheritedPrompt(event);
   // The project's table, so a custom or renamed kind resolves to the role it declared.
   const kinds = resolveKinds(readConfig(root), readKindDefinitions(root).definitions);
   const kind = kindOf(sessionName?.split(":")[0]?.trim() ?? "", kinds);
   const role = detectRole(sessionName, kinds, event?.prompt, inherited);
-  let task = resolveChildTask(root, sessionName, event?.prompt, inherited);
+  const key = `${runtime.sessionId}:${runtime.sessionEpoch}`;
+  let binding = BINDINGS.get(host);
+  if (binding?.key !== key) binding = undefined;
+  const branch = ctx?.sessionManager?.getBranch?.();
+  if (Array.isArray(branch)) {
+    const saved = branch.filter((entry: any) => entry.type === "custom" && entry.customType === TASK_BINDING).at(-1)?.data;
+    binding = saved?.root === root && typeof saved.ref === "string" ? { key, ref: saved.ref } : undefined;
+  }
+  let task = binding
+    ? resolveChildTask(root, undefined, `Active task: ${binding.ref}`)
+    : resolveChildTask(root, sessionName, event?.prompt, inherited);
 
   if (task.kind === "none" && !task.explicit && role && (role !== "research" || kind?.context === "task")) {
     // The child named no task: the parent's pointer is the only remaining
@@ -310,6 +259,20 @@ function readChildPrompt(
     }
   }
 
+  if (!binding) {
+    const ref = task.kind === "task" ? task.dir : task.kind === "invalid" ? task.ref : "(none)";
+    binding = { key, ref };
+    host.appendEntry?.(TASK_BINDING, { root, ref });
+  }
+  BINDINGS.set(host, binding);
+  // A follow-up cannot move this process to another task/worktree. Start a new
+  // child for that; in particular a borrowed parent pointer cannot change it.
+  const requested = resolveChildTask(root, undefined, event?.prompt);
+  if (!(requested.kind === "none" && !requested.explicit) &&
+      (requested.kind === "task" ? requested.dir : requested.kind === "invalid" ? requested.ref : "(none)") !== binding.ref) {
+    task = { kind: "invalid", ref: "任务绑定与本次指令不一致；请新建子会话" };
+  }
+  INVALID.set(host, task.kind === "invalid" ? task.ref : null);
   const displayRef =
     task.kind === "task"
       ? taskRefForDisplay(root, task.dir)
@@ -376,7 +339,7 @@ function buildPrompt(
   // Read at call time: a child is renamed after dispatch, so a name captured at
   // load would be stale by the first run.
   const sessionName = host.getSessionName?.();
-  const prompt = readChildPrompt(root, sessionName, event, runtime);
+  const prompt = readChildPrompt(root, sessionName, event, runtime, host, ctx);
   const block = blockFor(prompt);
 
   const options = event?.systemPromptOptions;
@@ -416,6 +379,9 @@ interface HostInjection {
 }
 
 const REGISTRATIONS = new WeakMap<PiRuntimeHost, HostInjection>();
+const TASK_BINDING = "coworkflow-task-binding";
+const BINDINGS = new WeakMap<PiRuntimeHost, { key: string; ref: string }>();
+const INVALID = new WeakMap<PiRuntimeHost, string | null>();
 
 export const subagentContextModule: WorkflowModule = {
   id: "subagent-context",
@@ -434,6 +400,11 @@ export const subagentContextModule: WorkflowModule = {
     }
     const entry: HostInjection = { runtime, off: null };
     REGISTRATIONS.set(host, entry);
+    const stopInvalid = host.on("tool_call", () => {
+      if (!entry.runtime.enabled || !entry.runtime.control.moduleEnabled("subagent-context")) return;
+      const invalid = INVALID.get(host);
+      if (invalid) return { block: true, reason: `无效任务绑定：${invalid}。请主会话修正派单。` };
+    });
     const unsubscribe = host.on("before_agent_start", (event: any, ctx: any) => {
       // Both gates are read at event time, not captured: a session that runs
       // `/Coworkflow:start off` stops injecting, a project that switches the
@@ -451,7 +422,8 @@ export const subagentContextModule: WorkflowModule = {
     // `pi.on` documents an unsubscribe, and the host in front of us may still
     // return nothing. When it does, the subscription is permanent by necessity:
     // the record stays and the handler above stays inert while the gates are off.
-    entry.off = typeof unsubscribe === "function" ? unsubscribe : null;
+    entry.off = typeof unsubscribe === "function" && typeof stopInvalid === "function"
+      ? () => { unsubscribe(); stopInvalid(); } : null;
   },
 
   /**
@@ -467,6 +439,8 @@ export const subagentContextModule: WorkflowModule = {
    * last handed it, so an unremovable subscription is inert, not stale.
    */
   onSessionEnd(host: PiRuntimeHost): void {
+    BINDINGS.delete(host);
+    INVALID.delete(host);
     const entry = REGISTRATIONS.get(host);
     if (entry === undefined) return;
     if (entry.off === null) return;

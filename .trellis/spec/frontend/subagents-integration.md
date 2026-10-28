@@ -104,6 +104,12 @@ A kind is a named agent definition plus its project policies (enabled, max concu
 
 The shipped purposes are `executor` (main implementation), `planner` (advisory options and tradeoffs only), `auditor` (independent review), `researcher` (evidence gathering) and `worker` (bounded, independently checkable work) — roles implement, research, check, research, implement respectively. `planner` may not edit code and does not decide for the parent; `worker` must stop and report when a task turns out to need design judgement, cross-module coordination, or an unclear root cause, and duration alone never justifies using it. Model pins live only in `agentKinds.<kind>.model`, never in code, assets or templates, so each project chooses its own mapping. Kind registration and admission are separate from queue planning. The queue submits admitted work through the native owner; it does not own child processes, retries or artifact lifetimes.
 
+Every registered kind sets `inheritProjectContext: true`. Upstream defaults that
+field to false for a runtime agent, which silently dropped the project's own
+`AGENTS.md` rules while the injector stripped only this package's managed region.
+Inheritance is what makes "project rules minus the parent's duties" true; the
+stripping stays the second half.
+
 Registration uses only the installed owner's documented runtime-agent contract — its public `./agents` export and the process-local `pi-subagents:runtime-agent-register:v1` event. The event is used rather than a direct `registerRuntimeAgent` call because a direct call writes into the owner's registry whether or not any owner is loaded in this process; this package would then report a kind as available while nothing merges it into an agent list. No listener therefore means "pi-subagents is not loaded", which is a fact to report, not a registration to keep. Names are namespace-prefixed (`cw-<kind>`) so they cannot collide with the owner's builtin table or a project agent; a collision is that kind's failure and is reported as such, never retried under another name.
 
 The same per-kind admission applies at parent `subagent` calls and queued units before RPC spawn (children neither register their own subtree nor police parent dispatch). It reads project policy from disk; it never kills a run already admitted. Occupancy comes from the public fleet projection (`status` v1 `fleet.entries[].agent`) through `core/subagents-client.ts`. Queue-owned starts provide a conservative local floor while a newly started run is not yet visible. Missing capability, an undecodable or truncated fleet DTO, or a reply after session change all refuse launch: unknown is not zero. Direct or decoded batch dispatches containing no owned agent return before a public read.
@@ -152,9 +158,25 @@ separately; state lists agree with `snapshot()` even while dispatch is disabled.
 Shutdown or an epoch change invalidates pending work; no implicit restart occurs.
 
 The injector resolves custom/wrapped names from the current kind definitions.
-`role: none` wins over inherited markers. An explicit invalid task reference stays
-invalid; a documentation placeholder permits parent-pointer fallback. Emit the
-absolute artifact directory for children whose cwd is a linked worktree.
+`role: none` wins over inherited markers. A documentation placeholder permits
+parent-pointer fallback; `Active task: (none)` is an explicit opt-out that never
+borrows the parent's pointer. Emit the absolute artifact directory for children
+whose cwd is a linked worktree.
+
+**One binding decides task and directory.** `bindLaunchTask()` resolves the task
+once per launch and rewrites the prompt to `Active task: <dir>|(none)`; the same
+answer places the child (`placeChildLaunch`). A queue entry binds at submission, so
+a later `task.py start` cannot move an already-accepted unit into another task's
+tree. A child persists its binding as a native session entry (not a model message),
+which survives follow-up turns, reload and branch replay; a later instruction that
+names a different task is refused and blocks tool calls instead of silently
+retargeting a running process.
+
+**A task reference must be a real task record.** `resolveChildTask` accepts only a
+directory inside `.trellis/tasks` that is not the tasks root, holds a readable
+`task.json` object, and does not escape through a symlink. Directories, `task.json`
+paths, `..` escapes and corrupt records are invalid, and an invalid reference fails
+the launch rather than falling back to a session tree.
 
 The native probe sets `PI_CODING_AGENT_DIR` to a temporary isolated directory and
 `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT` to its installed SDK root. It loads one
@@ -171,14 +193,20 @@ Use the extension event's `ctx.cwd`, not `process.cwd()`, for the child workspac
 | Gate closes during an await | Stop launches; preserve actual completion/failure evidence |
 | Ambiguous spawn receipt | Retain reservation, report `unobserved`, never retry |
 | Explicit missing task | Report invalid reference; never use another active task |
+| Task pointer changes between launches | New dispatch follows the new task; queued units keep their bound task |
+| Follow-up turn names another task | Refuse it, block tools; never migrate a running child |
+| Invalid or non-record task reference | Fail the launch; never substitute a session worktree |
+| Same-named worktree on another branch | Refuse adoption; never rewrite `task.json` to that branch |
+| Session ends while a child may still run | Retain the worktree; clean is not proof of no occupant |
 | Fixture loads both main and worktree builds | Invalid verification setup; isolate configuration |
 
 ### 5. Good / base / bad cases
 
-Good: four children of a custom research kind with `context: task`, two kind slots,
-ceiling and dependency waiting, and four distinct worktrees. Three task-bound
-children receive all four document sentinels at the final model request; one
-explicit `Active task: (none)` child receives none of them.
+Good: three children of a custom research kind with `context: task`, two kind
+slots, a dependency wait and distinct worktrees. Two task-bound children receive
+all four document sentinels at the final model request; one explicit
+`Active task: (none)` child receives none of them. Every child carries the
+project's own rules (a custom sentinel) and none of the parent managed region.
 Base: an unknown role receives the generic child guide.
 Bad: a green subprocess exit without document evidence is called injection success.
 
@@ -187,10 +215,14 @@ Bad: a green subprocess exit without document evidence is called injection succe
 `scripts/dispatch-host.test.ts` drives production registration, public RPC events,
 capacity, outcome classification and epoch races. `scripts/dispatch-queue.test.ts`
 covers atomic cycle rejection and result/snapshot agreement, including closed gates.
-`scripts/test.ts` covers role overrides, planning profiles (including renamed kinds and budget limits), explicit task opt-out, placeholders, invalid paths and prompt idempotency. Generic child guidance has one shipped asset, read by both rendering and the injection fallback; kind prompts only add purpose-specific instructions. `scripts/verify-dispatch.mjs` observes real processes and final system
-messages, asserts the four-child scenario, and removes its clean worktrees on success.
-The fixture ignores `.pi` as an entry (not directory-only `.pi/`), so a shared
-configuration symlink remains clean for upstream worktree admission.
+`scripts/test.ts` covers role overrides, planning profiles (including renamed kinds and budget limits), explicit task opt-out, placeholders, invalid paths and prompt idempotency. Generic child guidance has one shipped asset, read by both rendering and the injection fallback; kind prompts only add purpose-specific instructions. `scripts/runtime-contracts.test.ts` covers the shared task/cwd binding, native
+session-entry replay, retarget refusal, task-record validation, the auto-worktree
+branch guard and session-end retention against real Git fixtures.
+`scripts/verify-dispatch.mjs` observes real processes and final system messages,
+asserts the three-child scenario (task context, `(none)` opt-out, inherited project
+rules with the parent region stripped), and removes its clean worktrees on success.
+The fixture ignores `.pi` and `.trellis/tasks` as entries (not directory-only), so
+shared symlinks remain clean for upstream worktree admission.
 
 ### 7. Wrong vs correct
 
@@ -215,7 +247,9 @@ Every launch path takes its `cwd` from one function, `sessionTree()` in `modules
 Two properties are load-bearing:
 
 - **Placement is one decision, not a per-launch flag.** A direct dispatch and a named workflow get `cwd` through `tool_call` injection (pi allows mutating `event.input`, `docs/extensions.md`), and `coworkflow_dispatch` passes it on the RPC `spawn` call. Only calls that start children are placed — `action` calls (`status`, `stop`, `steer`, `validate`, …) launch nothing and are never rewritten, and an explicit `cwd` from the caller is left alone.
-- **No silent fallback.** A tree that cannot be established (no repository, `worktree add` failure, a same-named branch or directory that is not this session's) refuses that launch with the reason. Falling back to the shared checkout is the exact failure the module exists to remove, so it is not an option the code takes.
+- **No silent fallback, and no task substitution.** A tree that cannot be established (no repository, `worktree add` failure, a same-named branch or directory that is not this session's) refuses that launch with the reason. A task that names a worktree failing validation is a refusal too: falling back to a fresh session tree would run a task's work somewhere that task never declared. Falling back to the shared checkout is the exact failure the module exists to remove, so it is not an option the code takes.
+- **The bound task wins over the parent's location.** Placement follows the task bound to that launch, not the directory the parent session happens to sit in: a parent inside task A's worktree can dispatch work for task B, and the child lands in B. An explicit `cwd` must be a linked worktree of this repository *and* agree with the bound task, otherwise the launch is refused.
+- **A fanout is one task.** Every unit of one `coworkflow.fanout` call must resolve to the same task directory; units that resolve differently are refused rather than silently mixed into one `cwd`. Cross-task batches belong to `coworkflow_dispatch`, where placement is per unit.
 
 A fresh worktree symlinks `.trellis/{tasks,scripts,workspace,config.yaml,workflow.md}` and `.pi` from the main checkout — the same set and the same reason as `auto_worktree.py`: a linked worktree holds committed files only, and a child that cannot read its PRD, the spec, or the kind definitions is a child working blind. Symlinked, never copied, so there is one record rather than two histories.
 
@@ -223,14 +257,17 @@ One limit of that symlinking is load-bearing and must not be papered over: it on
 
 `/Coworkflow:merge` is the only path from a session branch back to the base, and it is deliberately conservative: a dirty tree is refused, zero commits ahead reports nothing to do, the merge is `--no-ff` on the base branch that is actually checked out (a detached HEAD or a different branch is refused rather than switched), a conflict stops the command with the conflicted paths and the `merge --abort` way out, and nothing is pushed or deleted. Session end never removes a worktree whose work is unmerged or uncommitted.
 
-The module declares no `newSwitchDefault`, which means on: unlike `capacity`, which refuses work a project asked for, this one *places* work the project already asks for into the checkout its own rules say it belongs in. `scripts/session-worktree.test.ts` pins the ladder, the dirty-checkout case, idempotent reuse, both refusals, the manifest, `inspectTree`, the merge preconditions and the status line.
+Session end also never removes a *clean* session tree. Cleanliness says nothing about occupancy: a background child can be running in that checkout with no commits yet, and deleting it would remove a live workspace. The module has no reliable way to prove a background child is gone, so it retains the tree and reports it; removal is an explicit, verified step. The same reasoning applies to the Trellis `after_start` hook: a same-named worktree on a different branch is refused instead of being adopted and written into `task.json`, because recording someone else's branch as the task's branch is how a task's work ends up committed somewhere nobody expects.
+
+The module declares no `newSwitchDefault`, which means on: unlike `capacity`, which refuses work a project asked for, this one *places* work the project already asks for into the checkout its own rules say it belongs in. `scripts/session-worktree.test.ts` pins the ladder, the dirty-checkout case, idempotent reuse, both refusals, the manifest, `inspectTree`, the merge preconditions, session-end retention and the status line; `scripts/runtime-contracts.test.ts` pins the shared task/cwd binding and the branch guard against real Git fixtures.
 
 ## Concurrent writers in one worktree (`coworkflow_dispatch` `files`)
 
 Children of one session share one working tree, so two of them writing the same file is not a merge conflict anyone can resolve later — it is one child silently overwriting another, and Git has nothing to report because no merge happens. The queue's answer splits by what it can actually know:
 
 - **Declared write sets are enforced.** A unit may pass `files` (paths relative to the checkout); `files: []` is a real declaration meaning "writes nothing", which is how a reader/auditor kind runs beside writers. Before a launch, a declared unit waits (`reason: "overlap"`) for any running or unconfirmed unit whose declared paths it intersects, and the completion that follows releases it. `overlapOf` compares by path segment, so a declared directory covers its contents (`src/dispatch` vs `src/dispatch/index.ts`) while a prefix that is not a segment does not (`src/dispatch-extra`).
-- **Undeclared units are reported, not guessed at.** An unknown write set stays parallel — refusing or serializing every batch would trade a working feature for a supposition — and instead the result carries `notice`, naming the units that are running without a declaration and why that is a risk. `renderDispatchResult` prints it. Two or more such units is the trigger; one alone is not a shared-writer situation.
+- **Paths are canonical before comparison.** Declarations are normalised with `path.posix.normalize`, so `src/x/../a.ts`, `./src//a.ts` and `src\a.ts` are one path and cannot be used to slip past the check. Absolute paths, `..` escapes and non-string entries are refused at submission, before anything is queued; a declaration is not advisory.
+- **Undeclared units are reported, not guessed at.** An unknown write set stays parallel — refusing or serializing every batch would trade a working feature for a supposition — and instead the result carries `notice`, naming the units that are running without a declaration and why that is a risk. `renderDispatchResult` prints it. The trigger is one undeclared unit *alongside any other unit that may write*: a declared writer is as much of a collision risk as another undeclared one, while a `files: []` reader is not. A lone undeclared unit is not a shared-writer situation, and a per-launch worktree removes the shared tree entirely.
 
 The honest limit is the point: enforcement where the queue has knowledge, a stated fact where it does not. `scripts/dispatch-queue.test.ts` pins the overlap queue-and-release, disjoint parallelism, directory coverage, the read-only declaration, and the notice (including that it does not fire for declared units).
 

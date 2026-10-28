@@ -135,6 +135,14 @@ test("template: the dot-* rename maps onto the three real roots", () => {
  * is derived from it rather than hardcoded, and a checkout without the link simply
  * compares fewer files (reported, never silently passed).
  */
+/**
+ * Checkouts that hold the reference copy of the rendered tree.
+ *
+ * A linked worktree carries only committed files, while some rendered targets
+ * (`.pi/extensions`, `.pi/prompts`) are project-local and untracked. When the test
+ * runs inside a task worktree the reference therefore lives in the main checkout
+ * that owns the shared Git directory.
+ */
 function referenceRoots(root: string): string[] {
   const roots = [root];
   try {
@@ -142,7 +150,15 @@ function referenceRoots(root: string): string[] {
     const primary = dirname(linked);
     if (primary !== root) roots.push(primary);
   } catch {
-    // No `.pi` link: this checkout is the only reference.
+    // No `.pi` link: fall through to the Git directory's owner.
+  }
+  try {
+    const common = execFileSync("git", ["-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const owner = dirname(common);
+    if (owner !== root && !roots.includes(owner)) roots.push(owner);
+  } catch {
+    // Not a repository: this checkout is the only reference.
   }
   return roots;
 }

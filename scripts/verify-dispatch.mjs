@@ -93,10 +93,15 @@ for (const manifest of ["check.jsonl", "implement.jsonl"]) {
 }
 put(join(taskDir, "task.json"), JSON.stringify({ id: "probe", name: "probe", status: "in_progress" }));
 // Session placement may share .pi via a symlink; ignore the entry, not only directories.
-put(join(fixture, ".gitignore"), ".pi\n.trellis/.runtime/\nsessions/\n");
+// The materialised `.trellis/tasks` is a symlink, which `tasks/` (directory-only) does not match.
+put(join(fixture, ".gitignore"), ".pi\n.trellis/tasks\n.trellis/.runtime/\nsessions/\n");
+put(join(fixture, "AGENTS.md"), "# Project\nPROJECT-RULE-SENTINEL-871\n<!-- pi-Coworkflow:start -->\nPARENT-ONLY-SENTINEL-983\n<!-- pi-Coworkflow:end -->\n");
 git("init", "-q", "-b", "main");
 git("add", ".");
 git("commit", "-qm", "probe fixture");
+const taskTree = join(base, "wt-probe");
+git("worktree", "add", "-b", "feat/probe", taskTree);
+put(join(taskDir, "task.json"), JSON.stringify({ id: "probe", status: "in_progress", branch: "feat/probe", worktree_path: taskTree }));
 process.chdir(fixture);
 
 const { createAgentSession, DefaultResourceLoader, SettingsManager, SessionManager } = await import(pathToFileURL(sdkEntry).href);
@@ -111,7 +116,7 @@ const capture = pi => {
   pi.on("message_end", event => {
     if (event.message?.customType !== "subagent-notify") return;
     for (const run of event.message.details?.runs ?? []) notices.set(run.runId, run);
-    if (notices.size === 4) done();
+    if (notices.size === 3) done();
   });
 };
 try {
@@ -131,10 +136,11 @@ try {
   const tool = tools.find(t => (t.definition ?? t).name === "coworkflow_dispatch");
   assert.ok(tool, "native host registers the queue tool");
   const task = `Active task: ${taskDir}\nRead-only probe: reply PROBE_COMPLETED without tools.`;
+  // Three units, ceiling two: one starts only after a slot frees, and the
+  // independent unit starts only after its prerequisite completes.
   const result = await (tool.definition ?? tool).execute("probe", { worktree: true, tasks: [
     { key: "a", kind: "probe", task }, { key: "b", kind: "probe", task },
-    { key: "c", kind: "probe", task },
-    { key: "d", kind: "probe", task: "Active task: (none)\nIndependent probe; reply PROBE_COMPLETED without tools.", needs: ["a"] },
+    { key: "c", kind: "probe", task: "Active task: (none)\nIndependent probe; reply PROBE_COMPLETED without tools.", needs: ["a"] },
   ] });
   assert.ok(!result.isError, JSON.stringify(result));
   // Wait for launched children before asserting the initial snapshot, so a fixture
@@ -144,17 +150,19 @@ try {
   })]);
   clearTimeout(timer);
   assert.equal(result.details.started.length, 2);
-  assert.deepEqual(result.details.queued.map(t => [t.key, t.reason]), [["c", "ceiling"], ["d", "dependency"]]);
+  assert.deepEqual(result.details.queued.map(t => [t.key, t.reason]), [["c", "dependency"]]);
   assert.ok([...notices.values()].every(run => run.status === "completed"), JSON.stringify([...notices.values()]));
   const evidence = readdirSync(evidenceDir).map(name => JSON.parse(readFileSync(join(evidenceDir, name), "utf8")));
-  assert.equal(evidence.length, 4, "each real child reached the model with its final context");
-  assert.equal(new Set(evidence.map(e => e.pid)).size, 4, "four distinct child processes");
-  assert.equal(new Set(evidence.map(e => e.cwd)).size, 4, "four distinct worktrees");
+  assert.equal(evidence.length, 3, "each real child reached the model with its final context");
+  assert.equal(new Set(evidence.map(e => e.pid)).size, 3, "three distinct child processes");
+  assert.equal(new Set(evidence.map(e => e.cwd)).size, 3, "three distinct worktrees");
   let independent = 0;
   for (const child of evidence) {
     assert.notEqual(child.pid, process.pid);
     assert.notEqual(child.cwd, fixture);
     const prompt = typeof child.systemPrompt === "string" ? child.systemPrompt : JSON.stringify(child.systemPrompt);
+    assert.ok(prompt.includes("PROJECT-RULE-SENTINEL-871"), "custom project rules reach every real child");
+    assert.ok(!prompt.includes("PARENT-ONLY-SENTINEL-983"), "parent managed rules are stripped");
     const taskless = !prompt.includes(markers[0]);
     if (taskless) {
       independent++;
@@ -168,12 +176,12 @@ try {
       assert.ok(prompt.includes("role: research"), "custom wrapped kind receives its declared role/profile");
     }
   }
-  assert.equal(independent, 1, "one explicitly independent child and three task-bound children");
+  assert.equal(independent, 1, "one explicitly independent child and two task-bound children");
   assert.ok(evidence.every(child => child.name.includes("cw-probe")), "planning profile is independent of the shipped planner name");
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ passed: true, children: evidence.length, initialRunning: 2, initialQueued: 2,
-    taskBoundChildren: 3, contextMarkersPerTaskChild: markers.length, independentChildren: independent,
-    isolatedWorktrees: true, modelNetworkRequests: 0 }));
+  console.log(JSON.stringify({ passed: true, children: evidence.length, initialRunning: 2, initialQueued: 1,
+    taskBoundChildren: 2, contextMarkersPerTaskChild: markers.length, independentChildren: independent,
+    projectRulesInherited: true, parentRegionRemoved: true, isolatedWorktrees: true, modelNetworkRequests: 0 }));
   passed = true;
 } finally {
   clearTimeout(timer);

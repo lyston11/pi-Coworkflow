@@ -36,11 +36,13 @@
 ### 写入、Git 与任务收尾
 
 - Trellis 任务一个分支、一个 linked worktree。`task.py start` 后读 task.json 的 `branch/worktree_path`，写代码前进入该目录（通常 `../{{worktreePrefix}}<任务名>`）。生命周期命令在启动任务的主检出里执行。
-- 子 agent 默认共用会话 worktree：当前 linked worktree → 已验证的活跃任务 worktree → 会话 worktree。分配失败拒绝启动，不退回共享主检出；验收时核对子 agent 的实际 cwd。
+- 子 agent 默认共用会话 worktree：当前 linked worktree → 已验证的活跃任务 worktree → 会话 worktree。派单时任务与目录一起绑定，之后主会话切任务不改变已接受单元的目录；分配失败拒绝启动，不退回共享主检出；验收时核对子 agent 的实际 cwd。
+- 子会话的任务绑定记在 Pi 原生 session entry 里，续聊、reload 和分支回放都沿用；后续指令改指其它任务会被拒绝并阻止工具调用，不会迁移运行中的子进程。任务引用必须是带 `task.json` 的真实任务目录。
 - worktree 中已跟踪的 `.pi/.trellis` 可能是提交快照；以主检出记录为准，注入提供工件绝对路径。不得用软链覆盖受跟踪文件来强行共享，这会破坏 Git 合并。
-- 同一工作区的批量写任务声明 `files`，只读写 `files: []`。已声明的重叠路径排队；遗漏声明仍可并行且报告风险，不能据此假定安全。目录覆盖其下路径，不覆盖同名字符串前缀。
+- 同一工作区的批量写任务声明 `files`，只读写 `files: []`。声明先规范化再比较，`..`、绝对路径和转义一律拒绝；已声明的重叠路径排队；遗漏声明仍可并行，但与任何可能写入的单元并行时报告风险，不能据此假定安全。目录覆盖其下路径，不覆盖同名字符串前缀。
 - 主会话的直接写入不受子任务队列的 `files` 检查保护；不得与子 agent 占用路径重叠。共享工作区只有主会话在写入停止后操作 Git index 和提交。
 - 独立 lane 才用 `worktree: true`（fanout 为 `worktrees: true`）；需要干净 HEAD，产出 patch 不会自动应用。主会话串行集成、核查证据、提交，再记录合并并按授权清理。
 - 禁止 `reset --hard`、`rebase`、`push -f`、切到他人分支或改写基线历史；需新基线时 fetch 后 merge。丢提交时先停写，用 reflog 定位并建 rescue 分支固定，再恢复。
 - 合并由主会话或唯一集成通道执行。`/Coworkflow:merge` 遇未提交改动或冲突会停下，不自动 push 或删除 worktree。
+- 会话结束不删除干净的会话 worktree：干净不等于没有后台子进程在使用；保留并报告，删除是显式且经核对的步骤。`task.py start` 遇到同名但异分支的 worktree 直接拒绝，不把它写进 `task.json`。
 - 完成任务后归档；仅在分支已合并且 worktree 无未提交代码时，执行 `git worktree remove` 和 `git branch -d`，报告清理结果。条件不足保留现场并说明；禁止用 `--force` 或 `-D` 掩盖未交付工作。

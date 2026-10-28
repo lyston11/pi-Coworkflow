@@ -269,6 +269,7 @@ async function childHarness(options: {
   let moduleOn = options.moduleOn ?? true;
   const host = {
     on(_event: string, handler: (event: any, ctx: any) => any) {
+      if (_event !== "before_agent_start") return () => {};
       handlers.push(handler);
       return () => {
         const index = handlers.indexOf(handler);
@@ -315,6 +316,7 @@ async function tempChildProject(): Promise<string> {
   const root = tempProject();
   const task = join(root, ".trellis", "tasks", "10-20-demo");
   mkdirSync(task, { recursive: true });
+  writeFileSync(join(task, "task.json"), JSON.stringify({ id: "demo", status: "in_progress" }));
   writeFileSync(join(task, "prd.md"), "# Requirements\n\nDo the thing.\n");
   mkdirSync(join(root, ".pi", "Coworkflow"), { recursive: true });
   writeFileSync(
@@ -527,18 +529,21 @@ test("subagent-context: the documented placeholder is not a task reference, so t
     // A real reference followed by a punctuation mark is still that reference, and it is
     // the one the child gets — the parent's task does not win over an explicit name.
     mkdirSync(join(root, ".trellis", "tasks", "10-20-other"), { recursive: true });
+    writeFileSync(join(root, ".trellis", "tasks", "10-20-other", "task.json"), "{}");
     const punctuated = {
       prompt: "Active task: .trellis/tasks/10-20-other，然后按它工作。",
       systemPrompt: "BASE",
       systemPromptOptions: { contextFiles: [], sections: {} as Record<string, string> },
     };
-    harness.run(punctuated);
+    const otherHarness = await childHarness({ root, sessionName: "cw-executor: other" });
+    otherHarness.run(punctuated);
     const punctuatedBlock = punctuated.systemPromptOptions.sections.pi_coworkflow_child ?? "";
     assert.match(punctuatedBlock, /^Active task: \.trellis\/tasks\/10-20-other$/m, "the punctuation is not part of the name");
 
     punctuated.prompt = "Active task: <任务目录>\nActive task: .trellis/tasks/10-20-other";
     punctuated.systemPromptOptions.sections = {};
-    harness.run(punctuated);
+    otherHarness.run(punctuated);
+    otherHarness.close();
     assert.match(punctuated.systemPromptOptions.sections.pi_coworkflow_child ?? "", /^Active task: \.trellis\/tasks\/10-20-other$/m,
       "a placeholder cannot hide a later explicit task in the same prompt");
 

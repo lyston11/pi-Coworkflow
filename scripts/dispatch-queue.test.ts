@@ -546,13 +546,43 @@ test("queue: a read-only unit declares files: [] and never collides", async () =
   assert.equal(result.notice, undefined, "a declared write set — including an empty one — needs no warning");
 });
 
+test("queue: canonical paths overlap, root covers all, escapes are rejected atomically", async () => {
+  for (const alias of ["src/x/../a.ts", "./src//a.ts", "src\\a.ts"]) {
+    const owner = fakeOwner({ executor: 4 });
+    const q = createDispatchQueue(owner.deps, 1);
+    const result = await q.submit({ tasks: [{ key: "a", kind: "executor", task: "a", files: ["src/a.ts"] },
+      { key: "b", kind: "executor", task: "b", files: [alias] }] });
+    assert.deepEqual(result.started.map(x => x.key), ["a"]);
+    assert.equal(result.queued[0]?.reason, "overlap");
+    owner.finish("executor");
+    assert.deepEqual((await q.settle(owner.runId("a"), "completed")).started.map(x => x.key), ["b"]);
+  }
+  const root = await createDispatchQueue(fakeOwner({ executor: 4 }).deps, 1).submit({ tasks: [
+    { key: "a", kind: "executor", task: "a", files: ["."] }, { key: "b", kind: "executor", task: "b", files: ["src/a.ts"] }] });
+  assert.equal(root.queued[0]?.reason, "overlap");
+  for (const file of ["../escape", "src/../../escape", "/tmp/file", "C:\\file", "", 42]) {
+    const owner = fakeOwner({ executor: 4 });
+    const q = createDispatchQueue(owner.deps, 1);
+    await assert.rejects(() => q.submit({ tasks: [{ key: "bad", kind: "executor", task: "bad", files: [file] as string[] }] }), /files/);
+  }
+});
+
+test("queue: one unknown writer warns beside a declared writer but not a reader", async () => {
+  for (const files of [["src/a.ts"], []]) {
+    const result = await createDispatchQueue(fakeOwner({ executor: 4 }).deps, 1).submit({ tasks: [
+      { key: "unknown", kind: "executor", task: "a" }, { key: "known", kind: "executor", task: "b", files }] });
+    assert.equal(result.started.length, 2);
+    assert.equal(Boolean(result.notice), files.length > 0);
+  }
+});
+
 test("queue: undeclared units stay parallel, and the report says that is the risk it is", async () => {
   const owner = fakeOwner({ executor: 4 });
   const queue = createDispatchQueue(owner.deps, 1);
 
   const result = await queue.submit({ tasks: units("a", "b") });
   assert.deepEqual(result.started.map((entry) => entry.key), ["a", "b"], "no declaration is not a refusal");
-  assert.match(result.notice ?? "", /a、b 同时在跑且都没有声明 files/);
+  assert.match(result.notice ?? "", /a、b 没有声明 files/);
   assert.match(renderDispatchResult(result), /静默覆盖/, "the rendered report carries it too");
 
   // One undeclared unit alone is not a shared-writer situation.

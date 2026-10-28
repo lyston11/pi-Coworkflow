@@ -753,6 +753,7 @@ export function kindRegistrationPlan(
         // empty description is refused by the owner, so it is never what we hand over.
         description: entry.description || builtinKind(entry.kind)?.description || `Coworkflow kind ${entry.kind}`,
         systemPrompt: prompt,
+        inheritProjectContext: true,
         // `parseAgentKinds` has already dropped anything unusable, so a value that
         // reaches here is one upstream will accept at registration. Absent stays
         // absent: the field is how a kind says "inherit".
@@ -791,6 +792,7 @@ export function planSignature(desired: readonly DesiredKind[]): string {
         entry.definition.description,
         entry.definition.model ?? "-",
         entry.definition.thinking ?? "-",
+        String(entry.definition.inheritProjectContext),
         `${entry.definition.systemPrompt.length}:${hash(entry.definition.systemPrompt)}`,
       ].join("|"),
     )

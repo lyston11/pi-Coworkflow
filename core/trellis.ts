@@ -156,7 +156,7 @@ export function activeTaskDir(root: string, session: string | null): string | nu
     try {
       const ref: unknown = (JSON.parse(raw) as { current_task?: unknown }).current_task;
       const resolved = typeof ref === "string" ? resolveTaskDir(root, ref) : null;
-      if (resolved) return resolved;
+      if (resolved && resolveChildTask(root, undefined, `Active task: ${resolved}`).kind === "task") return resolved;
     } catch {
       // A corrupt pointer is not this caller's problem; try the next key.
     }
@@ -168,6 +168,87 @@ export function activeTaskDir(root: string, session: string | null): string | nu
 export function taskRefForDisplay(root: string, taskDir: string): string {
   const rel = relative(root, taskDir).split(sep).join("/");
   return rel || taskDir;
+}
+
+/**
+ * The task path after `Active task:`, anywhere in the text. It must not be
+ * anchored to the line start: pi-subagents wraps the dispatch prompt, so the
+ * line arrives as `Task: Active task: .trellis/tasks/<name>`.
+ */
+const ACTIVE_TASK_RE = /Active task:\s*([^\s`'"\n]+)/g;
+const TASK_PATH_RE = /\.trellis\/tasks\/[A-Za-z0-9._-]+/;
+
+/** Ignore documentation placeholders, but retain invalid explicit paths for validation. */
+function leadingTaskRef(value: string): string | null {
+  if (value.startsWith("<")) return null;
+  // Trailing prose/Markdown is not part of the reference. Do not truncate path
+  // segments: doing so could turn an invalid explicit path into a different task.
+  const ref = value.split(/[，。；,;*]/, 1)[0]?.replace(/^\.\//, "");
+  return ref || null;
+}
+
+/** A task reference exactly as the child named it, or null when it named none. */
+export function taskReference(
+  sessionName: string | undefined,
+  ...texts: (string | undefined)[]
+): string | null {
+  for (const text of texts) {
+    for (const match of (text ?? "").matchAll(ACTIVE_TASK_RE)) {
+      const ref = leadingTaskRef(match[1]!);
+      if (ref !== null) return ref;
+    }
+  }
+  const fromName = TASK_PATH_RE.exec(sessionName ?? "")?.[0];
+  return fromName ?? null;
+}
+
+/**
+ * The task directory this child should work on, resolved against `root`.
+ *
+ * `invalid` is a different answer from "no task": a child that was told
+ * `Active task: .trellis/tasks/typo` must not be handed the parent's task
+ * instead, because then it writes to a task nobody dispatched it for.
+ */
+export type TaskResolution =
+  | { kind: "task"; dir: string; ref: string }
+  | { kind: "invalid"; ref: string }
+  | { kind: "none"; explicit?: boolean };
+
+export function resolveChildTask(
+  root: string,
+  sessionName: string | undefined,
+  ...texts: (string | undefined)[]
+): TaskResolution {
+  const ref = taskReference(sessionName, ...texts);
+  if (!ref) return { kind: "none" };
+  if (ref === "(none)") return { kind: "none", explicit: true };
+  const dir = resolveTaskDir(root, ref);
+  // `resolveTaskDir` resolves lexically so a caller may create a task; a child
+  // only ever reads one, so here a reference to a directory that does not exist
+  // is a bad reference (usually a typo in the dispatch prompt).
+  if (!dir) return { kind: "invalid", ref };
+  try {
+    const tasks = realpathSync(join(root, TASKS_DIR));
+    const actual = realpathSync(dir);
+    const record = JSON.parse(readFileSync(join(actual, "task.json"), "utf-8"));
+    return actual !== tasks && contains(tasks, actual) && statSync(actual).isDirectory()
+      && record !== null && typeof record === "object" && !Array.isArray(record)
+      ? { kind: "task", dir, ref } : { kind: "invalid", ref };
+  } catch {
+    return { kind: "invalid", ref };
+  }
+}
+
+/** Freeze the parent pointer into launch text before queueing or spawning. */
+export function bindLaunchTask(root: string, sessionId: string | null, task: string): { task: string; taskDir: string | null } {
+  let selected = resolveChildTask(root, undefined, task);
+  if (selected.kind === "invalid") throw new Error(`无效 Trellis 任务引用：${selected.ref}`);
+  if (selected.kind === "none" && !selected.explicit) {
+    const dir = activeTaskDir(root, sessionId);
+    if (dir) selected = { kind: "task", dir, ref: dir };
+  }
+  const dir = selected.kind === "task" ? selected.dir : null;
+  return { task: `Active task: ${dir ?? "(none)"}\n${task}`, taskDir: dir };
 }
 
 // ── Context injection ─────────────────────────────────────────────────
