@@ -43,7 +43,7 @@ import { existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync, symlinkSy
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { GIT_TIMEOUT_MS } from "../../core/config.ts";
 import type { PiRuntimeHost, RuntimeContext, WorkflowModule } from "../../core/module.ts";
-import { activeTaskDir, mainCheckout, repoRoot, taskRefForDisplay } from "../../core/trellis.ts";
+import { activeTaskDir, bindLaunchTask, mainCheckout, repoRoot, taskRefForDisplay } from "../../core/trellis.ts";
 import { planRun } from "../subagents/index.ts";
 
 const NS = "Coworkflow";
@@ -185,10 +185,6 @@ export function resolveSessionTree(options: {
   const root = git(repo, ["rev-parse", "--show-toplevel"]);
   if (!root.ok) return failure(`无法确认 ${repo} 是 git 仓库（${root.reason}）：没有仓库就无法隔离工作区。`);
 
-  if (isLinkedWorktree(cwd, repo)) {
-    return { path: cwd, branch: branchOf(cwd) ?? "", base: baseBranch(repo), source: "cwd" };
-  }
-
   const taskDir = options.taskDir === undefined ? activeTaskDir(mainCheckout(repo), sessionId) : options.taskDir;
   // The task tree is validated against the main checkout, whose path git reports in its
   // real spelling. Resolving the task directory the same way is what keeps `planRun`'s
@@ -204,6 +200,12 @@ export function resolveSessionTree(options: {
       source: "task",
       taskRef: taskPlan.taskRef,
     };
+  }
+
+  if (taskPlan !== null && !taskPlan.ok) return failure(taskPlan.message);
+
+  if (isLinkedWorktree(cwd, repo)) {
+    return { path: cwd, branch: branchOf(cwd) ?? "", base: baseBranch(repo), source: "cwd" };
   }
 
   const names = sessionTreeNames(repo, sessionToken(sessionId));
@@ -336,14 +338,15 @@ function tokenFor(runtime: RuntimeContext): string {
  * to do than crash — `dispatch` refuses that unit, the injection path leaves the call
  * alone but records why, and status prints it.
  */
-export function sessionTree(host: PiRuntimeHost, runtime: RuntimeContext): SessionTree | SessionTreeFailure {
+export function sessionTree(host: PiRuntimeHost, runtime: RuntimeContext, taskDir?: string | null): SessionTree | SessionTreeFailure {
   const state = stateFor(host);
   const token = tokenFor(runtime);
   if (state.token !== token) {
     state.tree = null;
     state.token = token;
   }
-  if (state.tree !== null) return state.tree;
+  // Task pointers, branches and worktree membership can change between launches.
+  // Keep only the last answer for status; never reuse it as launch authorization.
 
   const cwd = runtime.cwd;
   const repo = repoRoot(cwd);
@@ -351,10 +354,28 @@ export function sessionTree(host: PiRuntimeHost, runtime: RuntimeContext): Sessi
     state.tree = failure(`${cwd} 不在 git 仓库里：无法分配隔离 worktree。`);
     return state.tree;
   }
-  const resolved = resolveSessionTree({ repo, cwd, sessionId: runtime.sessionId });
+  const resolved = resolveSessionTree({ repo, cwd, sessionId: runtime.sessionId, taskDir });
   state.tree = resolved;
   if ("ok" in resolved) state.reportedProblems = [];
   return resolved;
+}
+
+/** Bind task and placement together for both tool calls and RPC launches. */
+export function placeChildLaunch(host: PiRuntimeHost, runtime: RuntimeContext, task: string, cwd?: unknown): { task: string; cwd: string } {
+  const root = runtime.configRoots.root(runtime.cwd);
+  if (!root) throw new Error("无法确认项目根目录，未启动子进程。");
+  const bound = bindLaunchTask(root, runtime.sessionId, task);
+  const tree = sessionTree(host, runtime, bound.taskDir);
+  if ("ok" in tree) throw new Error(tree.message);
+  if (cwd !== undefined) {
+    if (typeof cwd !== "string" || !isAbsolute(cwd) || !isLinkedWorktree(cwd, root)) {
+      throw new Error("显式 cwd 必须是本仓库的 linked worktree。");
+    }
+    if (bound.taskDir && realOrSelf(repoRoot(cwd)) !== realOrSelf(tree.path)) {
+      throw new Error("显式 cwd 与派单任务的 worktree 不一致。");
+    }
+  }
+  return { task: bound.task, cwd: typeof cwd === "string" ? cwd : tree.path };
 }
 
 /** Test seam: forget everything cached for this host. */
@@ -392,17 +413,26 @@ export const sessionWorktreeModule: WorkflowModule = {
       const input = event.input;
       if (!launchesChildren(input)) return undefined;
       const call = input as Record<string, unknown>;
-      // An explicit `cwd` is the caller's decision: this module places launches that
-      // did not say where they belong, it does not overrule one that said.
-      if (call.cwd !== undefined) return undefined;
-      const tree = sessionTree(host, runtime);
-      if ("ok" in tree) {
-        // A launch that cannot be placed is a launch this module did not authorize.
-        // Blocking here is the entire point: the alternative is a child writing into
-        // the shared checkout with nothing said about it.
-        return { block: true, reason: `${tree.message} 本次派单没有启动。` };
+      try {
+        const args = call.args as Record<string, any> | undefined;
+        const targets = Array.isArray(args?.tasks) ? args.tasks : [typeof args?.task === "string" ? args : call];
+        const fanout = call.workflow === "coworkflow.fanout";
+        let fanoutCwd: string | undefined;
+        for (const target of targets) {
+          const placed = placeChildLaunch(host, runtime, typeof target.task === "string" ? target.task : "", target.cwd ?? call.cwd);
+          if (typeof target.task === "string") target.task = placed.task;
+          if (fanout) {
+            if (fanoutCwd && fanoutCwd !== placed.cwd) throw new Error("coworkflow.fanout 的单元必须共用同一任务目录；跨任务请用 coworkflow_dispatch。");
+            fanoutCwd = placed.cwd;
+            call.cwd = placed.cwd;
+          } else {
+            target.cwd = placed.cwd;
+            if (target === args) call.cwd = placed.cwd;
+          }
+        }
+      } catch (error) {
+        return { block: true, reason: `${error instanceof Error ? error.message : String(error)} 本次派单没有启动。` };
       }
-      call.cwd = tree.path;
       return undefined;
     });
   },
@@ -448,17 +478,10 @@ export const sessionWorktreeModule: WorkflowModule = {
  * any condition is left exactly where it is — an unmerged branch is somebody's work,
  * and a session ending is not permission to delete it.
  */
-function cleanupOnSessionEnd(host: PiRuntimeHost, runtime: RuntimeContext): void {
-  const state = HOSTS.get(host);
+function cleanupOnSessionEnd(host: PiRuntimeHost, _runtime: RuntimeContext): void {
+  // Shutdown/reload does not imply that native async children have stopped.
+  // A synchronous hook cannot prove occupancy, so retain the checkout and branch.
   HOSTS.delete(host);
-  const tree = state?.tree;
-  if (tree === null || tree === undefined || "ok" in tree) return;
-  if (tree.source !== "session") return;
-  const inspected = inspectTree(tree);
-  if ("ok" in inspected || inspected.dirty || inspected.ahead > 0) return;
-  const main = mainCheckout(repoRoot(tree.path));
-  const removed = git(main, ["worktree", "remove", tree.path]);
-  if (removed.ok) git(main, ["branch", "-d", tree.branch]);
 }
 
 /**

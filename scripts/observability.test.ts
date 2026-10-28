@@ -350,6 +350,7 @@ test("facts: the panel shows the same bounded per-run summary, and an incomplete
 function tempProject(): string {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "coworkflow-observe-")));
   mkdirSync(join(root, taskRef), { recursive: true });
+  writeFileSync(join(root, taskRef, "task.json"), JSON.stringify({ id: "demo", status: "in_progress" }));
   mkdirSync(join(root, ".pi"));
   writeFileSync(join(root, ".pi", "Coworkflow.json"), JSON.stringify({ version: 1, modules: {} }));
   mkdirSync(join(root, SESSIONS_DIR), { recursive: true });

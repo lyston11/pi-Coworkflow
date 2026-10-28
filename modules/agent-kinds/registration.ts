@@ -47,6 +47,7 @@ import { loadSubagentsExport } from "../../core/subagents-workflow.ts";
 export interface KindDefinition {
   description: string;
   systemPrompt: string;
+  inheritProjectContext?: boolean;
   tools?: readonly string[];
   /**
    * The model this agent runs on: `provider/id`, a bare id, or either with a

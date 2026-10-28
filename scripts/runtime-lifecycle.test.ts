@@ -539,9 +539,11 @@ test("subagent-context: activate reuses its listener and reads the live runtime"
     "../modules/subagent-context/index.ts"
   );
   const handlers: ((event: any, ctx: any) => any)[] = [];
+  const byEvent: string[] = [];
   const host = {
     // A host that returns nothing: the documented unsubscribe is unavailable.
     on(_event: string, handler: (event: any, ctx: any) => any) {
+      byEvent.push(_event);
       handlers.push(handler);
       return undefined;
     },
@@ -565,7 +567,8 @@ test("subagent-context: activate reuses its listener and reads the live runtime"
   // A second activation in the same session (a repeated `/Coworkflow:start`)
   // must not attach a second handler.
   subagentContextModule.activate?.(host as never, runtime(false) as never);
-  assert.equal(handlers.length, 1);
+  assert.equal(handlers.length, 2, "one before_agent_start and one tool_call guard");
+  assert.deepEqual(byEvent, ["tool_call", "before_agent_start"]);
 
   const event = () => ({
     messageType: "user",
@@ -579,9 +582,9 @@ test("subagent-context: activate reuses its listener and reads the live runtime"
   // Session end cannot unsubscribe, so the record stays; the next activation
   // points that same listener at the new runtime.
   subagentContextModule.onSessionEnd?.(host as never, runtime(false) as never);
-  assert.equal(handlers.length, 1, "nothing was dropped for a host that cannot unsubscribe");
+  assert.equal(handlers.length, 2, "nothing was dropped for a host that cannot unsubscribe");
   subagentContextModule.activate?.(host as never, runtime(true) as never);
-  assert.equal(handlers.length, 1, "still one listener");
+  assert.equal(handlers.length, 2, "still one listener per event");
 
   const on = event();
   for (const handler of handlers) handler(on, { cwd: process.cwd() });

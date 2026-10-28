@@ -244,9 +244,8 @@ export function resolveFanout(
     script: buildFanoutScript({
       children,
       ...(focus ? { focus } : {}),
-      // With per-lane worktrees there is no shared directory to point at: upstream
-      // allocates each lane its own from a clean HEAD.
-      ...(!worktrees && prepared?.worktree ? { cwd: prepared.worktree } : {}),
+      // Inherit the enclosing launch cwd verified from this dispatch task. A
+      // prepared active task may have changed since the launch was bound.
       ...(worktrees ? { worktrees: true } : {}),
       ...(budgetOf(prepared) !== RUN_BUDGET_MS ? { budgetMs: budgetOf(prepared) } : {}),
     }),
@@ -361,7 +360,6 @@ type PlannedChild = FanoutChild & { refusal: string | null };
 interface FanoutScriptInput {
   children: PlannedChild[];
   focus?: string;
-  cwd?: string;
   /** Each lane gets its own upstream-managed worktree instead of sharing one. */
   worktrees?: boolean;
   /** The project's run budget, when it differs from the default. */
@@ -380,7 +378,6 @@ function buildFanoutScript(input: FanoutScriptInput): string {
   const focus = input.focus ? `\n本次扇出的共同要求（来自主会话）：${input.focus}\n` : "";
   return `
 const tasks = ${JSON.stringify(input.children)};
-const cwd = ${JSON.stringify(input.cwd ?? null)};
 const WORKTREES = ${input.worktrees === true ? "true" : "false"};
 const FANOUT_SCHEMA = ${JSON.stringify(FANOUT_SCHEMA)};
 const BUDGET_MS = ${input.budgetMs ?? RUN_BUDGET_MS};
@@ -444,7 +441,6 @@ function paramsFor(task) {
     },
     outputSchema: FANOUT_SCHEMA
   };
-  if (cwd !== null && WORKTREES !== true) params.cwd = cwd;
   return params;
 }
 

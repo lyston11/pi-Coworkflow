@@ -41,6 +41,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { posix } from "node:path";
 
 import type { PiRuntimeHost, RuntimeContext, Unsubscribe, WorkflowModule } from "../../core/module.ts";
 import { readConfig } from "../../core/config.ts";
@@ -50,7 +51,8 @@ import { RUN_BUDGET_MS, checkpointFor } from "../../core/subagents-workflow.ts";
 import { admitOne, agentKindsState, childModelFor, modelForKind, type AdmitFailure, type AdmitResult } from "../agent-kinds/index.ts";
 import { readKindDefinitions } from "../agent-kinds/definitions.ts";
 import { resolveKinds } from "../agent-kinds/defaults.ts";
-import { sessionTree } from "../session-worktree/index.ts";
+import { placeChildLaunch } from "../session-worktree/index.ts";
+import { bindLaunchTask } from "../../core/trellis.ts";
 
 /**
  * Why a unit is waiting.
@@ -320,9 +322,20 @@ function staleSubmission(startedBeforeReplacement = 0): Error {
  * `src/dispatch` and `src/dispatch/index.ts` collide, while `src/dispatch` and
  * `src/dispatch-extra` do not (a prefix comparison would say they collide).
  */
+function normalizedFile(value: unknown): string {
+  if (typeof value !== "string" || !value.trim() || value.includes("\0")) throw new Error("files 必须是非空的仓库相对路径。");
+  const path = value.trim().replace(/\\/g, "/");
+  if (path.startsWith("/") || /^[A-Za-z]:/.test(path)) throw new Error(`files 不接受绝对路径：${value}`);
+  const normalized = posix.normalize(path).replace(/\/+$/, "");
+  if (normalized === ".." || normalized.startsWith("../")) throw new Error(`files 不允许逃出工作区：${value}`);
+  return normalized;
+}
+
 export function overlapOf(left: readonly string[], right: readonly string[]): string | null {
+  left = left.map(normalizedFile);
+  right = right.map(normalizedFile);
   const covers = (declared: string, other: string): boolean =>
-    declared === other || other.startsWith(`${declared}/`) || declared.startsWith(`${other}/`);
+    declared === "." || other === "." || declared === other || other.startsWith(`${declared}/`) || declared.startsWith(`${other}/`);
   for (const mine of left) {
     for (const theirs of right) {
       if (covers(mine, theirs)) return mine.length <= theirs.length ? mine : theirs;
@@ -579,9 +592,10 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
     result.queued = waitingList();
     result.failed = failedList();
     result.unobserved = unobservedList();
-    const unknown = tasks.filter((task) => task.status === "running" && task.files === undefined).map((task) => task.key);
-    if (unknown.length > 1) {
-      Object.assign(result, { notice: `${unknown.join("、")} 同时在跑且都没有声明 files：它们共用一个工作区，写同一个文件会静默覆盖（git 不会报冲突）。下次给每个单元加 files（只读就写 files: []），重叠的会自动排队。` });
+    const writers = tasks.filter((task) => (task.status === "running" || task.status === "unobserved") && task.worktree !== true && (task.files === undefined || task.files.length > 0));
+    const unknown = writers.filter((task) => task.files === undefined).map((task) => task.key);
+    if (unknown.length > 0 && writers.length > 1) {
+      result.notice = `${unknown.join("、")} 没有声明 files，且有其它可能写入的单元并行：它们共用一个工作区，写同一个文件会静默覆盖（git 不会报冲突）。请声明 files；只读写 files: []。`;
     }
     return result;
   }
@@ -620,12 +634,11 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
       const files: string[] = [];
       // `files: []` is a declaration, not an omission: it says this unit writes nothing,
       // which is what a reader/auditor kind needs to run beside writers.
+      if (entry.files !== undefined && !Array.isArray(entry.files)) throw new Error(`${key} 的 files 必须是数组。`);
       const declaredFiles = Array.isArray(entry.files);
       if (declaredFiles) {
         for (const value of entry.files) {
-          if (typeof value !== "string") continue;
-          const normalised = value.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
-          if (normalised !== "") files.push(normalised);
+          files.push(normalizedFile(value));
         }
       }
       planned.push({
@@ -833,17 +846,17 @@ async function spawnViaRpc(
   // Where this unit belongs, resolved only when the project asked for session isolation:
   // the module is a gate, so a project that never enabled it keeps the previous behaviour
   // (children run where the parent runs) instead of being policed by an upgrade.
-  const tree = runtime.control.moduleEnabled("session-worktree") ? sessionTree(host, runtime) : null;
-  if (tree !== null && "ok" in tree) {
+  let placed: { cwd?: string; task: string } = { task: request.task };
+  try {
+    if (runtime.control.moduleEnabled("session-worktree")) placed = placeChildLaunch(host, runtime, request.task);
+  } catch (error) {
     bridge.release(launchId);
-    return { ok: false, reason: tree.message, disposition: "gated" };
+    return { ok: false, reason: error instanceof Error ? error.message : String(error), disposition: "gated" };
   }
-  const placed = tree !== null && !("ok" in tree) ? { cwd: tree.path } : {};
 
   const reply = await bridge.client.spawn(
     {
       agent: request.agent,
-      task: request.task,
       context: "fresh",
       ...placed,
       // Resolved by the caller: an RPC spawn never passes through the `tool_call` hook,
@@ -1114,7 +1127,9 @@ export const dispatchModule: WorkflowModule = {
             for (const unit of (params?.tasks ?? []) as DispatchTaskInput[]) {
               const decided = modelForKind(unit.kind, kinds, runtime, registry);
               if (decided !== null && "problem" in decided) return text(decided.problem, true);
-              tasks.push(decided === null ? unit : { ...unit, model: decided.model });
+              if (!root) throw new Error("无法确认项目根目录，未提交派单。");
+              const bound = bindLaunchTask(root, runtime.sessionId, unit.task);
+              tasks.push({ ...unit, task: bound.task, ...(decided === null ? {} : { model: decided.model }) });
             }
             const result = await queue.submit({
               tasks,

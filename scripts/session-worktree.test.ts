@@ -131,7 +131,7 @@ test("resolve: a validated task worktree wins over a session tree", () => {
   } finally { h.close(); }
 });
 
-test("resolve: an invalid task worktree falls back to a session tree rather than the main checkout", () => {
+test("resolve: an invalid task worktree refuses launch instead of changing task placement", () => {
   const h = fixture();
   try {
     const taskDir = join(h.root, ".trellis", "tasks", "10-01-broken");
@@ -139,8 +139,7 @@ test("resolve: an invalid task worktree falls back to a session tree rather than
     // Recorded worktree does not exist: the task is broken, the isolation still is not.
     writeFileSync(join(taskDir, "task.json"), JSON.stringify({ worktree_path: join(h.root, "gone"), branch: "feat/x" }));
     const resolved = resolveSessionTree({ repo: h.root, cwd: h.root, sessionId: "session-a", taskDir });
-    assert.ok(!("ok" in resolved));
-    assert.equal(resolved.source, "session");
+    assert.match(failureOf(resolved), /不存在|校验失败/);
   } finally { h.close(); }
 });
 
@@ -348,8 +347,7 @@ test("injection: one placement for every launch shape, and none for management c
     assert.equal("cwd" in managed.input, false, "a management call is not rewritten");
 
     const explicit: any = { toolName: "subagent", input: { agent: "worker", task: "x", cwd: "/somewhere/else" } };
-    call(explicit);
-    assert.equal(explicit.input.cwd, "/somewhere/else", "an explicit cwd is the caller's decision");
+    assert.equal(call(explicit)?.block, true, "a foreign explicit cwd is refused");
 
     const other: any = { toolName: "read", input: { path: "x" } };
     call(other);
@@ -358,7 +356,7 @@ test("injection: one placement for every launch shape, and none for management c
   } finally { h.close(); }
 });
 
-test("session end: an unused tree is removed, a tree with commits is kept", () => {
+test("session end: even clean trees are retained because background occupancy is unknown", () => {
   const h = fixture();
   try {
     const host = hostOf();
@@ -366,8 +364,8 @@ test("session end: an unused tree is removed, a tree with commits is kept", () =
     const tree = sessionTree(host, runtime);
     assert.ok(!("ok" in tree));
     sessionWorktreeModule.onSessionEnd?.(host, runtime);
-    assert.equal(existsSync(tree.path), false, "no commits, so nothing to keep");
-    assert.throws(() => h.git(["rev-parse", "--verify", "--quiet", `refs/heads/${tree.branch}`]), "and its branch is deleted");
+    assert.ok(existsSync(tree.path), "a clean tree may still be occupied by a child");
+    assert.ok(h.git(["rev-parse", "--verify", "--quiet", `refs/heads/${tree.branch}`]));
 
     const second = sessionTree(host, runtimeOf(h.root, "session-b"));
     assert.ok(!("ok" in second));

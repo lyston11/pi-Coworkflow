@@ -135,8 +135,9 @@ def main() -> int:
         existing = worktrees[worktree_path]
         if existing is None:
             return fail(f"{worktree_path} is registered as a detached worktree")
-        print(f"[auto-worktree] {worktree_path} already exists on {existing}")
-        return record(task_json, data, existing, worktree_path)
+        if existing != target_branch:
+            return fail(f"{worktree_path} belongs to {existing}, expected {target_branch}; refusing to adopt another branch")
+        return record(task_json, data, target_branch, worktree_path)
 
     if worktree_path.exists():
         return fail(

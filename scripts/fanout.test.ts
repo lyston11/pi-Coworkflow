@@ -240,7 +240,7 @@ test("fanout: three tasks start together — the third starts before the first f
     const call = params[key]!;
     assert.equal(call.context, "fresh");
     assert.equal(call.worktree, false);
-    assert.equal(call.cwd, TWD, "children run in the host-verified worktree");
+    assert.equal(call.cwd, undefined, "the host places the launch; the script must not hard-code a tree");
     assert.equal((call.acceptance as Record<string, unknown>).level, "checked");
     assert.equal((call.outputSchema as Record<string, unknown>).type, "object");
     assert.equal(call.async, undefined);
@@ -628,10 +628,11 @@ test("fanout: worktrees gives every lane its own tree and drops the shared cwd",
 
   const parallel = script(true);
   assert.match(parallel, /const WORKTREES = true;/);
-  // No shared directory to point at: each lane gets its own from a clean HEAD, so the
-  // script has no cwd to hand out at all.
-  assert.match(parallel, /const cwd = null;/, "a shared cwd is exactly what would serialise them");
-  assert.doesNotMatch(shared, /const cwd = null;/, "the shared-tree case still points at the task worktree");
+  // Neither case hard-codes a directory: with per-lane worktrees upstream allocates
+  // each lane its own, and the shared case inherits the cwd the host placed the
+  // launch in (the task bound at dispatch time, not the parent's current pointer).
+  assert.doesNotMatch(parallel, /const cwd =/, "a shared cwd is exactly what would serialise them");
+  assert.doesNotMatch(shared, /const cwd =/, "the shared tree comes from the placed launch, not the script");
 
   // The flag is validated like every other argument.
   const bad = resolveFanout(

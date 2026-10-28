@@ -305,6 +305,7 @@ function harness(): Harness {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "coworkflow-control-")));
   const taskRef = ".trellis/tasks/demo";
   mkdirSync(join(root, taskRef), { recursive: true });
+  writeFileSync(join(root, taskRef, "task.json"), JSON.stringify({ id: "demo", status: "in_progress" }));
   mkdirSync(join(root, ".pi"), { recursive: true });
   writeFileSync(join(root, ".pi", "Coworkflow.json"),
     JSON.stringify({ version: 1, modules: { "lane-worktree": true, subagents: true } }));
