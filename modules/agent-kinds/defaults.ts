@@ -55,13 +55,21 @@ export interface BuiltinKind {
 }
 
 /**
- * The kinds this package ships — one per Trellis role, so a project that adopts
- * kinds no longer needs the `trellis-*` role agents at all.
+ * The kinds this package ships — one per **purpose** of delegated work, so a
+ * project that adopts kinds no longer needs the `trellis-*` role agents at all.
  *
- * `executor` is on by default because it is the one that replaces what a project
- * already does by hand; `auditor` and `researcher` are off because they are the
- * kinds that can *refuse* their own scope or spend unbounded time, and a project
- * must opt into them rather than discover one.
+ * Purpose, not role: there are three Trellis roles but more than three reasons to
+ * delegate, and the two are different axes. A role decides which context a child
+ * receives (`implement` / `check` / `research`, declared in the asset frontmatter);
+ * a kind decides what the child is for and therefore which model it should run on.
+ * Several kinds may share a role — `executor` and `worker` are both `implement`,
+ * `planner` and `researcher` are both `research` — and the role is what makes a
+ * second injection path unnecessary: context follows the role, never the kind name.
+ *
+ * All shipped kinds are on by default: a kind is a capability the project may use,
+ * and `/Coworkflow:settings` is where one is switched off. What distinguishes them
+ * is the model each purpose deserves, which the project pins in `agentKinds.<kind>`
+ * — never here, because a built-in model would override a project's own choice.
  */
 /**
  * Re-exported from `core/config.ts`, where it lives so a module can quote it without importing
@@ -79,6 +87,13 @@ export const BUILTIN_KINDS: readonly BuiltinKind[] = [
     defaults: { enabled: true, maxConcurrent: DEFAULT_MAX_CONCURRENT },
   },
   {
+    kind: "planner",
+    label: "规划者",
+    description: "Coworkflow 规划者：针对难点给出备选方案与取舍，不实施、不替主会话决定",
+    asset: "./assets/planner.md",
+    defaults: { enabled: true, maxConcurrent: DEFAULT_MAX_CONCURRENT },
+  },
+  {
     kind: "auditor",
     label: "审计者",
     description: "Coworkflow 审计者：只读复核一处改动，给出可复现的阻断项",
@@ -90,6 +105,13 @@ export const BUILTIN_KINDS: readonly BuiltinKind[] = [
     label: "调研者",
     description: "Coworkflow 调研者：查清一个问题并给出有出处、可复现的答案",
     asset: "./assets/researcher.md",
+    defaults: { enabled: true, maxConcurrent: DEFAULT_MAX_CONCURRENT },
+  },
+  {
+    kind: "worker",
+    label: "分工执行者",
+    description: "Coworkflow 分工执行者：只做边界清楚、结果可独立检查的一件工作",
+    asset: "./assets/worker.md",
     defaults: { enabled: true, maxConcurrent: DEFAULT_MAX_CONCURRENT },
   },
 ];

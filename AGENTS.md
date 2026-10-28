@@ -86,15 +86,19 @@ Trellis 的 Pi 步骤与本节采用同一策略：主会话读相关规范、�
 
 本项目装了 `agent-kinds` 模块后，可派的子 agent 类型（kind）由**本会话的注册状态**决定，而它会变：项目可能关掉某类、改它的上限，注册也可能失败。所以本文件**不写死清单**——这一会话能派哪些 agent，以 `/Coworkflow:status` 的 `agent-kinds` 行为准（每个已注册 kind 一行：`= agent-kinds: cw-executor（kind executor）已注册 · 模型 …`），或以 `subagent({ action: "list" })` 的实际结果为准。
 
-**稳定的是对应关系，不是可用性。** 每个 kind 与 Trellis 的一个角色一一对应，因此 `cw-*` 拿到同一份角色上下文，并额外经过本项目的开关与并发上限：
+**稳定的是对应关系，不是可用性。** kind 按**用途**划分，Trellis 角色只有三个，所以多个 kind 可以共用一个角色：角色决定子 agent 拿到哪份上下文，kind 决定它是做什么的、该用哪个模型。
 
-| kind | agent | Trellis 角色 |
-|---|---|---|
-| 执行者 | `cw-executor` | implement |
-| 审计者 | `cw-auditor` | check |
-| 调研者 | `cw-researcher` | research |
+| kind | agent | 用途 | Trellis 角色 |
+|---|---|---|---|
+| 执行者 | `cw-executor` | 主实现：做完一件已定义的工作 | implement |
+| 规划者 | `cw-planner` | 难点上的备选方案与取舍，只建议不实施 | research |
+| 审计者 | `cw-auditor` | 只读复核一处改动，给出可复现的阻断项 | check |
+| 调研者 | `cw-researcher` | 查清一个问题，给出有出处、可复现的答案 | research |
+| 分工执行者 | `cw-worker` | 边界清楚、结果可独立检查的重复性或耗时工作 | implement |
 
-这是本包随附的三个默认 kind：默认都开、默认上限 5，实际值由 `/Coworkflow:settings` 的面板决定。**一个 kind 就是一份 markdown**：`<项目>/.pi/Coworkflow/agents/<kind>.md`，frontmatter 声明它是什么（label / agent / role / description / model / thinking / maxConcurrent / enabled），正文就是它的系统提示词（职能）。所以你可以改这三个的职能与名字，也可以新增自己的 kind；改完下一次派单就生效，不用重启。用 `pi-coworkflow kind scaffold|export|set --from|check` 操作它，或在面板/`/Coworkflow:kind` 里改。
+这是本包随附的五个默认 kind：默认都开、默认上限 5，实际值由 `/Coworkflow:settings` 的面板决定。**一个 kind 就是一份 markdown**：`<项目>/.pi/Coworkflow/agents/<kind>.md`，frontmatter 声明它是什么（label / agent / role / description / model / thinking / maxConcurrent / enabled），正文就是它的系统提示词（职能）。所以你可以改这五个的职能与名字，也可以新增自己的 kind；改完下一次派单就生效，不用重启。用 `pi-coworkflow kind scaffold|export|set --from|check` 操作它，或在面板/`/Coworkflow:kind` 里改。
+
+**模型按用途分别配**，写在 `.pi/Coworkflow.json` 的 `agentKinds.<kind>.model`，不在代码或提示词里：便宜且可检查的活可以配低成本模型，规划与审查这类需要判断的活配更强的模型。耗时长短不是选模型的依据，难度和可验证性才是。
 
 `trellis-implement` / `trellis-check` / `trellis-research` 不是本项目的推荐派单目标：`cw-*` 拿到的是同一份角色上下文，但会经过本项目的开关与数量限制，而 `trellis-*` 绕开了这两道闸。这个说法的前提是**该 kind 在本会话可用**；不可用时的退路见下一节，不是退回 `trellis-*`。
 
@@ -129,7 +133,7 @@ Trellis 的 Pi 步骤与本节采用同一策略：主会话读相关规范、�
 - **要求「一次探针」而不是「逐条验证」。** 让子 agent 写一个脚本把所有结论一次跑完并打印一张表；逐条各跑一次命令时，每个工具调用都是一次完整往返，几十条就能吃掉整个预算——实测同一类复核任务，逐条验证用掉 23 分钟 / 160 次调用，一次探针只用 5 分钟 / 60 次。
 - **派单边界**：实现任务必须可独立验证；咨询任务必须有具体问题、依据和交付要求。子 agent 可以提供规划或审查建议，不自行替主会话作最终决定或扩大实施范围。
 - **验收边界**：主会话核对实际产物、验收条件和验证证据；仅补足缺失检查，或在集成改变被测代码时重跑受影响检查。发现偏差就修正，不能直接把子 agent 的结论当事实，也不为证明分工有效而重复全量验证。
-- 子会话**不继承**主会话上下文：派单时显式写 `context: "fresh"`（三个 Trellis 角色 agent 也已声明 `defaultContext: fresh`；若你全局配了 `defaultSubagentContext: "fork"`，它会被覆盖，必须显式 `fresh`）。它拿到的 Trellis 上下文由 `pi-Coworkflow` 的 `subagent-context` 模块按**角色**注入：`implement` 拿到 `implement.jsonl` / `check` 拿到 `check.jsonl` / `research` 拿到 spec 目录树，加上 prd.md、design.md、implement.md；字节预算沿用 `.trellis/config.yaml` 的 `context_injection`。 **注入按角色，不按 agent 名**：`cw-executor` → implement、`cw-auditor` → check、`cw-researcher` → research 来自 kind 表；任何其它 agent 只要标记成这三个角色之一（`<!-- trellis-agent: <role> -->`）也拿到对应那一份；`role: none` 的 kind 与未标记的 agent 拿到的是子 agent 约定（不含角色上下文），不是什么都不给。
+- 子会话**不继承**主会话上下文：派单时显式写 `context: "fresh"`（kind 的 agent 定义已声明 `defaultContext: fresh`；若你全局配了 `defaultSubagentContext: "fork"`，它会被覆盖，必须显式 `fresh`）。它拿到的 Trellis 上下文由 `pi-Coworkflow` 的 `subagent-context` 模块按**角色**注入：`implement` 拿到 `implement.jsonl` / `check` 拿到 `check.jsonl` / `research` 拿到 spec 目录树，加上 prd.md、design.md、implement.md；字节预算沿用 `.trellis/config.yaml` 的 `context_injection`。 **注入按角色，不按 agent 名**：`cw-executor` 与 `cw-worker` → implement、`cw-auditor` → check、`cw-planner` 与 `cw-researcher` → research，都来自各自定义文件里的 `role:`；任何其它 agent 只要标记成这三个角色之一（`<!-- trellis-agent: <role> -->`）也拿到对应那一份；`role: none` 的 kind 与未标记的 agent 拿到的是子 agent 约定（不含角色上下文），不是什么都不给。
 - 因此派单提示词**首行必须是 `Active task: <任务目录>`**（Trellis 既有的派单协议）——注入靠它定位任务。这里的 `<任务目录>` 是占位符：**占位符本身不算引用**（注入会忽略它并回退到本会话的任务指针），但一个形状像任务路径、实际不存在的引用（`.trellis/tasks/typo`）会被当成无效引用报出来，不会悄悄换成父会话的任务。角色按两级识别：① **会话名里的 agent 名**（`subagent-<agent>-<runId>-<i>` 或 `<agent>: <task>` 都含 agent 名）按 kind 表解析成角色，改名后的 kind 也一样；② agent 定义或派单提示词里的 `<!-- trellis-agent: <role> -->` 标记——但 kind 自己写了 `role:` 就以它为准。所以想让任意 agent（例如 `worker`）拿到 implement 那份上下文，就在它的定义里加一行 `<!-- trellis-agent: implement -->`。
 - 并行派单不要猜 API：`subagent({ workflow: "parallel", args: { tasks: [...] } })` 的每个 task **只接受 `agent` 和 `task`**（带 `output` 会被拒）；多步/带产出的 workflow 必须把 JS 脚本写成文件再用 `workflow: "<路径>"`，`workflow: true` 只在同一回复里写了 ```js 代码块时有效。先 `subagent({ action: "validate", workflow: "<路径>" })` 再 `async: true` 派发。
 - 已决定委派的单件工作用单次 `subagent` 即可；批量交给队列。只有需要 workflow 的独立产物/验收契约时才用 `coworkflow.fanout`，写代码的隔离 lane 传 `worktrees: true`。

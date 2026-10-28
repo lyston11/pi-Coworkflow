@@ -93,18 +93,20 @@ test("workflow: the Pi blocks name kinds, never the trellis-* role agents", () =
       "a Pi block still mentions a trellis-* role agent instead of its kind",
     );
   }
-  for (const kind of ["cw-executor", "cw-auditor", "cw-researcher"]) {
-    assert.match(piText, new RegExp(kind), `the Pi blocks never dispatch ${kind}`);
-  }
-  assert.match(piText, /\/Coworkflow:status/, "the kind names must be pointed at /Coworkflow:status");
+  // The Pi blocks no longer pin a kind by name: the main session implements and checks
+  // directly, and optional delegation names "an available project kind". What must hold
+  // is that they never name a retired agent, and that they point at the live list.
+  assert.doesNotMatch(piText, /cw-(executor|auditor|researcher|planner|worker)/, "no kind is hardcoded in the Pi steps");
+  assert.match(piText, /available project kind/, "optional delegation names the configured kinds, not a fixed one");
+  assert.match(piText, /\/Coworkflow:status/, "the live kind list is where the names come from");
 });
 
-test("workflow: the Pi implement/check steps dispatch a kind and leave acceptance to the main session", () => {
+test("workflow: the Pi implement/check steps default to the main session and keep acceptance there", () => {
   const piText = blocks.pi.join("\n");
-  assert.match(piText, /Dispatch the implementation to the execute kind/);
-  assert.match(piText, /Dispatch the quality check to the audit kind/);
-  assert.match(piText, /Acceptance stays in the main session/);
-  assert.match(piText, /A verdict is evidence, not acceptance/);
+  assert.match(piText, /Implement directly in the main session by default/);
+  assert.match(piText, /Check the work directly in the main session by default/);
+  assert.match(piText, /Keep final acceptance, commits and integration in the main session/);
+  assert.match(piText, /A child's verdict is evidence, not final acceptance/);
   // The old inline instruction told the main session to do the work itself.
   assert.doesNotMatch(piText, /^1\. Load the `trellis-before-dev` skill/m);
   assert.doesNotMatch(piText, /^\d\. Implement the code per reviewed artifacts$/m);

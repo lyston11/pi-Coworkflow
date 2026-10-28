@@ -58,20 +58,25 @@ pi install /path/to/pi-Coworkflow                         # 本地开发
 
 ## 子 agent 类型（kind）
 
-这是这套工作流的中心。一个 kind = 一份 agent 定义 + 两条项目策略（是否启用、同时上限）。
+这是这套工作流的中心。一个 kind = 一份 agent 定义 + 项目策略（是否启用、同时上限、可选的模型与思考等级）。
 
-| kind | agent | 对应的 Trellis 角色 | 默认 |
-|---|---|---|---|
-| 执行者 | `cw-executor` | implement | 开，上限 5 |
-| 审计者 | `cw-auditor` | check | 开，上限 5 |
-| 调研者 | `cw-researcher` | research | 开，上限 5 |
+**kind 按用途划分，不按角色划分。** Trellis 只有三个角色（implement / check / research），
+而委派的理由多于三个，所以多个 kind 可以共用一个角色：**角色决定子 agent 拿到哪份上下文
+（prd / design / implement / 对应 jsonl 或 spec 树），kind 决定它是做什么的、该用哪个模型。**
 
-**一类一种角色，覆盖 Trellis 原有的三个角色 agent。** `cw-*` 拿到的是同一份角色上下文注入
-（prd / design / implement / 对应 jsonl 或 spec 树），但额外经过本项目的开关与数量限制。
+| kind | agent | 用途 | 角色 | 默认 |
+|---|---|---|---|---|
+| 执行者 | `cw-executor` | 主实现：做完一件已定义的工作 | implement | 开，上限 5 |
+| 规划者 | `cw-planner` | 难点上的备选方案与取舍，只建议不实施 | research | 开，上限 5 |
+| 审计者 | `cw-auditor` | 只读复核一处改动，给出可复现的阻断项 | check | 开，上限 5 |
+| 调研者 | `cw-researcher` | 查清一个问题，给出有出处、可复现的答案 | research | 开，上限 5 |
+| 分工执行者 | `cw-worker` | 边界清楚、结果可独立检查的重复性或耗时工作 | implement | 开，上限 5 |
+
+`cw-*` 拿到的是同一份角色上下文注入，但额外经过本项目的开关与数量限制。
 `trellis-implement` / `trellis-check` / `trellis-research` 在采用本模块后**不再是推荐目标**——
 它们绕开这两道闸。
 
-**默认值不是本包定的上限，是给项目改的起点**：三种 kind 默认都开、都从 **5** 起，具体多少由
+**默认值不是本包定的上限，是给项目改的起点**：五种 kind 默认都开、都从 **5** 起，具体多少由
 `/Coworkflow:settings` 决定。上限的意义是「别一次铺开太多」，不是「只准有一个审计者」——按 kind 定死
 不同的小数字等于替主会话做了拆分决定，而那是它的判断。要收紧就在面板里改，或直接把某个 kind 关掉。
 
@@ -90,8 +95,11 @@ subagent({ agent: "cw-executor", async: true, context: "fresh",
 
 ```
   子 agent 类型
-  执行者 cw-executor   [x] 开 · 上限 5   已注册到 pi-subagents
-  审计者 cw-auditor    [x] 开 · 上限 5   已注册到 pi-subagents
+  执行者 cw-executor        [x] 开 · 上限 5   已注册到 pi-subagents
+  规划者 cw-planner         [x] 开 · 上限 5   已注册到 pi-subagents
+  审计者 cw-auditor         [x] 开 · 上限 5   已注册到 pi-subagents
+  调研者 cw-researcher      [x] 开 · 上限 5   已注册到 pi-subagents
+  分工执行者 cw-worker      [x] 开 · 上限 5   已注册到 pi-subagents
 ```
 
 `Space` 开关、`←→` 调上限、`Enter` 输数字。**当场生效，无需重启**；改两次等于没改，
@@ -99,11 +107,11 @@ subagent({ agent: "cw-executor", async: true, context: "fresh",
 
 ### 每个 kind 自己的模型
 
-三种 kind 通常不该跑同一个模型：执行者适合便宜的，审计者适合强的。在 `/Comodels` 里每个 kind 各有一页：
+**每个用途配自己的模型，这正是 kind 存在的理由**：明确且可检查的活可以用低成本模型，规划建议与独立审查需要判断力、配更强的模型。耗时长短不是选模型的依据，难度和可验证性才是。在 `/Comodels` 里每个 kind 各有一页：
 
 ```
- 主会话   子 agent（默认）   [执行者 cw-executor]   审计者 cw-auditor   调研者 cw-researcher
- 当前：p/cheap · high · 固定 p/cheap
+ 主会话   子 agent（默认）   [执行者 cw-executor]   规划者 cw-planner   审计者 cw-auditor
+ 当前：p/strong · high · 固定 p/strong
 ```
 
 字段写在 `.pi/Coworkflow.json` 的 `agentKinds.<kind>.model` / `.thinking`，**写进 agent 定义本身**，
@@ -567,8 +575,8 @@ pi-Coworkflow/
 │   │   ├── registration.ts        # pi-subagents 运行时 agent 契约（加载/注册/dispose）
 │   │   ├── definitions.ts         # 项目定义文件（.pi/Coworkflow/agents/<kind>.md）的读写与校验
 │   │   ├── port.ts                # 公开请求端口 coworkflow:kind:v1（另一个入口，同一个写入者）
-│   │   ├── defaults.ts            # 随附 kind 表（含 kind → Trellis 角色）、默认值与资产加载
-│   │   └── assets/{executor,auditor,researcher}.md
+│   │   ├── defaults.ts            # 随附 kind 表（用途 → 角色）、默认值与资产加载
+│   │   └── assets/{executor,planner,auditor,researcher,worker}.md
 │   ├── lane-worktree/  capacity/
 │   └── panel/{index,shared,settings,models}.ts
 └── scripts/                       # node --test 套件 + cli.ts（终端入口）+ verify.ts（手工探针）

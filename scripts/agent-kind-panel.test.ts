@@ -487,6 +487,15 @@ async function openPanel(
   return panel;
 }
 
+/** Walk the computed page list until the given kind's page owns the cursor. */
+function focusKind(panel: ModelPanel, kind: string): void {
+  for (let step = 0; step < panel.pages().length; step += 1) {
+    if (panel.currentTab() === kindTab(kind)) return;
+    panel.handleInput("\t");
+  }
+  assert.fail(`no page for ${kind}`);
+}
+
 /** Poll until `check` holds: applying a model awaits a re-registration. */
 async function until(check: () => boolean, what: string): Promise<void> {
   for (let tick = 0; tick < 600; tick += 1) {
@@ -519,16 +528,17 @@ test("Comodels: a page per kind, applying writes the config and re-registers tha
       "主会话",
       "子 agent（默认）",
       "执行者 cw-executor",
+      "规划者 cw-planner",
       "审计者 cw-auditor",
       "调研者 cw-researcher",
+      "分工执行者 cw-worker",
     ]);
     assert.equal(panel.currentTab(), "session");
 
     // Tab walks the computed list; three presses land on the auditor's own page.
     panel.handleInput("\t");
     assert.equal(panel.currentTab(), "subagent");
-    panel.handleInput("\t");
-    panel.handleInput("\t");
+    focusKind(panel, "auditor");
     assert.equal(panel.currentTab(), "kind:auditor");
     assert.match(panel.render(160).join("\n"), /\[审计者 cw-auditor\]/);
 
@@ -569,8 +579,9 @@ test("Comodels: a page per kind, applying writes the config and re-registers tha
     assert.match(rendered, /xhigh/, "and offers the inherited model's levels again");
 
     // The default page keeps writing `subagents.*` for agents that are not kinds.
-    panel.handleInput("\t"); // kind:auditor → kind:researcher
-    panel.handleInput("\t"); // → session
+    panel.handleInput("\t"); // kind:auditor → the next kind page
+    panel.handleInput("\t");
+    panel.handleInput("\t"); // past the remaining kind pages → session
     panel.handleInput("\t"); // → subagent
     assert.equal(panel.currentTab(), "subagent");
     panel.handleInput("\x1b[B"); // 继承 → p/strong
@@ -604,10 +615,7 @@ test("Comodels: a disabled kind keeps its page and keeps the model it had stored
     assert.ok(page, "a disabled kind still has a page");
     assert.equal(page.note, "已关闭");
 
-    panel.handleInput("\t");
-    panel.handleInput("\t");
-    panel.handleInput("\t");
-    panel.handleInput("\t");
+    focusKind(panel, "researcher");
     assert.equal(panel.currentTab(), "kind:researcher");
     const rendered = panel.render(160).join("\n");
     assert.match(rendered, /已关闭/, "the page says the kind is off");
@@ -711,9 +719,7 @@ test("Comodels: Enter with the cursor untouched writes back the stored pin, neve
     await until(() => (registryView?.listRuntimeAgentConfigs(pi).length ?? 0) > 0, "the kinds to register");
     const panel = await openPanel(loaded, root);
 
-    panel.handleInput("\t");
-    panel.handleInput("\t");
-    panel.handleInput("\t");
+    focusKind(panel, "auditor");
     assert.equal(panel.currentTab(), "kind:auditor");
 
     // Exactly one row is current and it is the stored pin's own row, so the cursor
@@ -766,9 +772,7 @@ test("Comodels: a pin whose id carries a non-level colon suffix resolves and sur
       { model: { provider: "ollama", id: "llama3:latest", name: "Llama 3", reasoning: false } },
     ]);
 
-    panel.handleInput("\t");
-    panel.handleInput("\t");
-    panel.handleInput("\t");
+    focusKind(panel, "auditor");
     assert.equal(panel.currentTab(), "kind:auditor");
 
     const rows = panel.currentRows();
@@ -814,9 +818,7 @@ test("Comodels: with agent-kinds off the kind pages say nothing is registered, a
     const pages = panel.pages();
     assert.equal(pages.some((page) => page.tab === kindTab("auditor")), true);
     assert.equal(pages.find((page) => page.tab === kindTab("auditor"))?.note, "本会话未启用");
-    panel.handleInput("\t");
-    panel.handleInput("\t");
-    panel.handleInput("\t");
+    focusKind(panel, "auditor");
     assert.equal(panel.currentTab(), "kind:auditor");
     const rendered = panel.render(160).join("\n");
     assert.match(rendered, /本会话未启用 agent-kinds，未注册任何 kind/);
@@ -833,9 +835,7 @@ test("Comodels: with agent-kinds off the kind pages say nothing is registered, a
     await loaded.control.setAgentKind("auditor", { model: "typo/does-not-exist" });
     const before = readFileSync(join(root, ".pi", "Coworkflow.json"), "utf-8");
     const reopened = await openPanel(loaded, root);
-    reopened.handleInput("\t");
-    reopened.handleInput("\t");
-    reopened.handleInput("\t");
+    focusKind(reopened, "auditor");
     assert.equal(reopened.currentTab(), "kind:auditor");
     assert.equal(reopened.currentRows().filter((row) => row.current).length, 1);
     reopened.handleInput("\r");
@@ -871,9 +871,7 @@ test("Comodels: an untouched Enter on the thinking column keeps a level the page
     await until(() => (registryView?.listRuntimeAgentConfigs(pi).length ?? 0) > 0, "the kinds to register");
     const panel = await openPanel(loaded, root);
 
-    panel.handleInput("\t");
-    panel.handleInput("\t");
-    panel.handleInput("\t");
+    focusKind(panel, "auditor");
     assert.equal(panel.currentTab(), "kind:auditor");
     panel.handleInput("\x1b[C"); // into the thinking column
 

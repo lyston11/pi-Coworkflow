@@ -128,7 +128,7 @@ test("fanout: args are validated as strictly as the implement/review resource", 
 });
 
 test("fanout: a kind this package does not ship is rejected, naming the kinds that exist", () => {
-  for (const kind of ["worker", "trellis-implement", "cw-executor", "reviewer"]) {
+  for (const kind of ["tidy", "trellis-implement", "cw-executor", "reviewer"]) {
     const expanded = expand([{ kind, task: "x" }]);
     assert.equal(typeof expanded, "object", kind);
     if (typeof expanded === "object") {

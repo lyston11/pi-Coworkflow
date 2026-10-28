@@ -19,7 +19,28 @@
   "agentKinds": {
     "executor": {
       "enabled": true,
-      "maxConcurrent": 5
+      "maxConcurrent": 5,
+      "model": "cpa/gpt-6.1-terra"
+    },
+    "planner": {
+      "enabled": true,
+      "maxConcurrent": 5,
+      "model": "cpa/gpt-6-astra"
+    },
+    "auditor": {
+      "enabled": true,
+      "maxConcurrent": 5,
+      "model": "cpa/gpt-6.1-sol"
+    },
+    "researcher": {
+      "enabled": true,
+      "maxConcurrent": 5,
+      "model": "buddy2api/deepseek-v4.1-flash"
+    },
+    "worker": {
+      "enabled": true,
+      "maxConcurrent": 5,
+      "model": "buddy2api/deepseek-v4.1-flash"
     }
   }
 }

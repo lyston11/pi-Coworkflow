@@ -240,8 +240,10 @@ test("kinds config: unknown kinds and unreadable fields are preserved as the pro
       resolved.map((entry) => [entry.kind, entry.agent, entry.enabled, entry.maxConcurrent]),
       [
         ["executor", "cw-executor", false, 5],
+        ["planner", "cw-planner", true, 5],
         ["auditor", "cw-auditor", true, 5],
         ["researcher", "cw-researcher", true, 5],
+        ["worker", "cw-worker", true, 5],
       ],
       "the built-in defaults fill what the project did not say",
     );
@@ -251,16 +253,34 @@ test("kinds config: unknown kinds and unreadable fields are preserved as the pro
 });
 
 test("kinds table: names are cw- prefixed, map to Trellis roles, and prompts are assets not strings", () => {
-  // One kind per Trellis role: adopting kinds means the `trellis-*` role agents are
-  // no longer needed for any of the three. The role itself is declared in the asset's
-  // frontmatter and read back through `kindRole` — never in this table.
-  assert.deepEqual(builtinAgentNames(), ["cw-executor", "cw-auditor", "cw-researcher"]);
+  // Kinds are purposes, roles are context. Adopting kinds still means the `trellis-*`
+  // role agents are no longer needed for any of the three roles, but several kinds may
+  // share one role: the role is declared in the asset's frontmatter and read back
+  // through `kindRole` — never in this table, and never once per kind name.
+  assert.deepEqual(builtinAgentNames(), [
+    "cw-executor",
+    "cw-planner",
+    "cw-auditor",
+    "cw-researcher",
+    "cw-worker",
+  ]);
   assert.deepEqual(
     BUILTIN_KINDS.map((entry) => [entry.kind, "role" in entry]),
-    [["executor", false], ["auditor", false], ["researcher", false]],
+    [["executor", false], ["planner", false], ["auditor", false], ["researcher", false], ["worker", false]],
     "the table declares no role of its own",
   );
-  assert.deepEqual(BUILTIN_KINDS.map((entry) => kindRole(entry.kind)), ["implement", "check", "research"]);
+  assert.deepEqual(BUILTIN_KINDS.map((entry) => kindRole(entry.kind)), [
+    "implement",
+    "research",
+    "check",
+    "research",
+    "implement",
+  ]);
+  // Two purposes per implement/research role is the point: role injection is keyed on the
+  // role, so a second kind under the same role must not create a second injection path.
+  const roles = BUILTIN_KINDS.map((entry) => kindRole(entry.kind));
+  assert.ok(roles.filter((role) => role === "implement").length > 1, "kinds share the implement role");
+  assert.ok(roles.filter((role) => role === "research").length > 1, "kinds share the research role");
   assert.equal(kindOf("cw-executor"), "executor");
   assert.equal(kindOf("trellis-implement"), null, "a non-kind dispatch is not ours");
   assert.equal(kindOf("cw-unknown"), null, "only a shipped kind is ours");
@@ -271,7 +291,7 @@ test("kinds table: names are cw- prefixed, map to Trellis roles, and prompts are
   // A project that declares nothing gets the built-in defaults.
   assert.deepEqual(
     resolveKinds(null).map((entry) => [entry.kind, entry.enabled, entry.maxConcurrent]),
-    [["executor", true, 5], ["auditor", true, 5], ["researcher", true, 5]],
+    [["executor", true, 5], ["planner", true, 5], ["auditor", true, 5], ["researcher", true, 5], ["worker", true, 5]],
   );
 });
 
@@ -434,7 +454,7 @@ test("module: enabled kinds register with the owner, session end withdraws them,
     await syncAgentKinds(host, state.runtime);
     assert.deepEqual(
       registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(),
-      ["cw-auditor", "cw-executor", "cw-researcher"],
+      ["cw-auditor", "cw-executor", "cw-planner", "cw-researcher", "cw-worker"],
       "declared-enabled kinds appear in the owner's agent list",
     );
     const lines = agentKindsModule.runtimeStatus!(host) ?? [];
@@ -449,9 +469,9 @@ test("module: enabled kinds register with the owner, session end withdraws them,
     // And back on restores them, in the same session, with no duplicate.
     state.setEnabled(true);
     await syncAgentKinds(host, state.runtime);
-    assert.equal(registryView?.listRuntimeAgentConfigs(pi).length, 3);
+    assert.equal(registryView?.listRuntimeAgentConfigs(pi).length, BUILTIN_KINDS.length);
     await syncAgentKinds(host, state.runtime);
-    assert.equal(registryView?.listRuntimeAgentConfigs(pi).length, 3, "repeated reconcile registers nothing twice");
+    assert.equal(registryView?.listRuntimeAgentConfigs(pi).length, BUILTIN_KINDS.length, "repeated reconcile registers nothing twice");
 
     // Session end: disposal must not throw and must leave nothing that would act
     // on the next session.
@@ -476,7 +496,7 @@ test("module: a disabled kind is not registered, and the project switch withdraw
   try {
     const state = runtimeFor(root);
     await syncAgentKinds(host, state.runtime);
-    const on = ["cw-executor", "cw-researcher"];
+    const on = ["cw-executor", "cw-planner", "cw-researcher", "cw-worker"];
     assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(), on);
     const lines = agentKindsModule.runtimeStatus!(host) ?? [];
     assert.ok(lines.some((line) => line.includes("auditor") && line.includes("已关闭")), lines.join("\n"));
@@ -559,7 +579,7 @@ test("module: a declared-but-unshipped kind is preserved and reported, never reg
     await syncAgentKinds(host, runtimeFor(root).runtime);
     // Every shipped kind registers; the unshipped one is reported and never registered.
     const names = registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort() ?? [];
-    assert.deepEqual(names, ["cw-auditor", "cw-executor", "cw-researcher"]);
+    assert.deepEqual(names, ["cw-auditor", "cw-executor", "cw-planner", "cw-researcher", "cw-worker"]);
     assert.ok(!names.includes("reviewer"), "a kind this package does not ship is never registered");
     const lines = agentKindsModule.runtimeStatus!(host) ?? [];
     assert.ok(lines.some((line) => line.includes("reviewer") && line.includes("本包没有这个 kind")), lines.join("\n"));
@@ -870,7 +890,7 @@ test("gate: a disabled kind is refused, and the reason names only kinds that rea
     const refused = await h.call({ agent: "cw-auditor", task: "audit this" });
     assert.ok(refused, "a disabled kind must not be dispatched");
     assert.match(refused.reason ?? "", /关闭了 kind auditor（cw-auditor）/);
-    assert.match(refused.reason ?? "", /当前可用的 kind：cw-executor、cw-researcher/);
+    assert.match(refused.reason ?? "", /当前可用的 kind：cw-executor、cw-planner、cw-researcher、cw-worker/);
     assert.match(refused.reason ?? "", /没有启动任何子进程/);
     assert.equal(h.requests.length, 0, "a disabled kind costs no public read: it is refused before counting");
   } finally {
@@ -1057,7 +1077,9 @@ test("workflow agents: the kind's resolved role decides the step, not the shippe
   // A project definition may give a kind its own role. Reading the shipped kind's role
   // instead launched the implement step with an agent whose children receive check context —
   // the same kind, two answers, from two places.
-  const h = gateHarness({ kinds: { executor: { enabled: false } } });
+  // Both implement-role kinds are off, so only the project's own definition can
+  // supply the implement step: the shipped kinds must not stand in for it.
+  const h = gateHarness({ kinds: { executor: { enabled: false }, worker: { enabled: false } } });
   try {
     mkdirSync(join(h.root, ".pi", "Coworkflow", "agents"), { recursive: true });
     writeFileSync(
@@ -1116,7 +1138,7 @@ test("gate: session end releases the hook, and re-activation installs exactly on
     await syncAgentKinds(h.host, h.runtime);
     assert.deepEqual(
       kindRegistryFor(h.host).registered().map((entry) => entry.agent).sort(),
-      ["cw-auditor", "cw-executor", "cw-researcher"],
+      ["cw-auditor", "cw-executor", "cw-planner", "cw-researcher", "cw-worker"],
       "re-registered after the session ended",
     );
     assert.equal(await h.call({ agent: "cw-executor", task: "work" }), undefined, "the reinstated gate does not refuse a free kind");

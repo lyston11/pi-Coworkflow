@@ -357,7 +357,7 @@ test("panel: Space toggles a kind and Enter edits its limit, with no restart", {
     // The extension's own activation registered the enabled kinds through the
     // installed owner: this is the loaded-session state a panel opens over.
     await loaded.settled();
-    const all = ["cw-auditor", "cw-executor", "cw-researcher"];
+    const all = ["cw-auditor", "cw-executor", "cw-planner", "cw-researcher", "cw-worker"];
     assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(), all);
 
     const panel = panelFor(loaded.control);
@@ -372,7 +372,12 @@ test("panel: Space toggles a kind and Enter edits its limit, with no restart", {
       /"auditor":\s*\{[^}]*"enabled":\s*false/,
       "the toggle is persisted, not just rendered",
     );
-    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(), ["cw-executor", "cw-researcher"]);
+    assert.deepEqual(registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(), [
+      "cw-executor",
+      "cw-planner",
+      "cw-researcher",
+      "cw-worker",
+    ]);
     assert.match(panel.selected()?.value ?? "", /\[ \] 关/, "the row reflects the new state");
     assert.match(panel.statuses.at(-1) ?? "", /本会话已生效/, panel.statuses.join("\n"));
 
@@ -394,7 +399,7 @@ test("panel: Space toggles a kind and Enter edits its limit, with no restart", {
     await panel.press(" ");
     assert.deepEqual(
       registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(),
-      ["cw-executor", "cw-researcher"],
+      ["cw-executor", "cw-planner", "cw-researcher", "cw-worker"],
       "two toggles return to the state the project chose",
     );
     assert.ok(
@@ -425,7 +430,7 @@ test("status: a colliding kind is reported as failed, and only that kind is affe
     // The squatter holds cw-auditor, so that kind fails while the others register.
     assert.deepEqual(
       registryView?.listRuntimeAgentConfigs(pi).map((entry) => entry.name).sort(),
-      ["cw-auditor", "cw-executor", "cw-researcher"],
+      ["cw-auditor", "cw-executor", "cw-planner", "cw-researcher", "cw-worker"],
       "the squatter's own registration plus the kinds that succeeded",
     );
 
@@ -459,7 +464,7 @@ test("workflow agents: a kind stands in for a step only when it is enabled and r
     assert.deepEqual(
       kindWorkflowAgents(host, resolveKinds(readConfig(root))),
       { implementAgent: "cw-executor", reviewAgent: "cw-auditor" },
-      "each registered kind drives its own step",
+      "the role's primary kind drives the step, not whichever kind was declared last",
     );
 
     // Enabled but not registered: still the built-in pair, because a workflow
@@ -467,10 +472,16 @@ test("workflow agents: a kind stands in for a step only when it is enabled and r
     disposeKindRegistrations(host);
     assert.deepEqual(kindWorkflowAgents(host, resolveKinds(readConfig(root))), {});
 
-    // Only the enabled-and-live kind replaces its step.
+    // Only an enabled-and-live kind replaces its step. With `executor` off, the next
+    // live kind of the same role takes the implement step — a purpose added for cheaper
+    // work must not drive a workflow step while the primary kind is on, and must still
+    // stand in when that primary is off.
     writeKinds(root, { executor: { enabled: false }, auditor: { enabled: true } });
     await syncAgentKinds(host, state.runtime);
-    assert.deepEqual(kindWorkflowAgents(host, resolveKinds(readConfig(root))), { reviewAgent: "cw-auditor" });
+    assert.deepEqual(kindWorkflowAgents(host, resolveKinds(readConfig(root))), {
+      implementAgent: "cw-worker",
+      reviewAgent: "cw-auditor",
+    });
   } finally {
     disposeKindRegistrations(host);
     registryView?.clearRuntimeAgentsForPi(pi);
@@ -516,9 +527,13 @@ test("roles: a kind's role comes from its definition file, not from the agent's 
   // what a kind declares.
   assert.deepEqual(
     BUILTIN_KINDS.map((entry) => kindRole(entry.kind)),
-    ["implement", "check", "research"],
-    "each shipped asset declares its role in frontmatter",
+    ["implement", "research", "check", "research", "implement"],
+    "each shipped asset declares its role in frontmatter; several kinds may share one",
   );
+  // Purpose, not role: the two advisory kinds are read-only and the two implement kinds
+  // differ in what they accept, which is why they carry different models.
+  assert.equal(kindRole("planner"), "research");
+  assert.equal(kindRole("worker"), "implement");
   assert.equal(kindRole("unknown"), null);
 });
 

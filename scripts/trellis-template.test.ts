@@ -229,7 +229,7 @@ test("instructions: direct execution is normal, delegation optional, safety reta
   assert.match(parent, /只有收益高于重复上下文、交接和集成成本时才派单/);
   assert.match(parent, /不硬编码模型名称/);
   assert.doesNotMatch(parent, /执行全部交出去|默认并行，串行要给出理由|主会话自己动手的唯一场合/);
-  for (const safety of ["files: []", "必须后台", "开关与并发上限", "禁止 `reset --hard`", "子 agent 不合并、不 push"]) {
+  for (const safety of ["files: []", "必须后台", "开关与数量限制", "禁止 `reset --hard`", "子 agent 不合并、不 push", "agentKinds.<kind>.model"]) {
     assert.ok(parent.includes(safety), `delegation still preserves ${safety}`);
   }
   assert.match(parent, /主会话的直接写入不受子任务队列的 `files` 检查保护/);

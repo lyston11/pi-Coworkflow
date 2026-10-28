@@ -347,7 +347,7 @@ When a user request matches one of these intents inside an active task, route fi
 [codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
 - Planning or unclear requirements -> `trellis-brainstorm`.
-- Before editing -> `trellis-before-dev`; implement and check directly in the main session. An independent review is optional when risk justifies it; use an available project kind if delegating.
+- Before editing -> `trellis-before-dev`; implement and check directly in the main session. An independent review is optional when risk justifies it; if delegating, use a kind `/Coworkflow:status` lists.
 - Repeated debugging -> `trellis-break-loop`; spec updates -> `trellis-update-spec`.
 
 [/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
@@ -585,7 +585,7 @@ Implement directly in the main session by default:
 
 - Load `trellis-before-dev`; read `prd.md`, `design.md` if present, `implement.md` if present, and relevant spec/research.
 - Work in the task's verified worktree. Implement the approved scope, then run the affected project checks (lint, type-check and tests as applicable).
-- Optional delegation: use an available project kind only for a bounded, independently checkable task or concrete planning advice when its benefit exceeds context and handoff cost. Duration alone is not a reason to delegate or choose a lower-cost model.
+- Optional delegation: use a kind `/Coworkflow:status` lists, only for a bounded, independently checkable task or concrete planning advice when its benefit exceeds context and handoff cost. Duration alone is not a reason to delegate or choose a lower-cost model.
 - Keep model and role choices configurable; do not add a fixed planner/executor/reviewer pipeline.
 - If delegating, supply the active task, necessary context, write scope, expected output and budget. Use background execution and preserve admission, isolation and no-recursive-delegation rules.
 - Do not edit a child's occupied paths. Accept its actual deliverable in the correct worktree, and supplement evidence only where missing or invalidated by integration. Otherwise continue directly; parallelism is not a target.
@@ -616,7 +616,7 @@ Check the work directly in the main session by default:
 
 - Compare the diff and actual outputs with `prd.md`, `design.md` if present, `implement.md` if present, and relevant project specs.
 - Run the smallest sufficient affected checks; include cross-layer consistency when the change crosses layers. Fix findings and re-check the affected behavior.
-- Optional delegation: request an independent review from an available project kind when risk or a second perspective justifies the cost. A separate reviewer is not required for every change.
+- Optional delegation: request an independent review from a kind `/Coworkflow:status` lists when risk or a second perspective justifies the cost. A separate reviewer is not required for every change.
 - A child's verdict is evidence, not final acceptance. Inspect its findings and check results; do not repeat unchanged checks merely because they ran in a child. Re-run what integration changed or what lacks evidence.
 - Keep final acceptance, commits and integration in the main session.
 

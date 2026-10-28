@@ -1253,8 +1253,12 @@ export function kindWorkflowAgents(
   const chosen: { implementAgent?: string; reviewAgent?: string } = {};
   for (const entry of kinds) {
     if (!entry.enabled || !live.has(entry.kind)) continue;
-    if (entry.role === "implement") chosen.implementAgent = entry.agent;
-    else if (entry.role === "check") chosen.reviewAgent = entry.agent;
+    // First kind per role wins, and the table is ordered with each role's primary kind
+    // first (executor before worker, auditor is the only check kind). Several kinds may
+    // share a role now, so "last one wins" would let a purpose added later silently take
+    // over a workflow step it was never meant to drive.
+    if (entry.role === "implement") chosen.implementAgent ??= entry.agent;
+    else if (entry.role === "check") chosen.reviewAgent ??= entry.agent;
   }
   return chosen;
 }

@@ -784,7 +784,10 @@ test("agents: the division measurement and its nudge are gone", async () => {
   assert.doesNotMatch(region, /≥12 次工具调用/, "the threshold instruction is gone from the region");
   assert.doesNotMatch(region, /agents` 模块会数这个/, "and so is the claim that a module counts it");
   assert.match(region, /pi-Coworkflow:start/, "the region keeps its sentinels");
-  assert.match(region, /命名的 workflow/, "named workflows are how multi-stage work is expressed");
+  // Named workflows are still documented, but as an option for delegated multi-stage
+  // work — not as the shape every task must take.
+  assert.match(region, /命名 workflow/, "named workflows remain an option for delegated multi-stage work");
+  assert.match(region, /主会话默认负责端到端交付/, "and the default is direct main-session delivery");
 });
 
 test("trellis: a session file path resolves to the id it contains", async () => {
