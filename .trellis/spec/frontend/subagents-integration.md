@@ -16,7 +16,7 @@ Models, prompts and kinds remain configurable; no model identifiers, required ro
 
 When delegation is selected, preserve async execution, admission, context boundaries, write scopes, worktree safety and status/stop. Parent writes are outside the queue's `files` enforcement: never overlap a child's occupied paths. In a shared worktree only the parent stages/commits, after the relevant writers stop. Final acceptance inspects real outputs and evidence, adding checks only when missing or invalidated by integration. Native completion wakes the parent; do not poll or manufacture work while waiting.
 
-Policy has two sources that must agree: `modules/agents/assets/` and `templates/trellis/dot-trellis/workflow.md`. Pi injects the parsed phase step (2.1 first), with `in_progress-inline` as fallback; both must allow direct implementation and optional review. Update template sources and render the project copies, not just AGENTS or a fallback string. Other platforms keep their existing dispatch modes.
+Policy has two sources that must agree: `modules/agents/assets/` and `templates/trellis/dot-trellis/workflow.md`. Pi injects the parsed phase step (2.1 first), with `in_progress-inline` as fallback; both must allow direct implementation and optional review. Update template sources and render the project copies, not just AGENTS or a fallback string. All bundled platform branches now use the same direct-first policy, including the plain breadcrumb; no platform silently reintroduces a mandatory execute/audit pipeline. Delegated review is read-only across kind prompts, the channel check agent and the `trellis-check` skill; the main session owns repair.
 
 `scripts/trellis-template.test.ts` exercises rendered parent/child instructions, real `get_context.py --mode phase --platform pi --step 2.1/2.2` output, inline routing/fallback and preserved safety text. These assert guidance delivery, not model quality or token savings.
 
@@ -100,7 +100,7 @@ This boundary cannot govern other extensions' RPC calls, other processes, or all
 
 ## Agent kinds (typed subagent families)
 
-A kind is a named agent definition plus its project policies (enabled, max concurrent, and optionally its own model and thinking level). Kinds are purposes, not roles: there are three Trellis roles but more reasons to delegate, so several kinds may share one role. The role (declared in the definition frontmatter) decides which context a child receives; the kind decides what the child is for and therefore which model it should run on. Context injection stays keyed on the role, so a second kind-based injection path must not exist.
+A kind is a named agent definition plus its project policies (enabled, max concurrent, and optionally its own model and thinking level). Kinds are purposes, not roles: there are three Trellis roles but more reasons to delegate, so several kinds may share one role. The role and optional `context` profile (definition frontmatter) decide which context a child receives; the kind decides its purpose and model. `context: role` keeps role defaults; `context: task` lets research-role advisors receive PRD, design and implementation artifacts first, then the existing `implement.jsonl` manifest. The same builder and byte limits apply; research without a task falls back to the spec tree. Shipped planner selects task, researcher retains role. Custom or renamed kinds follow their metadata, never a name-based injection branch. `role: none` still suppresses role context.
 
 The shipped purposes are `executor` (main implementation), `planner` (advisory options and tradeoffs only), `auditor` (independent review), `researcher` (evidence gathering) and `worker` (bounded, independently checkable work) — roles implement, research, check, research, implement respectively. `planner` may not edit code and does not decide for the parent; `worker` must stop and report when a task turns out to need design judgement, cross-module coordination, or an unclear root cause, and duration alone never justifies using it. Model pins live only in `agentKinds.<kind>.model`, never in code, assets or templates, so each project chooses its own mapping. Kind registration and admission are separate from queue planning. The queue submits admitted work through the native owner; it does not own child processes, retries or artifact lifetimes.
 
@@ -112,7 +112,7 @@ That promise holds for **batches too**, and it is a correction rather than a res
 
 The project-wide `subagentConcurrency` ceiling remains a second, coarser gate; both must admit and neither replaces the other. `maxConcurrent` is this package's policy, never a claim about the owner's own limits: its `concurrency`/`maxTasks` are not read, mutated, or presented as ours.
 
-A kind's Trellis role is declared **once**, in its definition's `role:` frontmatter — the project's `.pi/Coworkflow/agents/<kind>.md` when it has one, otherwise the shipped asset that stands in for it (`modules/agent-kinds/assets/*.md`). `kindRole()` reads only that; the shipped kind table carries no role field, because a second declaration of the same fact is how `cw-executor` and its context end up disagreeing. `role: none` and "nothing declared" both mean no role context. `subagent-context` resolves a child's agent name to *which kind* it is, then asks that kind's definition for the role, so a child launched as `cw-executor` receives the existing role injection path — a second injection path keyed on kind is not permitted. The session name identifies a configured agent; role metadata comes from its live definition, including custom names, wrapped names and explicit `role: none`. The fixed `coworkflow.implement-review` workflow selects from enabled, registered kinds using resolved metadata (including project overrides). Injected task references use absolute paths to parent-owned artifacts, so linked-worktree children do not read a stale branch-local copy. Documentation placeholders are not task references; a real but invalid explicit task reference still fails closed. Lane records store the kind observed on the dispatch itself, for `/Coworkflow:lanes` grouping; a non-kind dispatch stores no kind rather than a guessed one.
+A kind's Trellis role is declared **once**, in its definition's `role:` frontmatter — the project's `.pi/Coworkflow/agents/<kind>.md` when it has one, otherwise the shipped asset that stands in for it (`modules/agent-kinds/assets/*.md`). `kindRole()` reads only that; the shipped kind table carries no role field, because a second declaration of the same fact is how `cw-executor` and its context end up disagreeing. `role: none` and "nothing declared" both mean no role context. `subagent-context` resolves a child's agent name to *which kind* it is, then asks that kind's definition for the role, so a child launched as `cw-executor` receives the existing role injection path — a second injection path keyed on kind is not permitted. The session name identifies a configured agent; role metadata comes from its live definition, including custom names, wrapped names and explicit `role: none`. The fixed `coworkflow.implement-review` workflow selects from enabled, registered kinds using resolved metadata (including project overrides). Injected task references use absolute paths to parent-owned artifacts, so linked-worktree children do not read a stale branch-local copy. Documentation placeholders are not task references; a real but invalid explicit task reference still fails closed. `Active task: (none)` is an explicit opt-out, stronger than any inherited session name or parent pointer; it never injects parent artifacts. Independent bounded work needs no lifecycle task purely for dispatch. No marker retains the existing task-bound fallback for compatibility. Lane records store the kind observed on the dispatch itself, for `/Coworkflow:lanes` grouping; a non-kind dispatch stores no kind rather than a guessed one.
 
 Deployment honesty is a gate requirement, not a diagnostic: when the contract is unavailable, nothing is registered, `runtimeStatus` and the settings panel state the exact reason, and a dispatch of a declared kind is refused. A kind is never reported as available on the strength of the project's own enablement.
 
@@ -175,8 +175,10 @@ Use the extension event's `ctx.cwd`, not `process.cwd()`, for the child workspac
 
 ### 5. Good / base / bad cases
 
-Good: four children, two slots, capacity and dependency waiting, four distinct
-worktrees, four document sentinels in every child's final model request.
+Good: four children of a custom research kind with `context: task`, two kind slots,
+ceiling and dependency waiting, and four distinct worktrees. Three task-bound
+children receive all four document sentinels at the final model request; one
+explicit `Active task: (none)` child receives none of them.
 Base: an unknown role receives the generic child guide.
 Bad: a green subprocess exit without document evidence is called injection success.
 
@@ -185,9 +187,10 @@ Bad: a green subprocess exit without document evidence is called injection succe
 `scripts/dispatch-host.test.ts` drives production registration, public RPC events,
 capacity, outcome classification and epoch races. `scripts/dispatch-queue.test.ts`
 covers atomic cycle rejection and result/snapshot agreement, including closed gates.
-`scripts/test.ts` covers role overrides, placeholders, invalid paths and prompt
-idempotency. `scripts/verify-dispatch.mjs` observes real processes and final system
+`scripts/test.ts` covers role overrides, planning profiles (including renamed kinds and budget limits), explicit task opt-out, placeholders, invalid paths and prompt idempotency. Generic child guidance has one shipped asset, read by both rendering and the injection fallback; kind prompts only add purpose-specific instructions. `scripts/verify-dispatch.mjs` observes real processes and final system
 messages, asserts the four-child scenario, and removes its clean worktrees on success.
+The fixture ignores `.pi` as an entry (not directory-only `.pi/`), so a shared
+configuration symlink remains clean for upstream worktree admission.
 
 ### 7. Wrong vs correct
 

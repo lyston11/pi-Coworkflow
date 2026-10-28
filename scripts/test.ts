@@ -451,7 +451,13 @@ test("subagent-context: a project without its own guide still gets the floor", a
     harness.run(event);
     const block = event.systemPromptOptions.sections.pi_coworkflow_child ?? "";
     assert.match(block, /不要扩大范围/, "the built-in floor applies");
-    assert.doesNotMatch(block, /Active task:/, "and no task is invented");
+    assert.doesNotMatch(block, /^Active task: \.trellis/m, "and no task is invented");
+    const { agentsModule } = await import(here("../modules/agents/index.ts"));
+    const { createContext } = await import(here("../core/module.ts"));
+    await agentsModule.apply?.(createContext({ root, prefix: "wt-", dry: false, report: () => {} }));
+    const withDefault = { ...event, systemPromptOptions: { contextFiles: [], sections: {} as Record<string, string> } };
+    harness.run(withDefault);
+    assert.equal((withDefault.systemPromptOptions.sections.pi_coworkflow_child ?? "").split("你是被派发的子 agent").length - 1, 1, "the rendered default guide is not injected twice");
   } finally {
     harness.close();
   }
@@ -670,6 +676,40 @@ test("subagent-context: the injected task also names the main checkout's absolut
   } finally {
     harness.close();
   }
+});
+
+test("subagent-context: planning profile is data-driven and an explicit no-task never borrows the parent", async () => {
+  const root = await tempChildProject();
+  const task = join(root, ".trellis", "tasks", "10-20-demo");
+  writeFileSync(join(task, "prd.md"), "# PLAN-PRD\n");
+  writeFileSync(join(task, "design.md"), "# PLAN-DESIGN\n");
+  writeFileSync(join(task, "implement.md"), "# PLAN-STEPS\n");
+  mkdirSync(join(root, ".trellis", "spec", "frontend"), { recursive: true });
+  writeFileSync(join(root, ".trellis", "spec", "frontend", "planning.md"), "PLAN-CURATED\n");
+  writeFileSync(join(task, "implement.jsonl"), JSON.stringify({ file: ".trellis/spec/frontend/planning.md", reason: "planning input" }) + "\n");
+  mkdirSync(join(root, ".pi", "Coworkflow", "agents"), { recursive: true });
+  writeFileSync(join(root, ".pi", "Coworkflow", "agents", "advisor.md"), "---\nagent: cw-renamed\nrole: research\ncontext: task\n---\nGive advice.\n");
+  const block = async (name: string, prompt: string): Promise<string> => {
+    const harness = await childHarness({ root, sessionName: name });
+    try { return String(harness.run({ prompt, systemPrompt: "BASE" })?.systemPrompt ?? ""); }
+    finally { harness.close(); }
+  };
+  for (const name of ["cw-planner: advice", "cw-renamed: advice"]) {
+    const planned = await block(name, "Active task: .trellis/tasks/10-20-demo");
+    for (const evidence of ["PLAN-PRD", "PLAN-DESIGN", "PLAN-STEPS", "PLAN-CURATED"]) assert.ok(planned.includes(evidence), evidence);
+  }
+  const researched = await block("cw-researcher: survey", "Active task: .trellis/tasks/10-20-demo");
+  assert.match(researched, /\.trellis\/spec\//);
+  assert.doesNotMatch(researched, /PLAN-PRD|PLAN-DESIGN|PLAN-STEPS|PLAN-CURATED/);
+  for (const name of ["cw-worker: .trellis/tasks/10-20-demo", "cw-planner: advice"]) {
+    const independent = await block(name, "Active task: (none)\nOnly do the bounded request.");
+    assert.match(independent, /Active task: \(none\)/);
+    assert.doesNotMatch(independent, /PLAN-PRD|PLAN-DESIGN|PLAN-STEPS|PLAN-CURATED|Active task: \.trellis/);
+  }
+  writeFileSync(join(root, ".trellis", "config.yaml"), "context_injection:\n  max_total_bytes: 1\n");
+  const limited = await block("cw-planner: advice", "Active task: .trellis/tasks/10-20-demo");
+  assert.match(limited, /not inlined|truncated/);
+  assert.doesNotMatch(limited, /PLAN-PRD|PLAN-DESIGN|PLAN-STEPS|PLAN-CURATED/);
 });
 
 test("subagent-context: the module switch and the session switch are both live", async () => {

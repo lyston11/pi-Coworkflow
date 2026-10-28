@@ -239,8 +239,13 @@ test("cli: export hands back a shipped kind's own prompt, and set --from rejects
     const text = readFileSync(out, "utf-8");
     // The shipped asset is a real document, not a one-liner: this is the thing that was too crude
     // to pass as `prompt="…"`.
-    assert.ok(text.split("\n").length > 20, "the exported prompt is a document");
+    assert.match(text, /只读复核/, "the exported definition preserves the auditor contract");
     assert.match(text, /^---\n/, "with frontmatter, so it can be edited and handed back");
+    const planner = join(root, "planner.md");
+    assert.equal(cli(["kind", "export", "planner", "--out", planner], root).code, 0);
+    assert.match(readFileSync(planner, "utf-8"), /context: task/);
+    assert.equal(cli(["kind", "set", "planner", "--from", planner], root).code, 0);
+    assert.equal(JSON.parse(cli(["kind", "show", "planner", "--json"], root).stdout).context, "task");
 
     // Hand it back edited: the label changes, the prompt body is kept.
     writeFileSync(out, text.replace("label: 审计者", "label: 项目审计者"));

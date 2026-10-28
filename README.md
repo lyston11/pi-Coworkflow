@@ -162,6 +162,7 @@ kind 集合是**项目自己的决定**。在 `.pi/Coworkflow/agents/<kind>.md` 
 label: 建造者                     # 面板里显示的名字
 agent: cw-builder                 # agent 名，必须形如 cw-<slug>；默认 cw-<kind>
 role: implement                   # Trellis 角色：implement | check | research | none
+context: role                     # role（默认）；task（research 增加任务上下文）
 description: 按派单实现一处改动
 model: provider/id                # 可选默认值
 thinking: high                    # 可选默认值
@@ -176,11 +177,15 @@ enabled: true                     # 可选默认值
 
 | 想要 | 怎么做 |
 |---|---|
-| 改本包随附 kind 的职能 | 用同名文件覆盖它：正文替换提示词，frontmatter 覆盖 label / role / description |
+| 改本包随附 kind 的职能 | 用同名文件覆盖它：正文替换提示词，frontmatter 覆盖 label / role / context / description |
 | 新增一个 kind | 写一个用新名字的文件 |
 | 改 agent 名 | `agent:`（必须 `cw-` 开头；撞到项目已有的 agent 时只有该 kind 失败并说明原因） |
 | 改默认配置 | `model` / `thinking` / `maxConcurrent` / `enabled` |
 | 删掉 | `/Coworkflow:kind remove <kind>`；随附的 kind 只能关掉（回到随附定义） |
+
+**上下文按需要加载**：`planner` 的 `context: task` 会优先加载 `prd.md`、`design.md`、`implement.md`，再复用 `implement.jsonl` 的相关规范，遵守现有字节预算；`researcher` 默认只拿 spec 目录树。自定义或改名的 kind 同样可设置 `context`，不按名称写分支；`role: none` 始终不注入角色上下文。
+
+派单首行写真实的 `Active task: <任务目录>`；独立的小工作写 `Active task: (none)`，不会继承父任务，也不必为派单新建任务。任务相关的代码修改仍沿用已有任务与 worktree 安全规则。
 
 **两层，谁说了算不含糊**：定义文件说的是这个 kind **是什么**；`.pi/Coworkflow.json` 的 `agentKinds.<kind>` 说的是项目**选了什么**（面板写的），**永远优先**。所以定义里的 `model:` 是默认值，一旦在 `/Comodels` 里选过模型，配置赢，`/Coworkflow:kind show` 会标出哪些是「项目选择」、哪些是「默认」。
 
@@ -188,7 +193,7 @@ enabled: true                     # 可选默认值
 
 | 改了什么 | 什么时候生效 |
 |---|---|
-| 提示词 / agent 名 / role / label / description / model / thinking | 下一次派单前：gate 发现磁盘上的定义与已注册的不一致，先重新注册再决定，所以这一次派单用的就是新内容 |
+| 提示词 / agent 名 / role / context / label / description / model / thinking | 下一次派单前：gate 发现磁盘上的定义与已注册的不一致，先重新注册再决定，所以这一次派单用的就是新内容 |
 | `enabled` / `maxConcurrent` | 立即：每次派单都从磁盘重读策略 |
 | 新增 / 删除定义文件 | 下一次派单前（删除会撤回对应的 agent） |
 

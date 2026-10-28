@@ -165,16 +165,21 @@ test("kind port: the writer validates before it writes, and a rejected value lea
   try {
     const written = writeKindDefinition(root, "builder", {
       label: "建造者",
-      role: "implement",
+      role: "research",
+      context: "task",
       prompt: "按派单实现。",
     });
     assert.ok(written.ok, JSON.stringify(written));
     const path = join(definitionsDir(root), "builder.md");
-    assert.match(readFileSync(path, "utf-8"), /role: implement/);
+    assert.match(readFileSync(path, "utf-8"), /role: research/);
+    assert.match(readFileSync(path, "utf-8"), /context: task/);
     // Round trip: what was written parses back to the same definition.
     const parsed = parseDefinition("builder", readFileSync(path, "utf-8"));
     assert.ok("definition" in parsed);
     assert.equal(parsed.definition.label, "建造者");
+    assert.equal(parsed.definition.context, "task");
+    const badContext = writeKindDefinition(root, "builder", { context: "nope" as never }, parsed.definition);
+    assert.equal(badContext.ok, false);
 
     // A rejected value must not create or modify anything.
     const before = readFileSync(path, "utf-8");

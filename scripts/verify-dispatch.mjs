@@ -82,15 +82,18 @@ put(join(fixture, ".pi/Coworkflow.json"), JSON.stringify({ version: 1, autoEnabl
   subagentConcurrency: 2, subagentRunBudgetMs: 60000, agentKinds: { probe: { enabled: true, maxConcurrent: 2 } },
 }));
 put(join(fixture, ".pi/Coworkflow/agents/probe.md"),
-  "---\nlabel: Probe\nagent: cw-probe\nrole: check\n---\nRead-only integration probe. Never use tools or start children.\n");
+  "---\nlabel: Probe\nagent: cw-probe\nrole: research\ncontext: task\n---\nRead-only planning probe. Never use tools or start children.\n");
 const markers = ["orbit-prd-317", "orbit-design-428", "orbit-plan-539", "orbit-spec-640"];
 for (const [file, value] of [["prd.md", markers[0]], ["design.md", markers[1]], ["implement.md", markers[2]]]) {
   put(join(taskDir, file), `# Probe\n${value}\n`);
 }
 put(join(fixture, ".trellis/spec/probe.md"), `# Check guideline\n${markers[3]}\n`);
-put(join(taskDir, "check.jsonl"), JSON.stringify({ file: ".trellis/spec/probe.md", reason: "probe" }) + "\n");
+for (const manifest of ["check.jsonl", "implement.jsonl"]) {
+  put(join(taskDir, manifest), JSON.stringify({ file: ".trellis/spec/probe.md", reason: "probe" }) + "\n");
+}
 put(join(taskDir, "task.json"), JSON.stringify({ id: "probe", name: "probe", status: "in_progress" }));
-put(join(fixture, ".gitignore"), ".pi/\n.trellis/.runtime/\nsessions/\n");
+// Session placement may share .pi via a symlink; ignore the entry, not only directories.
+put(join(fixture, ".gitignore"), ".pi\n.trellis/.runtime/\nsessions/\n");
 git("init", "-q", "-b", "main");
 git("add", ".");
 git("commit", "-qm", "probe fixture");
@@ -130,31 +133,47 @@ try {
   const task = `Active task: ${taskDir}\nRead-only probe: reply PROBE_COMPLETED without tools.`;
   const result = await (tool.definition ?? tool).execute("probe", { worktree: true, tasks: [
     { key: "a", kind: "probe", task }, { key: "b", kind: "probe", task },
-    { key: "c", kind: "probe", task }, { key: "d", kind: "probe", task, needs: ["a"] },
+    { key: "c", kind: "probe", task },
+    { key: "d", kind: "probe", task: "Active task: (none)\nIndependent probe; reply PROBE_COMPLETED without tools.", needs: ["a"] },
   ] });
   assert.ok(!result.isError, JSON.stringify(result));
-  assert.equal(result.details.started.length, 2);
-  assert.deepEqual(result.details.queued.map(t => [t.key, t.reason]), [["c", "ceiling"], ["d", "dependency"]]);
+  // Wait for launched children before asserting the initial snapshot, so a fixture
+  // assertion cannot leave live children behind when the session is disposed.
   await Promise.race([allDone, new Promise((_, reject) => {
     timer = setTimeout(() => reject(new Error("native probe deadline (90s)")), 90000);
   })]);
   clearTimeout(timer);
+  assert.equal(result.details.started.length, 2);
+  assert.deepEqual(result.details.queued.map(t => [t.key, t.reason]), [["c", "ceiling"], ["d", "dependency"]]);
   assert.ok([...notices.values()].every(run => run.status === "completed"), JSON.stringify([...notices.values()]));
   const evidence = readdirSync(evidenceDir).map(name => JSON.parse(readFileSync(join(evidenceDir, name), "utf8")));
   assert.equal(evidence.length, 4, "each real child reached the model with its final context");
   assert.equal(new Set(evidence.map(e => e.pid)).size, 4, "four distinct child processes");
   assert.equal(new Set(evidence.map(e => e.cwd)).size, 4, "four distinct worktrees");
+  let independent = 0;
   for (const child of evidence) {
     assert.notEqual(child.pid, process.pid);
     assert.notEqual(child.cwd, fixture);
     const prompt = typeof child.systemPrompt === "string" ? child.systemPrompt : JSON.stringify(child.systemPrompt);
-    for (const marker of markers) assert.ok(prompt.includes(marker), `${child.name}: missing ${marker}`);
-    assert.ok(prompt.includes(taskDir), "absolute parent task directory reaches the model");
-    assert.ok(prompt.includes("role: check"), "custom wrapped kind receives its declared role");
+    const taskless = !prompt.includes(markers[0]);
+    if (taskless) {
+      independent++;
+      for (const marker of markers) assert.ok(!prompt.includes(marker), "independent work borrows no task artifact");
+      assert.ok(prompt.includes("Active task: (none)"));
+      assert.ok(prompt.includes("role: research"));
+      assert.ok(!prompt.includes(taskDir), "independent child has no parent task reference");
+    } else {
+      for (const marker of markers) assert.ok(prompt.includes(marker), `${child.name}: missing ${marker}`);
+      assert.ok(prompt.includes(taskDir), "absolute parent task directory reaches the model");
+      assert.ok(prompt.includes("role: research"), "custom wrapped kind receives its declared role/profile");
+    }
   }
+  assert.equal(independent, 1, "one explicitly independent child and three task-bound children");
+  assert.ok(evidence.every(child => child.name.includes("cw-probe")), "planning profile is independent of the shipped planner name");
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ passed: true, children: evidence.length, initialRunning: 2, initialQueued: 2,
-    contextMarkersPerChild: markers.length, isolatedWorktrees: true, modelNetworkRequests: 0 }));
+    taskBoundChildren: 3, contextMarkersPerTaskChild: markers.length, independentChildren: independent,
+    isolatedWorktrees: true, modelNetworkRequests: 0 }));
   passed = true;
 } finally {
   clearTimeout(timer);

@@ -473,16 +473,19 @@ export function buildRoleContext(
   root: string,
   taskDir: string | null,
   role: SubagentRole,
+  profile: "role" | "task" = "role",
 ): string {
-  if (role === "research") return specTree(root);
+  const planning = role === "research" && profile === "task";
+  if (role === "research" && (!planning || !taskDir)) return specTree(root);
   if (!taskDir) return "";
 
   const limits = readInjectionLimits(root);
   const budget = new Budget(limits.maxTotalBytes);
   const parts: string[] = [];
 
-  const curated = agentContext(root, taskDir, role, limits, budget);
-  if (curated) parts.push(curated);
+  // Planning needs the question before supporting specs; existing implementation
+  // and check profiles retain their established manifest-first order.
+  if (!planning) parts.push(agentContext(root, taskDir, role, limits, budget));
 
   const artifacts: [string, string][] = [
     ["prd.md", "Requirements document"],
@@ -500,6 +503,7 @@ export function buildRoleContext(
     );
     if (block) parts.push(block);
   }
+  if (planning) parts.push(agentContext(root, taskDir, "implement", limits, budget));
   return parts.join("\n\n");
 }
 

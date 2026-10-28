@@ -288,6 +288,7 @@ export function resolveKinds(config: WorkflowConfig | null, definitions?: KindDe
       enabled: enabled.value === true,
       maxConcurrent: positiveInteger(maxConcurrent.value) ?? DEFAULT_MAX_CONCURRENT,
       role: kindRole(kind, definitions),
+      context: definition?.context ?? shippedDefinition(kind)?.context ?? "role",
       description: definition?.description ?? shipped?.description ?? "",
       source: definition === undefined ? "shipped" : "file",
       ...(definition === undefined ? {} : { promptFromFile: definition.prompt }),

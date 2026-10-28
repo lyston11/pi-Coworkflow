@@ -61,34 +61,6 @@ function contextFor(root: string, dry = false): { ctx: ReturnType<typeof createC
   return { ctx, lines };
 }
 
-/**
- * The bodies of a workflow document's Pi blocks.
- *
- * A platform block opens with `[Claude Code, Pi, …]` and closes with `[/…]`; task
- * state blocks carry a `:` in the marker and are not platform-specific. Only the
- * blocks naming `Pi` matter here: every other platform keeps its own dispatch
- * protocol and is never this package's rewrite target.
- */
-function piBlockBodies(md: string): string[] {
-  const out: string[] = [];
-  let current: { name: string; body: string[] } | null = null;
-  for (const line of md.split("\n")) {
-    const open = /^\[([^\]]+)\]$/.exec(line)?.[1];
-    const close = /^\[\/([^\]]+)\]$/.exec(line)?.[1];
-    if (current === null && open !== undefined && !open.includes(":")) {
-      current = { name: open, body: [] };
-      continue;
-    }
-    if (current !== null && close === current.name) {
-      if (current.name.split(",").map((part) => part.trim()).includes("Pi")) out.push(current.body.join("\n"));
-      current = null;
-      continue;
-    }
-    current?.body.push(line);
-  }
-  return out;
-}
-
 /** A minimal legacy install: the old role agents plus a `trellis-*` Pi block. */
 function legacyProject(): string {
   const root = tempProject();
@@ -240,7 +212,7 @@ test("instructions: direct execution is normal, delegation optional, safety reta
   assert.doesNotMatch(parent + child, /gpt-6|deepseek/i, "policy must not pin the user's example models");
 });
 
-test("Pi: the real phase extractor delivers direct implementation and optional review", () => {
+test("all platforms: the real phase extractor delivers direct implementation and read-only optional review", () => {
   const root = tempProject();
   renderTemplate(contextFor(root).ctx);
   const step = (id: string, platform = "pi"): string => execFileSync(
@@ -259,7 +231,12 @@ test("Pi: the real phase extractor delivers direct implementation and optional r
   assert.match(check, /A separate reviewer is not required/);
   assert.match(check, /do not repeat unchanged checks/);
   assert.doesNotMatch(implementation + check, /Spawn the (implement|check) sub-agent|Dispatch the (implementation|quality check) to/);
-  assert.match(step("2.1", "claude-code"), /Spawn the implement sub-agent/, "other platform modes are unchanged");
+  for (const platform of ["claude-code", "cursor", "opencode", "codex", "kiro", "gemini", "qoder", "codebuddy", "copilot", "droid", "oh-my-pi", "zcode", "snow", "reasonix", "trae", "grok", "kimi-code", "kilo", "antigravity", "devin", "deepseek-harness"]) {
+    const implement = step("2.1", platform), review = step("2.2", platform);
+    assert.match(implement, /Implement directly in the main session by default/, platform);
+    assert.match(review, /reviewer is read-only/, platform);
+    assert.doesNotMatch(implement + review, /Spawn the (implement|check) sub-agent|Auto-Fix|Self-Fix/, platform);
+  }
 });
 
 test("Pi: inline fallback and routing agree with the phase details", () => {
@@ -269,9 +246,22 @@ test("Pi: inline fallback and routing agree with the phase details", () => {
   assert.match(fallback, /main session implements and validates by default/);
   assert.match(fallback, /no mandatory execute\/audit pipeline/);
   assert.match(fallback, /commit \(Phase 3\.4\)/, "direct execution still reaches task closure");
-  const pi = piBlockBodies(workflow).join("\n");
-  assert.match(pi, /implement and check directly in the main session/);
-  assert.doesNotMatch(pi, /after editing -> dispatch the audit kind|Dispatch the (implementation|quality check) to/);
+  for (const name of ["in_progress", "in_progress-inline"]) {
+    const body = workflow.slice(workflow.indexOf(`\n[workflow-state:${name}]\n`), workflow.indexOf(`[/workflow-state:${name}]`));
+    assert.match(body, /main session implements and validates by default/);
+    assert.doesNotMatch(body, /sub-agent flow|dispatch the audit kind|review\/fix/);
+  }
+  assert.match(workflow, /implement and check directly in the main session/);
+  assert.match(workflow, /Active task: \(none\)/);
+  const help = execFileSync(process.platform === "win32" ? "python" : "python3",
+    [join(TEMPLATE_ROOT, "dot-trellis", "scripts", "task.py"), "--help"],
+    { encoding: "utf-8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } });
+  for (const [, command] of workflow.matchAll(/task\.py ([a-z][a-z-]*)/g)) {
+    assert.ok(help.includes(command!), `workflow references a real task command: ${command}`);
+  }
+  const reviewer = readFileSync(join(TEMPLATE_ROOT, "dot-trellis", "agents", "check.md"), "utf-8");
+  assert.match(reviewer, /Do not edit files/);
+  assert.doesNotMatch(reviewer, /fix.*directly|Auto-Fix|Self-Fix|NEVER ask.*fix/);
 });
 
 // ── idempotency ──────────────────────────────────────────────────────
@@ -364,10 +354,8 @@ test("template: an old install is upgraded — role agents gone, Pi block kind-o
 
   const workflow = readFileSync(join(root, ".trellis", "workflow.md"), "utf-8");
   assert.equal(workflow, readFileSync(join(TEMPLATE_ROOT, "dot-trellis", "workflow.md"), "utf-8"));
-  const pi = piBlockBodies(workflow).join("\n");
-  assert.ok(pi.length > 0, "the workflow must still carry Pi blocks");
-  assert.ok(!/Agent type[^\n]*trellis-/.test(pi), "the Pi blocks must no longer dispatch trellis-*");
-  assert.match(pi, /available project kind/, "optional Pi delegation still uses configured kinds");
+  assert.ok(!/Agent type[^\n]*trellis-/.test(workflow), "no platform dispatches legacy role agents");
+  assert.match(workflow, /available project kind/, "optional delegation still uses configured kinds");
 
   assert.ok(
     lines.some((line) => line.includes("已从旧 Trellis 产物升级到本仓模板")),

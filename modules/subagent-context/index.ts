@@ -57,7 +57,7 @@
  * "generic child", never "no instructions".
  */
 
-import type { PiRuntimeHost, RuntimeContext, WorkflowModule } from "../../core/module.ts";
+import { moduleAsset, type PiRuntimeHost, type RuntimeContext, type WorkflowModule } from "../../core/module.ts";
 import { statSync } from "node:fs";
 import {
   activeTaskDir,
@@ -104,13 +104,7 @@ export const SECTION = "pi_coworkflow_child";
  * an adopted project is never left without the boundary that says it does one
  * delegated piece of work and reports it.
  */
-const GENERIC_GUIDE = [
-  "你是被主会话派来执行一件已定义工作的子 agent，不是主会话。",
-  "",
-  "- 任务是派单提示词里那一段：交付它要求的产物，然后报告事实（改了哪些文件、跑了哪些命令、结果如何、还有什么不确定）。",
-  "- 不要扩大范围、不要顺手重构、不要改别的 bug；发现需要产品/架构判断时用 `contact_supervisor` 问主会话。",
-  "- 不能创建或推进 Trellis 任务、不能改任务状态、不能合并、不能 push。",
-].join("\n");
+const GENERIC_GUIDE = moduleAsset(import.meta.url, "../agents/assets/subagent-AGENTS.md") ?? "";
 
 /** A known role name, or `null`. The only caller is the dispatch-prompt marker. */
 function asRole(value: string | undefined): SubagentRole | null {
@@ -195,7 +189,7 @@ export function taskReference(
 export type TaskResolution =
   | { kind: "task"; dir: string; ref: string }
   | { kind: "invalid"; ref: string }
-  | { kind: "none" };
+  | { kind: "none"; explicit?: boolean };
 
 export function resolveChildTask(
   root: string,
@@ -204,6 +198,7 @@ export function resolveChildTask(
 ): TaskResolution {
   const ref = taskReference(sessionName, ...texts);
   if (!ref) return { kind: "none" };
+  if (ref === "(none)") return { kind: "none", explicit: true };
   const dir = resolveTaskDir(root, ref);
   // `resolveTaskDir` resolves lexically so a caller may create a task; a child
   // only ever reads one, so here a reference to a directory that does not exist
@@ -218,7 +213,7 @@ export function resolveChildTask(
 
 /** The block this module contributes, for one run of one child. */
 interface ChildPrompt {
-  /** Project guide or the built-in floor. */
+  /** Shared safety floor plus any distinct project supplement. */
   guide: string;
   role: SubagentRole | null;
   task: TaskResolution;
@@ -275,14 +270,7 @@ function blockFor(prompt: ChildPrompt): string {
   // role context so the task-specific material comes first.
   lines.push("## 子 agent 工作约定（本项目）", "", prompt.guide, "");
 
-  lines.push(
-    "## 边界",
-    "",
-    "- 你是被派发的子 agent：只做派单提示词里指定给你的那部分，不要自己创建 Trellis 任务、不要改任务状态、不要合并或 push。",
-    "- 任务状态、合并与清理由主会话负责；需要决策时用 `contact_supervisor` 提问，不要自行扩大范围。",
-    "",
-    "<!-- pi-Coworkflow:subagent-context:end -->",
-  );
+  lines.push("<!-- pi-Coworkflow:subagent-context:end -->");
   return lines.join("\n");
 }
 
@@ -309,10 +297,11 @@ function readChildPrompt(
   const inherited = inheritedPrompt(event);
   // The project's table, so a custom or renamed kind resolves to the role it declared.
   const kinds = resolveKinds(readConfig(root), readKindDefinitions(root).definitions);
+  const kind = kindOf(sessionName?.split(":")[0]?.trim() ?? "", kinds);
   const role = detectRole(sessionName, kinds, event?.prompt, inherited);
   let task = resolveChildTask(root, sessionName, event?.prompt, inherited);
 
-  if (task.kind === "none" && role && role !== "research") {
+  if (task.kind === "none" && !task.explicit && role && (role !== "research" || kind?.context === "task")) {
     // The child named no task: the parent's pointer is the only remaining
     // evidence, and a Trellis role without one has nothing to work from.
     const parentTask = activeTaskDir(root, runtime.parentSessionId);
@@ -328,10 +317,13 @@ function readChildPrompt(
         ? task.ref
         : "";
   const context =
-    role === null ? "" : buildRoleContext(root, task.kind === "task" ? task.dir : null, role);
+    role === null ? "" : buildRoleContext(root, task.kind === "task" ? task.dir : null, role, kind?.context);
 
+  const supplement = readSubagentGuide(root)?.trim();
+  const guide = supplement && supplement !== GENERIC_GUIDE.trim()
+    ? `${GENERIC_GUIDE.trim()}\n\n${supplement}` : GENERIC_GUIDE;
   return {
-    guide: readSubagentGuide(root) ?? GENERIC_GUIDE,
+    guide,
     role,
     task,
     displayRef,

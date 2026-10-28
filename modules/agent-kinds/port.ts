@@ -48,6 +48,7 @@ function kindView(control: WorkflowControl, root: string | null): unknown[] {
     agent: entry.agent,
     label: entry.label,
     role: entry.role,
+    context: entry.context,
     enabled: entry.enabled,
     maxConcurrent: entry.maxConcurrent,
     ...(entry.model === undefined ? {} : { model: entry.model }),
@@ -122,7 +123,7 @@ export function registerKindPort(
         // `define`: the payload is the definition's fields, and the writer validates it before
         // anything touches the disk, so a rejected value cannot leave a half-written file.
         const patch: Record<string, unknown> = {};
-        for (const key of ["label", "agent", "role", "description", "model", "thinking", "maxConcurrent", "enabled", "prompt"]) {
+        for (const key of ["label", "agent", "role", "context", "description", "model", "thinking", "maxConcurrent", "enabled", "prompt"]) {
           if (params[key] !== undefined) patch[key] = params[key];
         }
         if (Object.keys(patch).length === 0) return refuse("invalid_params", "define 需要至少一个字段");

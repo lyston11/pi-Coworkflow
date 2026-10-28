@@ -60,6 +60,7 @@ const WRITABLE = [
   "label",
   "agent",
   "role",
+  "context",
   "description",
   "model",
   "thinking",
@@ -128,6 +129,7 @@ type KindView = {
   agent: string;
   label: string;
   role: string | null;
+  context: "role" | "task";
   enabled: boolean;
   maxConcurrent: number;
   model?: string;
@@ -144,6 +146,7 @@ function kindsView(root: string): KindView[] {
     agent: entry.agent,
     label: entry.label,
     role: entry.role ?? null,
+    context: entry.context ?? "role",
     enabled: entry.enabled,
     maxConcurrent: entry.maxConcurrent,
     ...(entry.model === undefined ? {} : { model: entry.model }),
@@ -199,6 +202,7 @@ function effectiveDefinition(root: string, kind: string): { text: string; source
       kind,
       label: view.label,
       role: (view.role ?? "none") as never,
+      context: view.context,
       description: view.description,
       prompt: shipped,
     }),
@@ -215,6 +219,8 @@ label: ${label}
 agent: cw-${kind}
 # Trellis 角色：implement | check | research | none
 role: ${role}
+# 上下文档位：role（按角色）；task（research 增加任务工件与实现清单）
+context: role
 # 出现在 agent 列表里的说明
 description: ${description}
 # 以下是可选默认值；面板里选过的值总是优先于这里
@@ -305,6 +311,7 @@ function runKind(options: Options): number {
           `  agent: ${view.agent}`,
           `  label: ${view.label}`,
           `  role: ${view.role ?? "none"}`,
+          `  context: ${view.context}`,
           `  description: ${view.description}`,
           `  enabled: ${view.enabled}${view.chosen.enabled ? "（项目选择）" : "（默认）"}`,
           `  maxConcurrent: ${view.maxConcurrent}${view.chosen.maxConcurrent ? "（项目选择）" : "（默认）"}`,
@@ -470,7 +477,8 @@ const HELP = `pi-coworkflow ${VERSION} — 自定义本项目的子 agent 类型
   pi-coworkflow kind set builder --from .pi/Coworkflow/agents/builder.md
 
 字段（set k=v）：${WRITABLE.join("、")}
-  role 取 implement | check | research | none；enabled 取 true|false；maxConcurrent 取 ≥1 的整数
+  role 取 implement | check | research | none；context 取 role | task
+  enabled 取 true|false；maxConcurrent 取 ≥1 的整数
 
 为什么需要 session 命令：
   pi -p '/Coworkflow:start' 里的斜杠命令不会执行——它被当成提示词发出去，于是第一次派单

@@ -396,6 +396,8 @@ export interface ResolvedAgentKind {
    * `role: none` — a kind that is not one of the roles.
    */
   role?: SubagentRole | null;
+  /** Definition-selected context profile; task enriches research with task artifacts. */
+  context?: "role" | "task";
   /** What the owner shows in the agent list. */
   description?: string;
   /** Where this kind came from: a project definition file, or the shipped table. */

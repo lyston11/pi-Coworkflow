@@ -43,7 +43,7 @@ const AGENT_NAME = /^cw-[a-z0-9][a-z0-9-]*$/;
 const ROLES: readonly SubagentRole[] = ["implement", "check", "research"];
 
 /** The keys a definition may declare. Anything else is refused by name. */
-const KEYS = ["label", "agent", "role", "description", "model", "thinking", "maxConcurrent", "enabled"] as const;
+const KEYS = ["label", "agent", "role", "context", "description", "model", "thinking", "maxConcurrent", "enabled"] as const;
 
 /** One parsed, validated project definition. */
 export interface KindDefinitionFile {
@@ -54,6 +54,8 @@ export interface KindDefinitionFile {
   label?: string;
   /** `none` means "not a Trellis role": no role context is injected for its children. */
   role?: SubagentRole | "none";
+  /** role (default) follows the role; task adds task material for research. */
+  context?: "role" | "task";
   description?: string;
   /** Defaults only: the project config wins over these. */
   model?: string;
@@ -208,6 +210,12 @@ export function parseDefinition(kind: string, raw: string): { definition: KindDe
     }
     definition.role = front.role === "none" ? "none" : (front.role as SubagentRole);
   }
+  if (front.context !== undefined) {
+    if (front.context !== "role" && front.context !== "task") {
+      return { reason: `context 只能是 role / task：${front.context}` };
+    }
+    definition.context = front.context;
+  }
   if (front.model !== undefined) {
     if (!isKindModel(front.model) || front.model.length > MAX_KIND_MODEL_LENGTH) {
       return { reason: `model 不可用：${front.model}` };
@@ -274,6 +282,7 @@ export function writeKindDefinition(
   take("label");
   take("description");
   take("role");
+  take("context");
   take("model");
   take("thinking");
   take("maxConcurrent");
@@ -328,6 +337,7 @@ export function renderDefinition(definition: KindDefinitionFile): string {
   if (definition.label !== undefined) lines.push(`label: ${definition.label}`);
   if (definition.agent !== undefined) lines.push(`agent: ${definition.agent}`);
   if (definition.role !== undefined) lines.push(`role: ${definition.role}`);
+  if (definition.context !== undefined) lines.push(`context: ${definition.context}`);
   if (definition.description !== undefined) lines.push(`description: ${definition.description}`);
   if (definition.model !== undefined) lines.push(`model: ${definition.model}`);
   if (definition.thinking !== undefined) lines.push(`thinking: ${definition.thinking}`);

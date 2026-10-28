@@ -51,14 +51,6 @@ python3 ./.trellis/scripts/task.py archive <name>        # move to archive/{year
 python3 ./.trellis/scripts/task.py list [--mine] [--status <s>]
 python3 ./.trellis/scripts/task.py list-archive
 
-# Task coordination (declare before editing; `start` enforces it)
-python3 ./.trellis/scripts/task.py claim-paths <name> <path>... [--shared <path>...]
-python3 ./.trellis/scripts/task.py set-resource <name> [--group <g>] [--lane <l>]
-python3 ./.trellis/scripts/task.py add-blocker <name> <blocker>   # explicit ordering
-python3 ./.trellis/scripts/task.py integration-claim <name>      # one integrator per lane
-python3 ./.trellis/scripts/task.py integration-release <name>
-python3 ./.trellis/scripts/task.py preflight <name>              # read-only, before merging
-
 # Code-spec context (injected into implement/check agents via JSONL).
 # `implement.jsonl` / `check.jsonl` are seeded (empty) on `task create` for sub-agent-capable
 # platforms; the AI curates real spec + research entries during planning. `validate` fails
@@ -77,8 +69,6 @@ python3 ./.trellis/scripts/task.py set-scope <name> <scope>
 python3 ./.trellis/scripts/task.py add-subtask <parent> <child>
 python3 ./.trellis/scripts/task.py remove-subtask <parent> <child>
 
-# PR creation
-python3 ./.trellis/scripts/task.py create-pr [name] [--dry-run]
 ```
 
 > Run `python3 ./.trellis/scripts/task.py --help` to see the authoritative, up-to-date list.
@@ -179,37 +169,15 @@ Phase 3: Finish  → verify, update spec, commit, and wrap up
 
 Use a parent task when one user request contains several independently verifiable deliverables. The parent task owns the source requirement set, the task map, cross-child acceptance criteria, and final integration review; it normally should not be the implementation target unless it also has direct work.
 
-Use child tasks for deliverables that can be planned, implemented, checked, and archived independently. Parent/child structure is not a dependency system: if one child must wait for another, write that ordering in the child `prd.md` / `implement.md`, record it with `task.py add-blocker <child> <blocker>` so `start` can enforce it, and keep each child's acceptance criteria testable.
+Use child tasks for deliverables that can be planned, implemented, checked, and archived independently. Parent/child structure is not a dependency system: if one child must wait for another, write that ordering in the child `prd.md` / `implement.md`, have the main session enforce it, and keep each child's acceptance criteria testable.
 
 Create new children with `task.py create "<title>" --slug <name> --parent <parent-dir>`. Link existing tasks with `task.py add-subtask <parent> <child>`, and unlink mistakes with `task.py remove-subtask <parent> <child>`.
 
 ### Task Coordination (parallel work)
 
-Tasks declare the resources they intend to occupy so overlap is caught at `start` instead of at merge.
-The declaration lives in `task.json.coordination`:
+Record task write scopes, ordering and shared resources in `prd.md` / `implement.md`. The bundled task lifecycle has no automatic path-claim or dependency lock; the main session checks these before concurrent work. For queued child work, declare `files` and `needs` through `coworkflow_dispatch`; those controls do not cover direct parent writes or other processes.
 
-- `owned_paths` — repository-relative files or globs this task will edit. `shared_paths` records the same
-  intent for paths known to be contended; it does **not** waive the conflict check.
-- `serialization_group` — a named mutex. Two `in_progress` tasks in the same group cannot coexist.
-- `blocked_by` — explicit, machine-checked ordering. This is what makes a child wait, not tree position.
-- `integration_lane` / `integration_active` — the serial integration queue. Ordinary development does not
-  occupy the lane; `integration-claim` does, and `integration-release` (or archive) frees it.
-
-`task.py start` checks dependencies and active claims **before** writing either the session pointer or
-`task.json.status`, so a refused start leaves both untouched. Only `in_progress` tasks hold resources —
-planning tasks never block anyone, so drafting many tasks is safe.
-
-Matching is deliberately conservative: exact files, directory prefixes and recursive globs are compared,
-and anything that cannot be normalized or compared counts as a conflict rather than a pass. Paths must be
-repository-relative; absolute paths and `..` are rejected.
-
-Projects list their own contended resources under `coordination.default_serialized_paths` in
-`.trellis/config.yaml` (for example `.trellis/spec/**` and migration directories). Two tasks that touch the
-same configured resource are refused even when their own `owned_paths` do not overlap.
-
-`task.py preflight <name>` is read-only. It checks status, branch, worktree cleanliness, changed paths
-against `owned_paths`, the integration lane, and resource conflicts. It never merges, commits, pushes,
-archives or deletes. Run it immediately before integrating, and integrate one task at a time.
+Use verified task worktrees, keep one writer per occupied path, and stop dependent work until its prerequisite has passed acceptance. Before integration inspect the actual branch, `git status`, commits and diff against the base, then integrate one task at a time through the main session. Keep unmerged or dirty worktrees intact.
 
 <!-- Per-turn breadcrumb: shown when there is no active task (before Phase 1) -->
 
@@ -231,8 +199,8 @@ Preserve existing task fields and artifacts. If the correct status cannot be det
 - 1.0 Create task `[required · once]` (only after task-creation consent)
 - 1.1 Requirement exploration `[required · repeatable]` (`prd.md`; complex tasks also need `design.md` + `implement.md`)
 - 1.2 Research `[optional · repeatable]`
-- 1.3 Configure context `[required · once]` — Claude Code, Cursor, OpenCode, Codex, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Oh My Pi, ZCode, Snow, Reasonix, Grok, Kimi Code (sub-agent-dispatch platforms only; inline platforms skip)
-- 1.4 Activate task `[required · once]` (review gate, then `task.py start`; status → in_progress). Declare `owned_paths` for shared files and `blocked_by` for ordering first — `start` refuses overlapping claims before it writes anything.
+- 1.3 Configure context `[required · once]` — read specs directly; curate child manifests when delegating
+- 1.4 Activate task `[required · once]` (review gate, then `task.py start`; status → in_progress). Record write scopes and prerequisites first; the main session enforces coordination.
 - 1.5 Completion criteria
 
 <!-- Per-turn breadcrumb: shown throughout Phase 1 (status='planning') -->
@@ -241,25 +209,18 @@ Preserve existing task fields and artifacts. If the correct status cannot be det
 Load `trellis-brainstorm`; stay in planning.
 Lightweight: `prd.md` can be enough. Complex: finish `prd.md`, `design.md`, and `implement.md`; ask for review before `task.py start`.
 Multi-deliverable scope: consider a parent task plus independently verifiable child tasks; dependencies must be written in child artifacts, not implied by tree position.
-Parallel work: declare `owned_paths` for every file you will touch and record ordering with `task.py add-blocker`; `start` refuses overlapping claims.
-Sub-agent mode: curate `implement.jsonl` and `check.jsonl` as spec/research manifests before start.
+Parallel work: record write scopes and ordering in task artifacts; the main session verifies isolation and prerequisites.
+Read relevant specs directly; curate manifests when delegating. Direct-only tasks may start with the existing `--allow-empty-context` flag if seeded manifests block start.
 [/workflow-state:planning]
 
-<!-- Per-turn breadcrumb: shown throughout Phase 1 when codex.dispatch_mode=inline.
-     Codex opt-in alternate to [workflow-state:planning], also used by Pi.
-     The main agent edits code directly in Phase 2, so jsonl curation is
-     skipped — the inline workflow loads `trellis-before-dev` instead of
-     injecting JSONL into a sub-agent. The Pi extension prefers this body
-     over the plain one whenever a `-inline` twin exists; see the note on
-     [workflow-state:in_progress] below for why the plain block keeps the
-     sub-agent wording. -->
+<!-- Inline fallback retained for platform compatibility. -->
 
 [workflow-state:planning-inline]
 Load `trellis-brainstorm`; stay in planning.
 Lightweight: `prd.md` can be enough. Complex: finish `prd.md`, `design.md`, and `implement.md`; ask for review before `task.py start`.
 Multi-deliverable scope: consider a parent task plus independently verifiable child tasks; dependencies must be written in child artifacts, not implied by tree position.
-Parallel work: declare `owned_paths` for every file you will touch and record ordering with `task.py add-blocker`; `start` refuses overlapping claims.
-Inline mode: skip jsonl curation; Phase 2 reads artifacts/specs via `trellis-before-dev`.
+Parallel work: record write scopes and ordering in task artifacts; the main session verifies isolation and prerequisites.
+Read relevant specs directly; curate manifests when delegating. Direct-only tasks may start with the existing `--allow-empty-context` flag if seeded manifests block start.
 [/workflow-state:planning-inline]
 
 ### Phase 2: Execute
@@ -273,35 +234,23 @@ Inline mode: skip jsonl curation; Phase 2 reads artifacts/specs via `trellis-bef
      therefore must cover every required step from implementation through
      commit, including Phase 3.3 spec update and Phase 3.4 commit. -->
 
-Sub-agent dispatch protocol applies to all platforms and all sub-agents, including native Codex `SubagentStart` context injection with child-side pull fallback, class-2 Gemini/Qoder/Copilot/Reasonix/Trae/Grok/Kimi Code, hook-backed ZCode/Snow, and the research kind: every dispatch prompt starts with `Active task: <task path from task.py current>` before role-specific instructions. On Grok Build, use `spawn_subagent` with `subagent_type` set to the kind's agent name (e.g. `cw-executor`; live names from /Coworkflow:status). On Kimi Code, dispatch the built-in `coder` / `explore` sub-agent with the matching `.kimi-code/skills/trellis-<role>/SKILL.md` instructions.
+Optional dispatch protocol: use a currently registered project kind. Start with `Active task: <real task path>` for task-bound work, or `Active task: (none)` for an independent bounded job with self-contained inputs; no new task is required just to delegate it. Specify scope, output, checks and budget. Children work directly and never delegate again. Keep background execution, admission and write isolation.
 
 [workflow-state:in_progress]
-Tools: dispatch the kinds — `cw-executor` / `cw-auditor` / `cw-researcher` (live names from /Coworkflow:status; the template ships no `trellis-*` agents). `trellis-before-dev` / `trellis-update-spec` / `trellis-break-loop` are skills.
-Flow: execute kind -> audit kind -> `trellis-update-spec` -> commit (Phase 3.4) -> `/trellis:finish-work`.
-Main-session default: dispatch the execute and audit kinds. Sub-agent self-exemption: an executor must not spawn another executor or auditor; an auditor must not spawn another auditor or executor. Dispatch is main session only.
-Dispatch prompt starts with `Active task: <task path from task.py current>`. Read context: jsonl entries -> `prd.md` -> `design.md if present` -> `implement.md if present`.
-Before integrating: run `task.py preflight <name>` and hold the integration lane with `integration-claim`; one task integrates at a time.
+Flow: `trellis-before-dev` -> implement directly -> check the affected scope -> `trellis-update-spec` -> commit (Phase 3.4) -> `/trellis:finish-work`.
+The main session implements and validates by default. Delegate only when a bounded task or independent advice justifies the handoff cost; no mandatory execute/audit pipeline. Final decisions and acceptance stay in the main session.
+Read context: `prd.md` -> `design.md if present` -> `implement.md if present`, plus relevant spec/research loaded by skills.
+Before integrating: inspect the actual branch, git status and diff against the base; one main-session integrator acts at a time.
 [/workflow-state:in_progress]
 
-<!-- Per-turn breadcrumb: shown while status='in_progress' when
-     codex.dispatch_mode=inline, also used by Pi. Alternate to
-     [workflow-state:in_progress]. The main session edits code directly
-     instead of dispatching sub-agents.
-
-     The plain blocks above stay sub-agent worded on purpose. The Pi
-     extension resolves the status to a phase step first (`stepForStatus`:
-     planning -> 1.1, in_progress -> 2.1) and only falls back to a body when
-     that step yields no detail, and on that fallback it prefers the
-     `-inline` twin. Pi therefore never reads the plain bodies, while the
-     platforms whose hooks inject them (`resolve_breadcrumb_key` returns the
-     plain status for everything but codex) still get dispatch guidance that
-     matches their step 2.1. -->
+<!-- Inline fallback retained for existing platform hooks; it follows the same
+     direct-first policy as the plain breadcrumb and phase details. -->
 
 [workflow-state:in_progress-inline]
 Flow: `trellis-before-dev` -> implement directly -> check the affected scope -> `trellis-update-spec` -> commit (Phase 3.4) -> `/trellis:finish-work`.
 The main session implements and validates by default. Delegate only when a bounded task or independent advice justifies the handoff cost; no mandatory execute/audit pipeline. Final decisions and acceptance stay in the main session.
 Read context: `prd.md` -> `design.md if present` -> `implement.md if present`, plus relevant spec/research loaded by skills.
-Before integrating: run `task.py preflight <name>` and hold the integration lane with `integration-claim`; one task integrates at a time.
+Before integrating: inspect the actual branch, git status and diff against the base; one main-session integrator acts at a time.
 [/workflow-state:in_progress-inline]
 
 ### Phase 3: Finish
@@ -336,36 +285,9 @@ Code committed. Run `/trellis:finish-work`; if dirty, return to Phase 3.4 first.
 
 When a user request matches one of these intents inside an active task, route first, then load the detailed phase step if needed.
 
-[Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
-
 - Planning or unclear requirements -> `trellis-brainstorm`.
-- `in_progress` implementation/check -> dispatch the execute kind / the audit kind (`cw-executor` / `cw-auditor`; live names from /Coworkflow:status).
+- Before editing -> `trellis-before-dev`; implement and check directly in the main session. An independent review is optional when risk justifies it; select a currently registered project kind.
 - Repeated debugging -> `trellis-break-loop`; spec updates -> `trellis-update-spec`.
-
-[/Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
-
-[codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
-
-- Planning or unclear requirements -> `trellis-brainstorm`.
-- Before editing -> `trellis-before-dev`; implement and check directly in the main session. An independent review is optional when risk justifies it; if delegating, use a kind `/Coworkflow:status` lists.
-- Repeated debugging -> `trellis-break-loop`; spec updates -> `trellis-update-spec`.
-
-[/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
-
-### Guardrails
-
-- Task creation approval is not implementation approval; implementation waits for `task.py start` after artifact review.
-- PRD-only is valid for lightweight tasks; complex tasks need `design.md` + `implement.md`.
-- Planning must be persisted to task artifacts; checks must run before reporting completion.
-
-### Loading Step Detail
-
-At each step, run this to fetch detailed guidance:
-
-```bash
-python3 ./.trellis/scripts/get_context.py --mode phase --step <step>
-# e.g. python3 ./.trellis/scripts/get_context.py --mode phase --step 1.1
-```
 
 ---
 
@@ -417,21 +339,7 @@ Return to this step whenever requirements change and revise the relevant artifac
 
 Research can happen at any time during requirement exploration. It isn't limited to local code — you can use any available tool (MCP servers, skills, web search, etc.) to look up external information, including third-party library docs, industry practices, API references, etc.
 
-[Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
-
-Spawn the research sub-agent:
-
-- **Agent type**: `cw-researcher`
-- **Task description**: Research <specific question>
-- **Key requirement**: Research output MUST be persisted to `{TASK_DIR}/research/`
-
-[/Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
-
-[codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
-
-Do the research in the main session directly and write findings into `{TASK_DIR}/research/`. When a concrete question benefits from independent planning advice or separable research enough to justify a child session, optionally delegate it to an available project kind. Ask for evidence and alternatives, not an automatic implementation. The main session owns the final decision. Models and kind names come from project configuration, not this workflow.
-
-[/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
+Do research directly by default. Delegate a concrete question only when independent advice or separable investigation justifies the handoff. Ask an available project kind for evidence, limitations and relevant alternatives; the main session decides. Persist material task findings into `{TASK_DIR}/research/`; if a read-only child returns them in chat, the main session writes the artifact.
 
 **Research artifact conventions**:
 - One file per research topic (e.g. `research/auth-library-comparison.md`)
@@ -444,58 +352,16 @@ Brainstorm and research can interleave freely — pause to research a technical 
 
 #### 1.3 Configure context `[required · once]`
 
-[Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
+Load relevant task artifacts and specs directly with `trellis-before-dev`. Direct-only tasks do not need child manifests; if seeded files block `task.py start`, use its existing `--allow-empty-context` option for this explicit direct-only choice.
 
-Curate `implement.jsonl` and `check.jsonl` so the Phase 2 sub-agents get the right spec/research context. These files were seeded on `task create` with a single self-describing `_example` line; your job here is to fill in real entries.
-
-**Location**: `{TASK_DIR}/implement.jsonl` and `{TASK_DIR}/check.jsonl` (already exist).
-
-**Format**: one JSON object per line — `{"file": "<path>", "reason": "<why>"}`. Paths are repo-root relative.
-
-**What to put in**:
-- **Spec files** — `.trellis/spec/<package>/<layer>/index.md` and any specific guideline files (`error-handling.md`, `conventions.md`, etc.) relevant to this task
-- **Research files** — `{TASK_DIR}/research/*.md` that the sub-agent will need to consult
-
-**What NOT to put in**:
-- Code files (`src/**`, `packages/**/*.ts`, etc.) — those are read by the sub-agent during implementation, not pre-registered here
-- Files you're about to modify — same reason
-
-**Split between the two files**:
-- `implement.jsonl` → specs + research the implement sub-agent needs to write code correctly
-- `check.jsonl` → specs for the check sub-agent (quality guidelines, check conventions, same research if needed)
-
-These manifests do not replace `implement.md`. `implement.md` is the human-readable execution plan for a complex task; jsonl files only list context files to inject or load.
-
-**How to discover relevant specs**:
+Before delegating task-bound implementation or review, curate the relevant `implement.jsonl` or `check.jsonl` with spec/research paths and reasons. Seed examples are not context; code to modify is read by the child itself. Planning with `context: task` reuses task artifacts and `implement.jsonl`; research defaults to the spec tree.
 
 ```bash
 python3 ./.trellis/scripts/get_context.py --mode packages
+python3 ./.trellis/scripts/task.py add-context "$TASK_DIR" implement "<spec/research path>" "<reason>"
 ```
 
-Lists every package + its spec layers with paths. Pick the entries that match this task's domain.
-
-**How to append entries**:
-
-Either edit the jsonl file directly in your editor, or use:
-
-```bash
-python3 ./.trellis/scripts/task.py add-context "$TASK_DIR" implement "<path>" "<reason>"
-python3 ./.trellis/scripts/task.py add-context "$TASK_DIR" check "<path>" "<reason>"
-```
-
-Delete the seed `_example` line once real entries exist (optional — it's skipped automatically by consumers).
-
-Ready gate: both `implement.jsonl` and `check.jsonl` must contain at least one real `{"file": "...", "reason": "..."}` entry before `task.py start`. The seed `_example` row alone is not ready.
-
-Skip this step only when both files already have real curated entries.
-
-[/Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
-
-[codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
-
-Skip this step. Context is loaded directly by the `trellis-before-dev` skill in Phase 2.
-
-[/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
+Manifests provide context, not an execution plan; complex tasks still need `implement.md`.
 
 #### 1.4 Activate task `[required · once]`
 
@@ -505,7 +371,7 @@ After artifact review, flip the task status to `in_progress`:
 python3 ./.trellis/scripts/task.py start <task-dir>
 ```
 
-For lightweight tasks, `prd.md` can be enough. For complex tasks, `prd.md`, `design.md`, and `implement.md` must exist and be reviewed before start. On sub-agent-dispatch platforms, `implement.jsonl` and `check.jsonl` must both have real curated entries before start. Runtime consumers tolerate missing or seed-only manifests for compatibility, but that tolerance is not a planning-ready state.
+For lightweight tasks, `prd.md` can be enough. For complex tasks, `prd.md`, `design.md`, and `implement.md` must exist and be reviewed before start. For task-bound delegation, curate the relevant manifests first. Direct-only tasks may use the existing `--allow-empty-context` flag if seeded manifests block start; this does not authorize dispatching unprepared work.
 
 After this command succeeds, the breadcrumb auto-switches to `[workflow-state:in_progress]`, and the rest of Phase 2 / 3 follows.
 
@@ -522,11 +388,7 @@ If `task.py start` errors with a session-identity message (no context key from h
 | `design.md` exists (complex tasks) | ✅ |
 | `implement.md` exists (complex tasks) | ✅ |
 
-[Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
-
-| `implement.jsonl` and `check.jsonl` each contain at least one real curated entry (seed row does not count) | ✅ |
-
-[/Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
+| Relevant context manifests are curated before task-bound delegation | when delegating |
 
 ---
 
@@ -536,91 +398,24 @@ Goal: turn reviewed planning artifacts into code that passes quality checks.
 
 #### 2.1 Implement `[required · repeatable]`
 
-[Claude Code, Cursor, OpenCode, codex-sub-agent, CodeBuddy, Droid, ZCode, Snow, Oh My Pi]
-
-Spawn the implement sub-agent:
-
-- **Agent type**: `cw-executor`
-- **Task description**: Implement the reviewed task artifacts, consulting materials under `{TASK_DIR}/research/`; finish by running project lint and type-check
-- **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then tell the spawned agent it is already the execute sub-agent and must implement directly, not spawn another sub-agent.
-
-The platform hook/plugin auto-handles:
-- Reads `implement.jsonl` and injects referenced spec/research files into the agent prompt
-- Injects `prd.md`, `design.md` if present, and `implement.md` if present
-- For Codex, `SubagentStart` supplies native context injection; the agent profile keeps child-side loading as the fallback
-
-[/Claude Code, Cursor, OpenCode, codex-sub-agent, CodeBuddy, Droid, ZCode, Snow, Oh My Pi]
-
-[Gemini, Qoder, Copilot, Reasonix, Trae, Grok, Kimi Code]
-
-Spawn the implement sub-agent:
-
-- **Agent type**: `cw-executor`
-- **Task description**: Implement the reviewed task artifacts, consulting materials under `{TASK_DIR}/research/`; finish by running project lint and type-check
-- **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then explicitly say the spawned agent is already the execute sub-agent and must implement directly without spawning another sub-agent.
-
-The pull-based sub-agent definition auto-handles the context load requirement:
-- Resolves the active task with `task.py current --source`, then reads `prd.md`, `design.md` if present, and `implement.md` if present
-- Reads `implement.jsonl` and requires the agent to load each referenced spec/research file before coding
-
-[/Gemini, Qoder, Copilot, Reasonix, Trae, Grok, Kimi Code]
-
-[Kiro]
-
-Spawn the implement sub-agent:
-
-- **Agent type**: `cw-executor`
-- **Task description**: Implement the reviewed task artifacts, consulting materials under `{TASK_DIR}/research/`; finish by running project lint and type-check
-- **Dispatch prompt guard**: Tell the spawned agent it is already the execute sub-agent and must implement directly, not spawn another sub-agent.
-
-The platform prelude auto-handles the context load requirement:
-- Reads `implement.jsonl` and injects referenced spec/research files into the agent prompt
-- Injects `prd.md`, `design.md` if present, and `implement.md` if present
-
-[/Kiro]
-
-[codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
-
 Implement directly in the main session by default:
 
 - Load `trellis-before-dev`; read `prd.md`, `design.md` if present, `implement.md` if present, and relevant spec/research.
 - Work in the task's verified worktree. Implement the approved scope, then run the affected project checks (lint, type-check and tests as applicable).
 - Optional delegation: use a kind `/Coworkflow:status` lists, only for a bounded, independently checkable task or concrete planning advice when its benefit exceeds context and handoff cost. Duration alone is not a reason to delegate or choose a lower-cost model.
 - Keep model and role choices configurable; do not add a fixed planner/executor/reviewer pipeline.
-- If delegating, supply the active task, necessary context, write scope, expected output and budget. Use background execution and preserve admission, isolation and no-recursive-delegation rules.
+- If delegating, supply a real task reference (or explicit `(none)` for an independent job), necessary context, write scope, expected output and budget. Use background execution and preserve admission, isolation and no-recursive-delegation rules.
 - Do not edit a child's occupied paths. Accept its actual deliverable in the correct worktree, and supplement evidence only where missing or invalidated by integration. Otherwise continue directly; parallelism is not a target.
 
-[/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
-
 #### 2.2 Quality check `[required · repeatable]`
-
-[Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
-
-Spawn the check sub-agent:
-
-- **Agent type**: `cw-auditor`
-- **Task description**: Review all code changes against specs and task artifacts; fix any findings directly; ensure lint and type-check pass
-- **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then tell the spawned agent it is already the audit sub-agent and must review/fix directly, not spawn another sub-agent.
-
-The check agent's job:
-- Review code changes against specs
-- Review code changes against `prd.md`, `design.md` if present, and `implement.md` if present
-- Auto-fix issues it finds
-- Run lint and typecheck to verify
-
-[/Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
-
-[codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
 Check the work directly in the main session by default:
 
 - Compare the diff and actual outputs with `prd.md`, `design.md` if present, `implement.md` if present, and relevant project specs.
 - Run the smallest sufficient affected checks; include cross-layer consistency when the change crosses layers. Fix findings and re-check the affected behavior.
-- Optional delegation: request an independent review from a kind `/Coworkflow:status` lists when risk or a second perspective justifies the cost. A separate reviewer is not required for every change.
+- Optional delegation: request an independent review from a kind `/Coworkflow:status` lists when risk or a second perspective justifies the cost. A separate reviewer is not required for every change. The reviewer is read-only: report findings and repair suggestions; do not edit or auto-fix. The main session owns repairs.
 - A child's verdict is evidence, not final acceptance. Inspect its findings and check results; do not repeat unchanged checks merely because they ran in a child. Re-run what integration changed or what lacks evidence.
 - Keep final acceptance, commits and integration in the main session.
-
-[/codex-inline, Pi, Kilo, Antigravity, Devin, DeepSeek Harness]
 
 **Final pass (before Phase 3.4 commit)**: the last 2.2 of a task must run full-scope, not just on the latest implement chunk. List all affected packages with `python3 ./.trellis/scripts/get_context.py --mode packages`, then load each package's spec index Quality Check section. This catches cross-layer / multi-package issues a mid-iteration local 2.2 cannot.
 
