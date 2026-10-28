@@ -197,6 +197,10 @@ test("instructions: direct execution is normal, delegation optional, safety reta
   const parent = readFileSync(join(root, "AGENTS.md"), "utf-8");
   const child = readFileSync(join(root, SUBAGENT_GUIDE_REL), "utf-8");
   assert.ok(parent.startsWith(projectRule), "rendering preserves project-owned guidance");
+  assert.equal(parent.split("<!-- pi-Coworkflow:start -->").length - 1, 1);
+  assert.equal(parent.split("<!-- pi-Coworkflow:end -->").length - 1, 1);
+  await agentsModule.apply?.(ctx);
+  assert.equal(readFileSync(join(root, "AGENTS.md"), "utf-8"), parent, "refresh is idempotent");
   assert.match(parent, /主会话默认负责端到端交付/);
   assert.match(parent, /只有收益高于重复上下文、交接和集成成本时才派单/);
   assert.match(parent, /不硬编码模型名称/);

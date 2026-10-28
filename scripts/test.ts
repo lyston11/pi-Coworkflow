@@ -823,7 +823,7 @@ test("agents: the division measurement and its nudge are gone", async () => {
   const region = readFileSync(here("../modules/agents/assets/main-AGENTS.region.md"), "utf-8");
   assert.doesNotMatch(region, /≥12 次工具调用/, "the threshold instruction is gone from the region");
   assert.doesNotMatch(region, /agents` 模块会数这个/, "and so is the claim that a module counts it");
-  assert.match(region, /pi-Coworkflow:start/, "the region keeps its sentinels");
+  assert.doesNotMatch(region, /<!-- pi-Coworkflow:(?:start|end) -->/, "the renderer owns the sentinels, not the asset");
   // Named workflows are still documented, but as an option for delegated multi-stage
   // work — not as the shape every task must take.
   assert.match(region, /命名 workflow/, "named workflows remain an option for delegated multi-stage work");

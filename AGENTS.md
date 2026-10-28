@@ -21,7 +21,6 @@ Managed by Trellis. Edits outside this block are preserved; edits inside may be 
 <!-- TRELLIS:END -->
 
 <!-- pi-Coworkflow:start -->
-<!-- pi-Coworkflow:start -->
 ## 工作流约束（pi-Coworkflow 受管区）
 
 本区由 `pi-Coworkflow` 生成；修改本包模板后通过 `/Coworkflow:init` 刷新，不手工编辑受管区。项目补充写在区外。
@@ -67,6 +66,4 @@ Managed by Trellis. Edits outside this block are preserved; edits inside may be 
 - 禁止 `reset --hard`、`rebase`、`push -f`、切到他人分支或改写基线历史；需新基线时 fetch 后 merge。丢提交时先停写，用 reflog 定位并建 rescue 分支固定，再恢复。
 - 合并由主会话或唯一集成通道执行。`/Coworkflow:merge` 遇未提交改动或冲突会停下，不自动 push 或删除 worktree。
 - 完成任务后归档；仅在分支已合并且 worktree 无未提交代码时，执行 `git worktree remove` 和 `git branch -d`，报告清理结果。条件不足保留现场并说明；禁止用 `--force` 或 `-D` 掩盖未交付工作。
-<!-- pi-Coworkflow:end -->
-<!-- pi-Coworkflow:end -->
 <!-- pi-Coworkflow:end -->
