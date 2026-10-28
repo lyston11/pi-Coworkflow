@@ -18,7 +18,7 @@
  */
 
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,105 +28,55 @@ import { test } from "node:test";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const WORKFLOW = join(ROOT, ".trellis", "workflow.md");
 
-// ── platform block parsing ────────────────────────────────────────────
+// ── .trellis/workflow.md: one body, no platform-specific dispatch ─────
 
 /**
- * Split a workflow document into the bodies of its platform blocks.
+ * The workflow document no longer carries per-platform blocks.
  *
- * A platform block opens with `[Claude Code, Cursor, …]` and closes with
- * `[/…]`; task-state blocks look identical but carry a `:` in the marker
- * (`[workflow-state:in_progress]`) and are not platform-specific, so they are
- * left in the surrounding text.
- */
-function platformBlocks(md: string): { pi: string[]; other: string[]; outside: string[] } {
-  const pi: string[] = [];
-  const other: string[] = [];
-  const outside: string[] = [];
-  let current: { name: string; body: string[] } | null = null;
-
-  for (const line of md.split("\n")) {
-    const open = /^\[([^\]]+)\]$/.exec(line)?.[1];
-    const close = /^\[\/([^\]]+)\]$/.exec(line)?.[1];
-    if (current === null && open !== undefined && !open.includes(":")) {
-      current = { name: open, body: [] };
-      continue;
-    }
-    if (current !== null && close === current.name) {
-      const body = current.body.join("\n");
-      (current.name.split(",").map((part) => part.trim()).includes("Pi") ? pi : other).push(body);
-      current = null;
-      continue;
-    }
-    if (current !== null) current.body.push(line);
-    else outside.push(line);
-    // `close` is read above; an unmatched closer is document text.
-  }
-  return { pi, other, outside };
-}
-
-const digest = (text: string): string => createHash("sha256").update(text, "utf-8").digest("hex");
-
-/**
- * sha256 of the non-Pi platform blocks, joined by `\n--\n`.
+ * It used to hold eleven `[Claude Code, Cursor, …]` blocks that each named an agent
+ * to dispatch, which meant every platform read a different protocol and a rewrite of
+ * one block silently changed another platform's behaviour. The policy is now one
+ * document: the main session implements and checks by default, and delegation is an
+ * option that names "a kind /Coworkflow:status lists" instead of a fixed agent.
  *
- * Recorded from the document *before* the kind-only rewrite: identical digests
- * are the proof that Claude Code / Codex / Cursor / Gemini / Kiro / … see the
- * same bytes they saw yesterday. If a future edit to those blocks is intended,
- * recompute this with `node --experimental-strip-types scripts/trellis-surface.test.ts`
- * only after reading why it changed.
+ * What must hold is therefore structural: no platform marker survives, and the two
+ * Phase 2 steps keep the direct-first wording that replaced the dispatch protocol.
+ * A reintroduced block would bring back exactly the divergence this removed.
  */
-const NON_PI_DIGEST = "a86089cb801ef9c75b77c56408199939cb68adbe430b963ff8aac1a4f6fcac8f";
-
 const workflow = readFileSync(WORKFLOW, "utf-8");
-const blocks = platformBlocks(workflow);
 
-// ── .trellis/workflow.md: Pi speaks kinds, nobody else moves ──────────
+test("workflow: no platform-specific block survives, so every platform reads one protocol", () => {
+  const markers = [...workflow.matchAll(/^\[([^\]\n]+)\]$/gm)].map((match) => match[1]!);
+  const platformMarkers = markers.filter((name) => !name.startsWith("/") && !name.includes(":"));
+  assert.deepEqual(platformMarkers, [], "a platform block was reintroduced");
+  assert.doesNotMatch(workflow, /Agent type\*\*/, "no step dispatches a fixed agent any more");
+  assert.doesNotMatch(workflow, /trellis-(implement|check|research)/, "a retired role agent is still named");
+  assert.doesNotMatch(workflow, /cw-(executor|auditor|researcher|planner|worker)/, "no kind is hardcoded");
+});
 
-test("workflow: the Pi blocks name kinds, never the trellis-* role agents", () => {
-  assert.equal(blocks.pi.length, 5, "expected the five `[codex-inline, Pi, …]` blocks");
-  const piText = blocks.pi.join("\n");
-  for (const body of blocks.pi) {
-    assert.doesNotMatch(body, /Agent type\*\*:\s*`trellis-/, "a Pi block still dispatches a trellis-* agent type");
-    assert.doesNotMatch(
-      body,
-      /trellis-(implement|check|research)/,
-      "a Pi block still mentions a trellis-* role agent instead of its kind",
-    );
+test("workflow: implement and check default to the main session and keep acceptance there", () => {
+  assert.match(workflow, /Implement directly in the main session by default/);
+  assert.match(workflow, /Check the work directly in the main session by default/);
+  assert.match(workflow, /Keep final acceptance, commits and integration in the main session/);
+  assert.match(workflow, /A child's verdict is evidence, not final acceptance/);
+  assert.match(workflow, /Optional delegation/, "delegation stays available, as an option");
+  assert.match(workflow, /\/Coworkflow:status/, "the live kind list is where agent names come from");
+  assert.match(workflow, /reviewer is read-only/, "a delegated review never edits the work it reviews");
+  // The retired protocol: dispatch every step to a named agent.
+  assert.doesNotMatch(workflow, /Spawn the (implement|check) sub-agent|Dispatch the (implementation|quality check) to/);
+});
+
+test("workflow: every task command it documents actually exists", () => {
+  const help = execFileSync(
+    process.platform === "win32" ? "python" : "python3",
+    [join(ROOT, ".trellis", "scripts", "task.py"), "--help"],
+    { encoding: "utf-8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } },
+  );
+  const documented = new Set([...workflow.matchAll(/task\.py ([a-z][a-z-]*)/g)].map((match) => match[1]!));
+  assert.ok(documented.size > 0, "the document still documents the task CLI");
+  for (const command of documented) {
+    assert.ok(help.includes(command), `workflow documents a task command that does not exist: ${command}`);
   }
-  // The Pi blocks no longer pin a kind by name: the main session implements and checks
-  // directly, and optional delegation names "an available project kind". What must hold
-  // is that they never name a retired agent, and that they point at the live list.
-  assert.doesNotMatch(piText, /cw-(executor|auditor|researcher|planner|worker)/, "no kind is hardcoded in the Pi steps");
-  assert.match(piText, /available project kind/, "optional delegation names the configured kinds, not a fixed one");
-  assert.match(piText, /\/Coworkflow:status/, "the live kind list is where the names come from");
-});
-
-test("workflow: the Pi implement/check steps default to the main session and keep acceptance there", () => {
-  const piText = blocks.pi.join("\n");
-  assert.match(piText, /Implement directly in the main session by default/);
-  assert.match(piText, /Check the work directly in the main session by default/);
-  assert.match(piText, /Keep final acceptance, commits and integration in the main session/);
-  assert.match(piText, /A child's verdict is evidence, not final acceptance/);
-  // The old inline instruction told the main session to do the work itself.
-  assert.doesNotMatch(piText, /^1\. Load the `trellis-before-dev` skill/m);
-  assert.doesNotMatch(piText, /^\d\. Implement the code per reviewed artifacts$/m);
-});
-
-test("workflow: the non-Pi platform blocks are unchanged except for the agent names they dispatch", () => {
-  assert.equal(blocks.other.length, 8, "expected the eight non-Pi platform blocks");
-  // Every platform reads this one document, and the template ships no `trellis-*` agents, so
-  // the other platforms must dispatch the kinds too — a block that names an agent the project
-  // does not have is broken guidance wherever it is read. What is pinned here is that nothing
-  // *else* changed: the same eight blocks, the same dispatch structure, the same sentence shape.
-  const otherText = blocks.other.join("\n");
-  assert.doesNotMatch(otherText, /Agent type\*\*: `trellis-/, "no platform may dispatch a retired agent");
-  assert.equal(otherText.split("Agent type**: `cw-executor`").length - 1, 3);
-  assert.equal(otherText.split("Agent type**: `cw-auditor`").length - 1, 1);
-  assert.equal(otherText.split("Agent type**: `cw-researcher`").length - 1, 1);
-  // Pinned as a snapshot on purpose: the block set and its structure are what this test
-  // protects. A deliberate change (like renaming the dispatched agents) updates the constant
-  // in the same commit; an accidental edit to some other platform's protocol does not.
-  assert.equal(digest(otherText), NON_PI_DIGEST, "a non-Pi platform block changed beyond the agent names");
 });
 
 // ── modules/trellis: the role-agent guard ─────────────────────────────

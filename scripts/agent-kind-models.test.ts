@@ -32,7 +32,8 @@ import { test } from "node:test";
 
 import { createConfigRootResolver, isKindModel, isThinkingLevel, readConfig } from "../core/config.ts";
 import { exportEntry } from "../core/subagents-workflow.ts";
-import { agentKindsModule, childModelFor, kindRegistrationPlan, syncAgentKinds } from "../modules/agent-kinds/index.ts";
+import { agentKindsModule, childModelFor, kindRegistrationPlan, modelForKind, syncAgentKinds } from "../modules/agent-kinds/index.ts";
+import { resolveKinds } from "../modules/agent-kinds/defaults.ts";
 import {
   createKindRegistry,
   disposeKindRegistrations,
@@ -593,6 +594,113 @@ test("child model: the dispatch gate writes it into every launch shape and leave
     const refused = (await call({ agent: "reviewer", task: "x" })) as { block?: boolean; reason?: string } | undefined;
     assert.equal(refused?.block, true);
     assert.match(String(refused?.reason), /不在当前模型注册表中/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("child model: a kind's own model wins over the project default, and the default still applies where no kind decided", () => {
+  const root = mkdtempSync(join(tmpdir(), "coworkflow-kind-model-precedence-"));
+  try {
+    // Two kinds, two models, plus the project default: the arrangement the panel exists
+    // for. The owner resolves a launch as `stepOverrides.model ?? agentConfig.model`, so a
+    // default written into the dispatch outranks the kind — the bug this pins.
+    writeKinds(root, {
+      executor: { model: "kind/pinned" },
+      auditor: { model: "kind/audit" },
+      researcher: { enabled: true },
+    });
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    writeFileSync(join(root, ".pi", "settings.json"), JSON.stringify({ subagents: { defaultModel: "proj/default" } }));
+    const runtime = modelRuntime(root);
+    const registry = registryOf([["kind", "pinned"], ["kind", "audit"], ["proj", "default"]]);
+
+    // The resolver is the one decision point both entries use.
+    assert.deepEqual(modelForKind("executor", resolveKinds(readConfig(root), undefined), runtime, registry), {
+      model: "kind/pinned",
+    });
+    assert.deepEqual(modelForKind("cw-auditor", resolveKinds(readConfig(root), undefined), runtime, registry), {
+      model: "kind/audit",
+    });
+    // No kind model of its own: the project default is what applies.
+    assert.deepEqual(modelForKind("researcher", resolveKinds(readConfig(root), undefined), runtime, registry), {
+      model: "proj/default",
+    });
+    // An agent this package does not own has no kind page either.
+    assert.deepEqual(modelForKind(undefined, resolveKinds(readConfig(root), undefined), runtime, registry), {
+      model: "proj/default",
+    });
+    // Nothing declared anywhere: the owner's own precedence stays in charge.
+    writeFileSync(join(root, ".pi", "settings.json"), JSON.stringify({}));
+    assert.equal(modelForKind("researcher", resolveKinds(readConfig(root), undefined), runtime, registry), null);
+    // A kind's own model is not checked against the registry: it travels inside the
+    // registration the owner already accepted, so refusing it here would be a second,
+    // disagreeing answer. The default still is checked, because it is resolved here.
+    assert.deepEqual(modelForKind("executor", resolveKinds(readConfig(root), undefined), runtime, registry), {
+      model: "kind/pinned",
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("child model: the gate writes each kind's own model into every launch shape", async () => {
+  const root = mkdtempSync(join(tmpdir(), "coworkflow-kind-model-gate-"));
+  try {
+    writeKinds(root, { executor: { model: "kind/pinned" }, auditor: { model: "kind/audit" } });
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    writeFileSync(join(root, ".pi", "settings.json"), JSON.stringify({ subagents: { defaultModel: "proj/default" } }));
+    const runtime = modelRuntime(root);
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+    const host = {
+      on: (name: string, fn: (event: unknown, ctx: unknown) => Promise<unknown>) => {
+        handlers.set(name, fn);
+        return () => {};
+      },
+      events: { on: () => () => {}, emit() {} },
+      registerCommand() {},
+      registerTool() {},
+      getActiveTools: () => [],
+    };
+    agentKindsModule.activate?.(host as never, runtime);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const gate = handlers.get("tool_call");
+    if (gate === undefined) throw new Error("the tool_call gate is not registered");
+    const ctx = { modelRegistry: registryOf([["kind", "pinned"], ["kind", "audit"], ["proj", "default"]]) };
+    const call = async (input: Record<string, unknown>) => await gate({ toolName: "subagent", input }, ctx);
+
+    // The model is written before the registration check, so these assertions read the
+    // rewrite itself: whether this temp project has a live pi-subagents is a different
+    // question, already covered by the registration tests above.
+    const single: Record<string, unknown> = { agent: "cw-executor", task: "x" };
+    await call(single);
+    assert.equal(single.model, "kind/pinned", "a kind's own model is not overruled by the default");
+
+    // A batch resolves per entry: two kinds, two models, in one call.
+    const batch: Record<string, unknown> = {
+      workflow: "coworkflow.fanout",
+      args: { tasks: [{ kind: "executor", task: "a" }, { kind: "auditor", task: "b" }, { kind: "executor", task: "c", model: "own/keep" }] },
+    };
+    await call(batch);
+    const tasks = (batch.args as { tasks: Record<string, unknown>[] }).tasks;
+    assert.equal(tasks[0]?.model, "kind/pinned");
+    assert.equal(tasks[1]?.model, "kind/audit");
+    assert.equal(tasks[2]?.model, "own/keep", "an explicit model is still the caller's decision");
+
+    // A plain agent has no kind page, so the project default applies to it.
+    const plain: Record<string, unknown> = { agent: "reviewer", task: "x" };
+    assert.equal(await call(plain), undefined);
+    assert.equal(plain.model, "proj/default");
+
+    // The default is still validated: a kindless launch refuses an unusable default.
+    writeFileSync(join(root, ".pi", "settings.json"), JSON.stringify({ subagents: { defaultModel: "proj/gone" } }));
+    const refused = (await call({ agent: "reviewer", task: "x" })) as { block?: boolean; reason?: string } | undefined;
+    assert.equal(refused?.block, true);
+    assert.match(String(refused?.reason), /不在当前模型注册表中/);
+    // ...while a kind that pinned its own model never consults the broken default at all.
+    const pinned: Record<string, unknown> = { agent: "cw-executor", task: "x" };
+    await call(pinned);
+    assert.equal(pinned.model, "kind/pinned");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

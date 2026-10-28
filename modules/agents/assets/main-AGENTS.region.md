@@ -20,7 +20,8 @@
 - kind 按用途分；随附 executor（委派实现）、planner（方案建议）、auditor（只读审查）、researcher（事实调查）、worker（已定步骤）。可以增删或改名。
 - 每个类型的完整提示词在 `.pi/Coworkflow/agents/<kind>.md`；frontmatter 声明用途、agent、role、context 与默认参数。CLI：`pi-coworkflow kind scaffold|export|set --from|check`。
 - 模型按用途分别配在 `.pi/Coworkflow.json` 的 `agentKinds.<kind>.model`；数量与开关也沿用项目配置，随附默认上限 {{kindLimit}}。不硬编码模型名称，不按耗时推定适合低成本模型。
-- `/Comodels` 主会话页只影响当前会话，默认子 agent 页写项目 `.pi/settings.json` 的 `subagents.*`，各 kind 页写各自配置。父会话解析默认模型后随启动下发；无效模型拒绝派单并说明原因。
+- `/Comodels` 主会话页只影响当前会话，默认子 agent 页写项目 `.pi/settings.json` 的 `subagents.*`，各 kind 页写各自配置。
+- 模型优先级：该 kind 自己配的模型 > 默认子 agent 模型 > 上游自己的继承。默认模型只补“该 kind 没定”的位置，不会覆盖 kind 页；否则五个 kind 只能跑同一个模型。无效模型拒绝派单并说明原因。
 - 派单失败时先读并报告原因。不得换成 `trellis-*` 或改名绕过开关与数量限制；选已注册的合适 kind，或由主会话完成。没有 `subagent` 工具就直接实施；确需委派时才报告缺失及安装/重载办法，不用搜索工具反复找它。
 
 ### 派单契约

@@ -47,7 +47,9 @@ import { readConfig } from "../../core/config.ts";
 import { decodeNativeCompletions } from "../../core/pi-subagents.ts";
 import { attachSubagents, existingSubagentsBridge } from "../../core/subagents-client.ts";
 import { RUN_BUDGET_MS, checkpointFor } from "../../core/subagents-workflow.ts";
-import { admitOne, agentKindsState, childModelFor, type AdmitFailure, type AdmitResult } from "../agent-kinds/index.ts";
+import { admitOne, agentKindsState, childModelFor, modelForKind, type AdmitFailure, type AdmitResult } from "../agent-kinds/index.ts";
+import { readKindDefinitions } from "../agent-kinds/definitions.ts";
+import { resolveKinds } from "../agent-kinds/defaults.ts";
 import { sessionTree } from "../session-worktree/index.ts";
 
 /**
@@ -71,6 +73,15 @@ export interface DispatchTaskInput {
   /** Keys that must be `completed` before this unit may start. */
   needs?: string[];
   /**
+   * The model this unit launches with.
+   *
+   * Resolved per unit by the caller, because the kind decides it: a kind page pins the
+   * model for that purpose, and the project's `subagents.defaultModel` only applies where
+   * the kind has none. Filling one model for the whole batch would hand every kind the
+   * same one — the reason this lives on the unit instead of on `DispatchInput`.
+   */
+  model?: string;
+  /**
    * The paths this unit intends to write, relative to the working checkout.
    *
    * Declared so the queue can keep two units that touch the same file from running at
@@ -86,17 +97,6 @@ export interface DispatchInput {
   tasks: readonly DispatchTaskInput[];
   /** Isolate every launched child in a managed worktree. */
   worktree?: boolean;
-  /**
-   * The child model this batch launches with, already resolved from the project's own
-   * settings.
-   *
-   * Resolved by the caller, because only the tool call has the host's registry: this
-   * channel starts children through the owner's RPC, which never passes through the
-   * `tool_call` hook that fills the model in for a direct dispatch. The child's cwd is a
-   * worktree cut from a commit, so it cannot see an uncommitted `.pi/settings.json` and
-   * would silently run on a different model than `/Comodels` showed.
-   */
-  model?: string;
 }
 
 export interface DispatchResult {
@@ -224,8 +224,7 @@ interface Task {
   runId?: string;
   worktree?: boolean;
   /** The project's subagent model this unit launches with; absent means "let the owner decide". */
-  model?: string;
-}
+  model?: string;}
 
 /** What a session replacement threw away, so the next report can say it happened. */
 export interface SessionInvalidation {
@@ -634,7 +633,7 @@ export function createDispatchQueue(deps: DispatchDeps, epoch: number): Dispatch
         ...(declaredFiles ? { files: [...new Set(files)] } : {}),
         status: "waiting",
         ...(input.worktree === true ? { worktree: true } : {}),
-        ...(typeof input.model === "string" && input.model.trim() !== "" ? { model: input.model.trim() } : {}),
+        ...(typeof entry.model === "string" && entry.model.trim() !== "" ? { model: entry.model.trim() } : {}),
       });
     });
     // Refused before anything is queued: a cycle can never be satisfied, and leaving
@@ -1101,15 +1100,25 @@ export const dispatchModule: WorkflowModule = {
           }
           const queue = queueFor(host, runtime);
           try {
-            // The model is resolved here too: an RPC spawn bypasses the `tool_call` hook
-            // that fills it in for a direct dispatch, and the child's cwd is a worktree cut
-            // from a commit, so it cannot see an uncommitted `.pi/settings.json`.
-            const decided = childModelFor(runtime, ctx?.modelRegistry);
-            if (decided !== null && "problem" in decided) return text(decided.problem, true);
+            // Each unit's model is resolved here too: an RPC spawn bypasses the `tool_call`
+            // hook that fills it in for a direct dispatch, and the child's cwd is a worktree
+            // cut from a commit, so it cannot see an uncommitted `.pi/settings.json`.
+            //
+            // Per unit, not per batch: the kind decides, and a kind page that pinned a model
+            // must not be overruled by the project default — that is what makes five kinds
+            // able to run on five different models.
+            const root = runtime.configRoots.root(runtime.cwd);
+            const kinds = resolveKinds(root === null ? null : readConfig(root), readKindDefinitions(root).definitions);
+            const registry = ctx?.modelRegistry;
+            const tasks: DispatchTaskInput[] = [];
+            for (const unit of (params?.tasks ?? []) as DispatchTaskInput[]) {
+              const decided = modelForKind(unit.kind, kinds, runtime, registry);
+              if (decided !== null && "problem" in decided) return text(decided.problem, true);
+              tasks.push(decided === null ? unit : { ...unit, model: decided.model });
+            }
             const result = await queue.submit({
-              tasks: (params?.tasks ?? []) as DispatchTaskInput[],
+              tasks,
               ...(params?.worktree === true ? { worktree: true } : {}),
-              ...(decided === null ? {} : { model: decided.model }),
             });
             return {
               content: [{ type: "text" as const, text: renderDispatchResult(result) }],

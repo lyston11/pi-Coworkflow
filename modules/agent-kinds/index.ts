@@ -369,6 +369,32 @@ export function childModelFor(
   return { model: reference };
 }
 
+/**
+ * The model one unit launches with: the kind's own pinned model, else the project default.
+ *
+ * A kind page and the subagent default are not peers. The kind's model is the project's
+ * decision about *that purpose* — the whole reason the page exists — and the default is
+ * what applies where no purpose decided. The owner resolves a launch as
+ * `stepOverrides.model ?? agentConfig.model`, so writing the default into the dispatch
+ * made it outrank the kind and silently run every child on one model; the default is
+ * therefore only consulted when the unit's kind has nothing of its own.
+ *
+ * `kind` is absent for agents this package does not own (`reviewer`, `trellis-check`),
+ * which have no kind page and take the default like any other child.
+ */
+export function modelForKind(
+  kind: string | undefined,
+  kinds: readonly ResolvedAgentKind[],
+  runtime: RuntimeContext,
+  registry: ModelRegistryLike | undefined,
+): { model: string } | { problem: string } | null {
+  const pinned = kind === undefined || kind === ""
+    ? undefined
+    : kinds.find((entry) => entry.kind === kind || entry.agent === kind)?.model;
+  if (pinned !== undefined) return { model: pinned };
+  return childModelFor(runtime, registry);
+}
+
 /** The host's model registry, as much of it as this module asks. */
 export interface ModelRegistryLike {
   getAvailable?(): unknown[];
@@ -1073,11 +1099,28 @@ async function gate(
   );
   if (ungoverned !== null) return ungovernedLaunchRefusal(ungoverned);
 
-  // Every launch gets the project's model, kind or not: the child's own directory is a
-  // worktree cut from a commit, so an uncommitted `.pi/settings.json` is not in it and the
-  // owner would fall back to a different model without saying so. Applied before the kind
-  // lookups below, because a plain agent (`reviewer`, `trellis-check`) reads the same file.
-  const modelRefusal = applyChildModel(event.input, runtime, ctx);
+  // Every launch gets a model, kind or not: the child's own directory is a worktree cut
+  // from a commit, so an uncommitted `.pi/settings.json` is not in it and the owner would
+  // fall back to a different model without saying so. A kind's own model wins over the
+  // project default (see `modelForKind`); `kindsOf` is what makes that distinction.
+  //
+  // Deliberately before the policy lookups below: a plain agent (`reviewer`,
+  // `trellis-check`) has no kind page and reads the same settings file.
+  let liveKinds: readonly ResolvedAgentKind[] | null = null;
+  const kindsOf = (): readonly ResolvedAgentKind[] => {
+    if (liveKinds !== null) return liveKinds;
+    const root = runtime.configRoots.root(runtime.cwd);
+    const config = root === null ? null : readConfig(root);
+    liveKinds = resolveKinds(config, readKindDefinitions(root).definitions);
+    return liveKinds;
+  };
+  const modelRefusal = applyChildModel(
+    event.input,
+    runtime,
+    ctx,
+    // A script launch carries no kind to look up and is refused just below anyway.
+    ungoverned === null ? kindsOf : null,
+  );
   if (modelRefusal !== undefined) return modelRefusal;
 
   const fanout = decodeFanoutCall(event.input);
@@ -1086,9 +1129,7 @@ async function gate(
 
   /** The live policy for this kind, read from disk on every call. */
   const policyOf = (): { kinds: ResolvedAgentKind[]; policy: ResolvedAgentKind | undefined } => {
-    const root = runtime.configRoots.root(runtime.cwd);
-    const config = root === null ? null : readConfig(root);
-    const kinds = resolveKinds(config, readKindDefinitions(root).definitions);
+    const kinds = [...kindsOf()];
     return {
       kinds,
       policy: decoded === null ? undefined : kinds.find((entry) => entry.agent === decoded.agent),
@@ -1146,26 +1187,46 @@ function applyChildModel(
   input: unknown,
   runtime: RuntimeContext,
   ctx: unknown,
+  /** The live kind table, or `null` when this call cannot name one of our kinds. */
+  kinds: (() => readonly ResolvedAgentKind[]) | null,
 ): Refusal | undefined {
-  const decided = childModelFor(runtime, (ctx as { modelRegistry?: ModelRegistryLike } | undefined)?.modelRegistry);
-  if (decided === null) return;
-  if ("problem" in decided) return { block: true, reason: decided.problem };
+  const registry = (ctx as { modelRegistry?: ModelRegistryLike } | undefined)?.modelRegistry;
+  // Resolved at most once per call: the table costs a config read, and a batch asks the
+  // same question for every entry.
+  let table: readonly ResolvedAgentKind[] | null = null;
+  const decide = (kind: string | undefined): { model: string } | { problem: string } | null => {
+    if (kinds === null) return childModelFor(runtime, registry);
+    table ??= kinds();
+    return modelForKind(kind, table, runtime, registry);
+  };
+  /** The kind an entry names, in either spelling the two workflows use. */
+  const kindNamed = (entry: Record<string, unknown>): string | undefined => {
+    const kind = typeof entry.kind === "string" ? entry.kind.trim() : "";
+    if (kind !== "") return kind;
+    const agent = typeof entry.agent === "string" ? entry.agent.trim() : "";
+    return agent === "" ? undefined : agent;
+  };
+
   if (input === null || typeof input !== "object" || Array.isArray(input)) return;
   const call = input as Record<string, unknown>;
-  if (typeof call.model === "string" && call.model.trim() !== "") return;
   const tasks = (call.args as Record<string, unknown> | undefined)?.tasks;
   if (Array.isArray(tasks)) {
-    // A batch: each entry is its own launch, so each one needs the model. An entry that
-    // named its own keeps it.
+    // A batch: each entry is its own launch, so each one gets its own answer. An entry that
+    // named its own model keeps it.
     for (const entry of tasks) {
       if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
       const task = entry as Record<string, unknown>;
       if (typeof task.model === "string" && task.model.trim() !== "") continue;
-      task.model = decided.model;
+      const decided = decide(kindNamed(task));
+      if (decided !== null && "problem" in decided) return { block: true, reason: decided.problem };
+      if (decided !== null) task.model = decided.model;
     }
     return;
   }
-  call.model = decided.model;
+  if (typeof call.model === "string" && call.model.trim() !== "") return;
+  const decided = decide(kindNamed(call));
+  if (decided !== null && "problem" in decided) return { block: true, reason: decided.problem };
+  if (decided !== null) call.model = decided.model;
   return;
 }
 
