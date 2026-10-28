@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/frontend/agent-kinds.md", "reason": "Review kind and role behavior against the project design contract"}
+{"file": ".trellis/spec/frontend/subagents-integration.md", "reason": "Review prompt rendering, delegation, and child-context integration"}

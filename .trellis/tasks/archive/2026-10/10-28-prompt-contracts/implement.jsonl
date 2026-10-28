@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/frontend/agent-kinds.md", "reason": "Kind definitions, roles, model-purpose boundaries, and context-source contract"}
+{"file": ".trellis/spec/frontend/subagents-integration.md", "reason": "Main-session-first delegation policy, workflow prompt sources, and child context contracts"}
